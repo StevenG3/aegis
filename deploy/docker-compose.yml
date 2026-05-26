@@ -1,0 +1,100 @@
+name: trading-agent
+services:
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: services/orchestrator/Dockerfile
+    environment:
+      DATA_DIR: /data
+      RISK_ENGINE_URL: http://risk-engine:8081
+      EXECUTION_SERVICE_URL: http://execution-service:8082
+      MARKET_DATA_URL: http://market-data:8083
+      PER_SYMBOL_DAILY_LIMIT_USDT: "50000"
+      CLAUDE_API_KEY: ""
+      OPS_TOKEN: ""
+      LIVE_UNLOCK_TTL_MIN: "15"
+      SCORECARD_DEFAULT_TTL_MIN: "60"
+    ports:
+      - "8080:8080"
+    volumes:
+      - trading_data:/data
+    depends_on:
+      risk-engine:
+        condition: service_healthy
+      execution-service:
+        condition: service_healthy
+      market-data:
+        condition: service_healthy
+    networks: [trading_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  risk-engine:
+    build:
+      context: ..
+      dockerfile: services/risk-engine/Dockerfile
+    environment:
+      DATA_DIR: /data
+      MARKET_DATA_URL: http://market-data:8083
+      MAX_NOTIONAL_USDT: "10000"
+      CONFIRMATION_THRESHOLD_USDT: "500"
+      PER_SYMBOL_DAILY_LIMIT_USDT: "50000"
+      LIVE_TRADING_ENABLED: "false"
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      DAILY_DRAWDOWN_HARD_STOP_USDT: "1000"
+    depends_on:
+      market-data:
+        condition: service_healthy
+    volumes:
+      - trading_data:/data
+    networks: [trading_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  execution-service:
+    build:
+      context: ..
+      dockerfile: services/execution-service/Dockerfile
+    environment:
+      DATA_DIR: /data
+      MARKET_DATA_URL: http://market-data:8083
+      LIVE_TRADING_ENABLED: "false"
+      EXCHANGE_API_KEY: ""
+      EXCHANGE_API_SECRET: ""
+    volumes:
+      - trading_data:/data
+    depends_on:
+      market-data:
+        condition: service_healthy
+    networks: [trading_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  market-data:
+    build:
+      context: ..
+      dockerfile: services/market-data/Dockerfile
+    environment:
+      FIXTURES_ONLY: "false"
+    networks: [trading_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  trading_data:
+
+networks:
+  trading_net:
+    internal: true
