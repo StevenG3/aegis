@@ -10,3 +10,9 @@ def test_orchestrator_and_analysis_adapter_bind_host_local_only() -> None:
     assert '"8080:8080"' not in text
     assert '"127.0.0.1:${ORCHESTRATOR_HOST_PORT:-18081}:8080"' in text
     assert '"127.0.0.1:${ANALYSIS_ADAPTER_HOST_PORT:-18085}:8085"' in text
+
+
+def test_analysis_adapter_uses_internal_tradingagents_bridge() -> None:
+    text = COMPOSE.read_text()
+    assert 'TA_BRIDGE_URL: ${TA_BRIDGE_URL:-http://tradingagents-bridge:18181}' in text
+    assert 'host.docker.internal' not in text
