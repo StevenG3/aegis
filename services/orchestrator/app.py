@@ -32,6 +32,15 @@ app = FastAPI(title="orchestrator", version="0.1.0")
 PER_SYMBOL_DAILY_LIMIT_USDT = Decimal(os.getenv("PER_SYMBOL_DAILY_LIMIT_USDT", "50000"))
 DECIMAL_8 = Decimal("0.00000001")
 
+
+class _OutcomeSummaryBucket:
+    def __init__(self) -> None:
+        self.closed_count = 0
+        self.hits = 0
+        self.losses = 0
+        self.open_count = 0
+        self.total_pnl = Decimal("0")
+
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "claude-haiku-4-5-20251001")
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
@@ -311,6 +320,90 @@ def _q8s(value: Decimal) -> str:
     return f"{_q8(value):.8f}"
 
 
+
+
+def _maybe_open_scorecard_outcome(
+    execution: ExecutionResult,
+    intent: OrderIntent,
+    new_qty_after_buy: Decimal,
+) -> None:
+    """Record an opened outcome when a scorecard-sourced BUY produces fill."""
+    _ = new_qty_after_buy
+    if intent.side != "buy":
+        return
+    if intent.source.origin != "scorecard" or not intent.source.scorecard_id:
+        return
+    if execution.avg_price is None or execution.filled_qty <= 0:
+        return
+    with connect() as conn:
+        row = conn.execute(
+            "select source from scorecards where scorecard_id = ?",
+            (intent.source.scorecard_id,),
+        ).fetchone()
+    source = row["source"] if row else "unknown"
+    opened_qty = _q8(execution.filled_qty)
+    opened_avg_cost = _q8(execution.avg_price)
+    opened_cost_basis = _q8(opened_qty * opened_avg_cost)
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into scorecard_outcomes
+              (outcome_id, scorecard_id, actor, symbol, source, action,
+               opened_intent_id, opened_at, opened_qty, opened_avg_cost,
+               opened_cost_basis, status, closed_at, closed_realized_pnl,
+               closed_return_pct, notes)
+            values (?,?,?,?,?,?,?,?,?,?,?,'open',NULL,NULL,NULL,NULL)
+            """,
+            (
+                str(uuid4()),
+                intent.source.scorecard_id,
+                intent.actor,
+                intent.symbol,
+                source,
+                intent.side,
+                str(intent.intent_id),
+                _now().isoformat(),
+                _q8s(opened_qty),
+                _q8s(opened_avg_cost),
+                _q8s(opened_cost_basis),
+            ),
+        )
+        conn.commit()
+
+
+def _maybe_close_scorecard_outcomes(
+    actor: str,
+    symbol: str,
+    realized_delta: Decimal,
+    new_qty: Decimal,
+) -> None:
+    if new_qty != Decimal("0"):
+        return
+    with connect() as conn:
+        rows = conn.execute(
+            "select outcome_id, opened_cost_basis from scorecard_outcomes "
+            "where actor = ? and symbol = ? and status = 'open'",
+            (actor, symbol),
+        ).fetchall()
+    if not rows:
+        return
+    total_basis = sum(Decimal(row["opened_cost_basis"]) for row in rows) or Decimal("1")
+    closed_at = _now().isoformat()
+    notes = "split-attribution" if len(rows) > 1 else None
+    with connect() as conn:
+        for row in rows:
+            basis = Decimal(row["opened_cost_basis"])
+            share = (basis / total_basis) if total_basis else Decimal("0")
+            attributed = _q8(realized_delta * share)
+            return_pct = _q8(attributed / basis) if basis > 0 else Decimal("0")
+            conn.execute(
+                "update scorecard_outcomes set status = 'closed', "
+                "closed_at = ?, closed_realized_pnl = ?, closed_return_pct = ?, "
+                "notes = ? where outcome_id = ?",
+                (closed_at, _q8s(attributed), _q8s(return_pct), notes, row["outcome_id"]),
+            )
+        conn.commit()
+
 def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
     if execution.avg_price is None or execution.filled_qty == Decimal("0"):
         return
@@ -375,6 +468,15 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
                 ),
             )
         conn.commit()
+        try:
+            if intent.side == "buy":
+                _maybe_open_scorecard_outcome(execution, intent, new_qty)
+            else:
+                _maybe_close_scorecard_outcomes(
+                    intent.actor, intent.symbol, realized_delta, new_qty
+                )
+        except Exception:
+            pass
 
 
 def _mark_for_symbol(symbol: str) -> tuple[Decimal | None, str | None]:
@@ -696,6 +798,146 @@ def list_scorecards(
             }
         )
     return {"items": items, "total": len(items)}
+
+
+@app.get("/scorecard-outcomes", response_model=None)
+def list_outcomes(
+    actor: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
+    status: Literal["open", "closed"] | None = None,
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, object]:
+    clauses: list[str] = []
+    params: list[object] = []
+    for col, val in (
+        ("actor", actor),
+        ("symbol", symbol),
+        ("source", source),
+        ("status", status),
+    ):
+        if val is not None:
+            clauses.append(f"{col} = ?")
+            params.append(val)
+    where = (" where " + " and ".join(clauses)) if clauses else ""
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            select outcome_id, scorecard_id, actor, symbol, source, action,
+                   opened_intent_id, opened_at, opened_qty, opened_avg_cost,
+                   opened_cost_basis, status, closed_at, closed_realized_pnl,
+                   closed_return_pct, notes
+            from scorecard_outcomes{where}
+            order by opened_at desc
+            limit ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    return {
+        "items": [_outcome_row_to_dict(row) for row in rows],
+        "attribution_rule": (
+            "When the aggregate position closes with multiple open outcomes, "
+            "realized PnL is split proportionally by opened_cost_basis. "
+            "Rows with notes='split-attribution' indicate this case."
+        ),
+    }
+
+
+@app.get("/scorecard-outcomes/summary", response_model=None)
+def outcomes_summary(actor: str | None = None, since: str | None = None) -> dict[str, object]:
+    clauses_closed: list[str] = ["status = 'closed'"]
+    params_closed: list[object] = []
+    if actor:
+        clauses_closed.append("actor = ?")
+        params_closed.append(actor)
+    if since:
+        clauses_closed.append("closed_at >= ?")
+        params_closed.append(since)
+    where_closed = " where " + " and ".join(clauses_closed)
+    with connect() as conn:
+        closed_rows = conn.execute(
+            f"select source, closed_realized_pnl from scorecard_outcomes{where_closed}",
+            params_closed,
+        ).fetchall()
+        open_clauses = ["status = 'open'"]
+        open_params: list[object] = []
+        if actor:
+            open_clauses.append("actor = ?")
+            open_params.append(actor)
+        open_rows = conn.execute(
+            f"select source, count(*) as n from scorecard_outcomes "
+            f"where {' and '.join(open_clauses)} group by source",
+            open_params,
+        ).fetchall()
+
+    by_source: dict[str, _OutcomeSummaryBucket] = {}
+    for row in closed_rows:
+        src = str(row["source"])
+        pnl = Decimal(str(row["closed_realized_pnl"]))
+        bucket = by_source.setdefault(src, _OutcomeSummaryBucket())
+        bucket.closed_count += 1
+        bucket.total_pnl += pnl
+        if pnl > 0:
+            bucket.hits += 1
+        elif pnl < 0:
+            bucket.losses += 1
+
+    for row in open_rows:
+        bucket = by_source.setdefault(str(row["source"]), _OutcomeSummaryBucket())
+        bucket.open_count = int(str(row["n"]))
+
+    summary: dict[str, object] = {}
+    for src, bucket in by_source.items():
+        summary[src] = {
+            "closed_count": bucket.closed_count,
+            "open_count": bucket.open_count,
+            "hits": bucket.hits,
+            "losses": bucket.losses,
+            "hit_rate": (
+                f"{bucket.hits / bucket.closed_count:.4f}"
+                if bucket.closed_count
+                else "0.0000"
+            ),
+            "realized_pnl": _q8s(bucket.total_pnl),
+            "total_pnl": _q8s(bucket.total_pnl),
+        }
+    return {"actor": actor, "since": since, "by_source": summary}
+
+
+@app.get("/scorecard-outcomes/{outcome_id}", response_model=None)
+def get_outcome(outcome_id: UUID) -> JSONResponse | dict[str, object]:
+    with connect() as conn:
+        row = conn.execute(
+            "select outcome_id, scorecard_id, actor, symbol, source, action, "
+            "opened_intent_id, opened_at, opened_qty, opened_avg_cost, "
+            "opened_cost_basis, status, closed_at, closed_realized_pnl, "
+            "closed_return_pct, notes from scorecard_outcomes where outcome_id = ?",
+            (str(outcome_id),),
+        ).fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"code": "OUTCOME_NOT_FOUND"})
+    return _outcome_row_to_dict(row)
+
+
+def _outcome_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "outcome_id": row["outcome_id"],
+        "scorecard_id": row["scorecard_id"],
+        "actor": row["actor"],
+        "symbol": row["symbol"],
+        "source": row["source"],
+        "action": row["action"],
+        "opened_intent_id": row["opened_intent_id"],
+        "opened_at": row["opened_at"],
+        "opened_qty": row["opened_qty"],
+        "opened_avg_cost": row["opened_avg_cost"],
+        "opened_cost_basis": row["opened_cost_basis"],
+        "status": row["status"],
+        "closed_at": row["closed_at"],
+        "closed_realized_pnl": row["closed_realized_pnl"],
+        "closed_return_pct": row["closed_return_pct"],
+        "notes": row["notes"],
+    }
 
 
 @app.get("/pnl/today", response_model=None)

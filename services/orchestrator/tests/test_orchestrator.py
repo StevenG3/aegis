@@ -2240,3 +2240,328 @@ def test_live_unlock_wet_rowcount_zero_returns_used(monkeypatch, tmp_path: Path)
     body = json.loads(bytes(err.body).decode())
     assert body["code"] == "LIVE_UNLOCK_ALREADY_USED"
 
+
+
+# -- Phase 12 scorecard outcomes ---------------------------------------------
+
+
+def _risk_and_execution(
+    monkeypatch, *, avg_price: str = "100000.00", filled_qty: str = "0.001"
+) -> None:
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/validate"):
+            return FakeResponse(decision())
+        return FakeResponse(execution(avg_price=avg_price, filled_qty=filled_qty))
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+
+
+def _create_scorecard_order(
+    client: TestClient,
+    *,
+    idempotency_key: str,
+    source: str = "tradingagents",
+    actor: str = "user_1",
+    symbol: str = "BTCUSDT",
+    budget: str = "200",
+    conviction: str = "0.5",
+) -> str:
+    scorecard_id = client.post(
+        "/scorecards",
+        json=make_scorecard_payload(
+            actor=actor, symbol=symbol, source=source, conviction=conviction
+        ),
+    ).json()["scorecard_id"]
+    response = client.post(
+        "/intents/from_scorecard",
+        json={
+            "scorecard_id": scorecard_id,
+            "actor": actor,
+            "idempotency_key": idempotency_key,
+            "usdt_budget": budget,
+        },
+    )
+    assert response.status_code == 200
+    return scorecard_id
+
+
+def _manual_sell(client: TestClient, *, idempotency_key: str, qty: str, price: str) -> None:
+    payload = dict(
+        VALID,
+        intent_id=str(orchestrator_app.uuid4()),
+        side="sell",
+        quantity={"kind": "base", "value": qty},
+        idempotency_key=idempotency_key,
+    )
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/validate"):
+            return FakeResponse(decision())
+        return FakeResponse(execution(avg_price=price, filled_qty=qty))
+
+    old_post = orchestrator_app.httpx.post
+    orchestrator_app.httpx.post = fake_post
+    try:
+        response = client.post("/intents", json=payload)
+    finally:
+        orchestrator_app.httpx.post = old_post
+    assert response.status_code == 200
+
+
+def test_outcome_opens_on_scorecard_buy_fill(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch)
+    client = TestClient(orchestrator_app.app)
+    scorecard_id = _create_scorecard_order(client, idempotency_key="outcome-open")
+
+    response = client.get("/scorecard-outcomes", params={"status": "open"})
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["scorecard_id"] == scorecard_id
+    assert item["source"] == "tradingagents"
+    assert item["status"] == "open"
+    assert item["opened_cost_basis"] == "100.00000000"
+
+
+def test_outcome_does_not_open_for_manual_intent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch)
+    client = TestClient(orchestrator_app.app)
+    assert client.post("/intents", json=VALID).status_code == 200
+
+    response = client.get("/scorecard-outcomes")
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
+def test_outcome_closes_on_full_sell(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch, avg_price="100000.00", filled_qty="0.001")
+    client = TestClient(orchestrator_app.app)
+    _create_scorecard_order(client, idempotency_key="outcome-close-buy")
+    _manual_sell(client, idempotency_key="outcome-close-sell", qty="0.001", price="110000.00")
+
+    item = client.get("/scorecard-outcomes", params={"status": "closed"}).json()["items"][0]
+
+    assert item["status"] == "closed"
+    assert item["closed_realized_pnl"] == "10.00000000"
+    assert item["closed_return_pct"] == "0.10000000"
+
+
+def test_outcome_partial_sell_keeps_open(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch, avg_price="100000.00", filled_qty="0.002")
+    client = TestClient(orchestrator_app.app)
+    _create_scorecard_order(client, idempotency_key="outcome-partial-buy")
+    _manual_sell(client, idempotency_key="outcome-partial-sell", qty="0.001", price="110000.00")
+
+    item = client.get("/scorecard-outcomes").json()["items"][0]
+
+    assert item["status"] == "open"
+    assert item["closed_realized_pnl"] is None
+
+
+def test_outcome_split_attribution_two_scorecards(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch, avg_price="100000.00", filled_qty="0.001")
+    client = TestClient(orchestrator_app.app)
+    _create_scorecard_order(client, idempotency_key="split-a")
+    _create_scorecard_order(client, idempotency_key="split-b")
+    _manual_sell(client, idempotency_key="split-sell", qty="0.002", price="110000.00")
+
+    items = client.get("/scorecard-outcomes", params={"status": "closed"}).json()["items"]
+    pnls = sorted(Decimal(item["closed_realized_pnl"]) for item in items)
+
+    assert len(items) == 2
+    assert all(item["notes"] == "split-attribution" for item in items)
+    assert pnls == [Decimal("10.00000000"), Decimal("10.00000000")]
+    assert sum(pnls) == Decimal("20.00000000")
+
+
+def test_outcome_attribution_unequal_cost_basis(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+    _risk_and_execution(monkeypatch, avg_price="100000.00", filled_qty="0.001")
+    _create_scorecard_order(client, idempotency_key="unequal-a")
+    _risk_and_execution(monkeypatch, avg_price="90000.00", filled_qty="0.001")
+    _create_scorecard_order(client, idempotency_key="unequal-b")
+    _manual_sell(client, idempotency_key="unequal-sell", qty="0.002", price="110000.00")
+
+    items = client.get("/scorecard-outcomes", params={"status": "closed"}).json()["items"]
+    by_basis = {item["opened_cost_basis"]: item for item in items}
+
+    assert by_basis["100.00000000"]["closed_realized_pnl"] == "15.78947368"
+    assert by_basis["90.00000000"]["closed_realized_pnl"] == "14.21052632"
+
+
+def test_list_outcomes_filters_by_source_and_status(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch)
+    client = TestClient(orchestrator_app.app)
+    _create_scorecard_order(client, idempotency_key="filter-ta", source="tradingagents")
+    _create_scorecard_order(client, idempotency_key="filter-manual", source="manual")
+
+    response = client.get(
+        "/scorecard-outcomes", params={"source": "tradingagents", "status": "open"}
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["items"]) == 1
+    assert response.json()["items"][0]["source"] == "tradingagents"
+    assert "attribution_rule" in response.json()
+
+
+def test_get_outcome_unknown_returns_404(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    response = TestClient(orchestrator_app.app).get(
+        "/scorecard-outcomes/99999999-9999-4999-8999-999999999999"
+    )
+    assert response.status_code == 404
+    assert response.json()["code"] == "OUTCOME_NOT_FOUND"
+
+
+def test_outcomes_summary_hit_rate(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    with orchestrator_app.connect() as conn:
+        for i, pnl in enumerate(["10", "5", "-3"]):
+            conn.execute(
+                "insert into scorecard_outcomes "
+                "(outcome_id, scorecard_id, actor, symbol, source, action, opened_intent_id, "
+                "opened_at, opened_qty, opened_avg_cost, opened_cost_basis, status, "
+                "closed_at, closed_realized_pnl, closed_return_pct, notes) "
+                "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                (
+                    str(orchestrator_app.uuid4()),
+                    f"sc-{i}",
+                    "user_1",
+                    "BTCUSDT",
+                    "tradingagents",
+                    "buy",
+                    f"intent-{i}",
+                    orchestrator_app._now().isoformat(),
+                    "0.00100000",
+                    "100000.00000000",
+                    "100.00000000",
+                    "closed",
+                    orchestrator_app._now().isoformat(),
+                    pnl,
+                    "0.10000000",
+                ),
+            )
+        conn.execute(
+            "insert into scorecard_outcomes "
+            "(outcome_id, scorecard_id, actor, symbol, source, action, opened_intent_id, "
+            "opened_at, opened_qty, opened_avg_cost, opened_cost_basis, status) "
+            "values (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(orchestrator_app.uuid4()),
+                "sc-open",
+                "user_1",
+                "BTCUSDT",
+                "tradingagents",
+                "buy",
+                "intent-open",
+                orchestrator_app._now().isoformat(),
+                "0.00100000",
+                "100000.00000000",
+                "100.00000000",
+                "open",
+            ),
+        )
+        conn.commit()
+
+    stats = TestClient(orchestrator_app.app).get(
+        "/scorecard-outcomes/summary", params={"actor": "user_1"}
+    ).json()["by_source"]["tradingagents"]
+
+    assert stats["closed_count"] == 3
+    assert stats["hits"] == 2
+    assert stats["losses"] == 1
+    assert stats["open_count"] == 1
+    assert stats["hit_rate"] == "0.6667"
+    assert stats["realized_pnl"] == "12.00000000"
+    assert stats["total_pnl"] == "12.00000000"
+
+
+def test_outcomes_summary_empty_source(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    response = TestClient(orchestrator_app.app).get("/scorecard-outcomes/summary")
+    assert response.status_code == 200
+    assert response.json()["by_source"] == {}
+
+
+def test_outcomes_hook_failure_does_not_break_position_update(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(orchestrator_app, "_maybe_open_scorecard_outcome", fail)
+    client = TestClient(orchestrator_app.app)
+    response = client.post(
+        "/intents/from_scorecard",
+        json={
+            "scorecard_id": client.post("/scorecards", json=make_scorecard_payload()).json()[
+                "scorecard_id"
+            ],
+            "actor": "user_1",
+            "idempotency_key": "hook-fail",
+            "usdt_budget": "200",
+        },
+    )
+
+    assert response.status_code == 200
+    with orchestrator_app.connect() as conn:
+        position = conn.execute(
+            "select qty from paper_positions where actor=?", ("user_1",)
+        ).fetchone()
+    assert position["qty"] == "0.00100000"
+
+
+def test_outcome_for_scorecard_deleted_from_table_uses_unknown_source(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch)
+    client = TestClient(orchestrator_app.app)
+    scorecard_id = client.post("/scorecards", json=make_scorecard_payload()).json()["scorecard_id"]
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select payload_json from scorecards where scorecard_id = ?", (scorecard_id,)
+        ).fetchone()
+        conn.execute("delete from scorecards where scorecard_id = ?", (scorecard_id,))
+        conn.commit()
+    scorecard = orchestrator_app.Scorecard.model_validate_json(row["payload_json"])
+    intent = orchestrator_app.OrderIntent(
+        intent_id=orchestrator_app.uuid4(),
+        request_id=orchestrator_app.uuid4(),
+        idempotency_key="deleted-scorecard",
+        actor="user_1",
+        created_at=orchestrator_app._now(),
+        mode="paper",
+        venue="binance_spot",
+        symbol=scorecard.symbol,
+        side="buy",
+        order_type="market",
+        quantity=orchestrator_app.Quantity(kind="quote", value=Decimal("100")),
+        limit_price=None,
+        time_in_force="GTC",
+        reduce_only=False,
+        leverage=None,
+        stop_loss=None,
+        take_profit=None,
+        source=orchestrator_app.Source(
+            origin="scorecard", scorecard_id=str(scorecard.scorecard_id), hermes_message_id=None
+        ),
+        client_confirmation_required=False,
+    )
+
+    orchestrator_app._update_position(
+        orchestrator_app.ExecutionResult.model_validate(execution()), intent
+    )
+
+    item = client.get("/scorecard-outcomes").json()["items"][0]
+    assert item["source"] == "unknown"

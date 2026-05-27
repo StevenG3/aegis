@@ -136,4 +136,39 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "create index if not exists idx_live_unlock_expires on live_unlock_tokens(expires_at)"
     )
+
+    conn.execute(
+        """
+        create table if not exists scorecard_outcomes (
+            outcome_id text primary key,
+            scorecard_id text not null,
+            actor text not null,
+            symbol text not null,
+            source text not null,
+            action text not null,
+            opened_intent_id text not null,
+            opened_at text not null,
+            opened_qty text not null,
+            opened_avg_cost text not null,
+            opened_cost_basis text not null,
+            status text not null,
+            closed_at text,
+            closed_realized_pnl text,
+            closed_return_pct text,
+            notes text
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_scorecard_outcomes_actor_symbol "
+        "on scorecard_outcomes(actor, symbol, status)"
+    )
+    conn.execute(
+        "create index if not exists idx_scorecard_outcomes_scorecard "
+        "on scorecard_outcomes(scorecard_id)"
+    )
+    conn.execute(
+        "create index if not exists idx_scorecard_outcomes_source "
+        "on scorecard_outcomes(source, status)"
+    )
     conn.commit()

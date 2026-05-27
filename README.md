@@ -220,3 +220,17 @@ The request returns immediately with `{"job_id":"...","status":"queued"}`. Poll 
 TradingAgents analysts are originally equity-focused. Crypto support depends on TradingAgents' own dataflows; this adapter does not compensate for missing crypto-native data sources, so treat crypto reports with appropriate skepticism until upstream data sources improve.
 
 The conviction heuristic is intentionally simple: hold maps to `0.30`; buy/sell starts at `0.50` and adds `0.10` for each populated analyst report, capped at `0.90`. Future phases can refine this from TA debate margins and historical hit rate.
+
+## Phase 12: Scorecard Outcomes
+
+Phase 12 adds a forward-only `scorecard_outcomes` table that records whether scorecard-sourced BUY signals ultimately made or lost money. A filled scorecard BUY opens an outcome row. When the aggregate `(actor, symbol)` position closes, every open outcome for that pair is closed with realized PnL and return percentage.
+
+Attribution is approximate by design: if multiple scorecards overlap on the same `(actor, symbol)`, the close PnL is split proportionally by each row's `opened_cost_basis`; those rows carry `notes="split-attribution"`. Manual orders and natural-language orders without a scorecard reference do not create outcome rows.
+
+Examples:
+
+```bash
+curl 'http://localhost:8080/scorecard-outcomes?actor=user_1&status=closed'
+curl 'http://localhost:8080/scorecard-outcomes/summary?actor=user_1'
+curl 'http://localhost:8080/scorecard-outcomes/11111111-1111-4111-8111-111111111111'
+```
