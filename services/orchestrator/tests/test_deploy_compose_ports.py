@@ -16,3 +16,10 @@ def test_analysis_adapter_uses_internal_tradingagents_bridge() -> None:
     text = COMPOSE.read_text()
     assert 'TA_BRIDGE_URL: ${TA_BRIDGE_URL:-http://tradingagents-bridge:18181}' in text
     assert 'host.docker.internal' not in text
+
+
+def test_market_data_has_egress_network_without_host_ports() -> None:
+    text = COMPOSE.read_text()
+    market_section = text.split("\n  market-data:\n", 1)[1].split("\n  analysis-adapter:\n", 1)[0]
+    assert "networks: [trading_net, host_access_net]" in market_section
+    assert "ports:" not in market_section
