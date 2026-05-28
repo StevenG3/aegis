@@ -84,10 +84,16 @@ services:
       LIVE_TRADING_ENABLED: "false"
       EXCHANGE_API_KEY: ""
       EXCHANGE_API_SECRET: ""
+      IBKR_MODE: ${IBKR_MODE:-stub}
+      IBKR_BRIDGE_URL: ${IBKR_BRIDGE_URL:-http://ibkr-bridge:8086}
+      IBKR_POLL_TIMEOUT_SEC: ${IBKR_POLL_TIMEOUT_SEC:-60}
+      IBKR_POLL_INTERVAL_SEC: ${IBKR_POLL_INTERVAL_SEC:-1}
     volumes:
       - trading_data:/data
     depends_on:
       market-data:
+        condition: service_healthy
+      ibkr-bridge:
         condition: service_healthy
     networks: [trading_net]
     healthcheck:
@@ -104,7 +110,8 @@ services:
       FIXTURES_ONLY: "false"
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
       STOCK_QUOTE_CACHE_TTL_SEC: ${STOCK_QUOTE_CACHE_TTL_SEC:-60}
-      STOCK_QUOTE_PROVIDER_CHAIN: ${STOCK_QUOTE_PROVIDER_CHAIN:-polygon,yahoo,fixture}
+      STOCK_QUOTE_PROVIDER_CHAIN: ${STOCK_QUOTE_PROVIDER_CHAIN:-ibkr,polygon,yahoo,fixture}
+      IBKR_BRIDGE_URL: ${IBKR_BRIDGE_URL:-http://ibkr-bridge:8086}
     networks: [trading_net, host_access_net]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/healthz')"]
@@ -133,6 +140,26 @@ services:
     networks: [trading_net, host_access_net]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  ibkr-bridge:
+    build:
+      context: ..
+      dockerfile: services/ibkr-bridge/Dockerfile
+    environment:
+      IBKR_GATEWAY_HOST: ${IBKR_GATEWAY_HOST:-ibkr-host}
+      IBKR_GATEWAY_PORT: ${IBKR_GATEWAY_PORT:-4002}
+      IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
+      IBKR_CONNECT_TIMEOUT_SEC: ${IBKR_CONNECT_TIMEOUT_SEC:-10}
+    extra_hosts:
+      - "ibkr-host:host-gateway"
+    ports:
+      - "127.0.0.1:${IBKR_BRIDGE_HOST_PORT:-18086}:8086"
+    networks: [trading_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/healthz')"]
       interval: 10s
       timeout: 3s
       retries: 5

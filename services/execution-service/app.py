@@ -24,6 +24,10 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
 EXCHANGE_API_SECRET = os.getenv("EXCHANGE_API_SECRET", "")
 BINANCE_BASE_URL = "https://api.binance.com"
+IBKR_MODE = os.getenv("IBKR_MODE", "stub")
+IBKR_BRIDGE_URL = os.getenv("IBKR_BRIDGE_URL", "http://ibkr-bridge:8086").rstrip("/")
+IBKR_POLL_TIMEOUT_SEC = float(os.getenv("IBKR_POLL_TIMEOUT_SEC", "60"))
+IBKR_POLL_INTERVAL_SEC = float(os.getenv("IBKR_POLL_INTERVAL_SEC", "1"))
 
 
 @app.exception_handler(RequestValidationError)
@@ -264,7 +268,7 @@ def _binance_paper_execute(
     return result
 
 
-def _ibkr_paper_execute(
+def _ibkr_paper_stub_execute(
     request: ExecutionRequest,
     symbol: str,
     side: str,
@@ -321,6 +325,166 @@ def _ibkr_paper_execute(
     return result
 
 
+def _bridge_status(status: str) -> Literal[
+    "filled", "partial", "rejected", "canceled", "error", "open"
+]:
+    status_map: dict[str, Literal["filled", "partial", "rejected", "canceled", "error", "open"]] = {
+        "filled": "filled",
+        "partial": "partial",
+        "rejected": "rejected",
+        "canceled": "canceled",
+        "cancelled": "canceled",
+        "error": "error",
+        "pending": "open",
+        "submitted": "open",
+    }
+    return status_map.get(status.lower(), "open")
+
+
+def _bridge_result(
+    request: ExecutionRequest, raw: dict[str, object], fallback_error: str | None = None
+) -> ExecutionResult:
+    fills: list[Fill] = []
+    raw_fills = raw.get("fills", [])
+    if not isinstance(raw_fills, list):
+        raw_fills = []
+    for fill in raw_fills:
+        if not isinstance(fill, dict):
+            continue
+        fills.append(
+            Fill(
+                price=Decimal(str(fill["price"])),
+                qty=Decimal(str(fill["qty"])),
+                fee=Decimal(str(fill.get("fee", "0"))),
+                fee_asset=str(fill.get("fee_asset", "USD")),
+                ts=datetime.fromisoformat(str(fill["ts"]).replace("Z", "+00:00")),
+            )
+        )
+    avg_price_raw = raw.get("avg_price")
+    return ExecutionResult(
+        execution_id=request.execution_id,
+        intent_id=request.intent_id,
+        decision_id=request.decision_id,
+        idempotency_key=request.idempotency_key,
+        status=_bridge_status(str(raw.get("status", "open"))),
+        venue_order_id=str(raw["id"]) if raw.get("id") is not None else None,
+        fills=fills,
+        avg_price=Decimal(str(avg_price_raw)) if avg_price_raw is not None else None,
+        filled_qty=Decimal(str(raw.get("filled_qty", "0"))),
+        remaining_qty=Decimal(str(raw.get("remaining_qty", "0"))),
+        error=str(raw["error"]) if raw.get("error") is not None else fallback_error,
+        raw_venue_response_ref=str(raw["raw_order_ref"])
+        if raw.get("raw_order_ref") is not None
+        else None,
+        finalized_at=_now(),
+    )
+
+
+def _ibkr_bridge_quantity(
+    symbol: str,
+    quantity_kind: str,
+    base_qty: str,
+    quote_qty: str,
+) -> Decimal:
+    if quantity_kind == "base":
+        return Decimal(base_qty)
+    response = httpx.get(f"{IBKR_BRIDGE_URL}/tickers/{symbol.upper()}", timeout=5.0)
+    response.raise_for_status()
+    price = Decimal(str(response.json()["price"]))
+    if price <= 0:
+        raise ValueError("invalid price")
+    return (Decimal(quote_qty) / price).quantize(Decimal("0.0001"))
+
+
+def _poll_ibkr_order(order_id: str) -> dict[str, object]:
+    deadline = time_lib.monotonic() + IBKR_POLL_TIMEOUT_SEC
+    latest: dict[str, object] = {"id": order_id, "status": "submitted"}
+    while time_lib.monotonic() < deadline:
+        response = httpx.get(f"{IBKR_BRIDGE_URL}/orders/{order_id}", timeout=5.0)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("unexpected IBKR bridge response")
+        latest = body
+        terminal = {"filled", "partial", "rejected", "canceled", "error"}
+        if str(body.get("status", "")).lower() in terminal:
+            return body
+        time_lib.sleep(IBKR_POLL_INTERVAL_SEC)
+    return latest
+
+
+def _ibkr_bridge_execute(
+    request: ExecutionRequest,
+    symbol: str,
+    side: str,
+    quantity_kind: str,
+    base_qty: str,
+    quote_qty: str,
+    order_type: str,
+    limit_price: str,
+    time_in_force: str,
+) -> ExecutionResult:
+    try:
+        quantity = _ibkr_bridge_quantity(symbol, quantity_kind, base_qty, quote_qty)
+        if quantity <= 0:
+            raise ValueError("computed quantity is zero")
+        payload: dict[str, object] = {
+            "idempotency_key": request.idempotency_key,
+            "symbol": symbol.upper(),
+            "side": side.lower(),
+            "order_type": order_type.lower(),
+            "quantity": str(quantity),
+            "limit_price": limit_price or None,
+            "time_in_force": time_in_force.upper(),
+        }
+        response = httpx.post(f"{IBKR_BRIDGE_URL}/orders", json=payload, timeout=10.0)
+        response.raise_for_status()
+        raw = response.json()
+        if not isinstance(raw, dict):
+            raise ValueError("unexpected IBKR bridge response")
+        if str(raw.get("status", "")).lower() in {"pending", "submitted"} and raw.get("id"):
+            raw = _poll_ibkr_order(str(raw["id"]))
+        result = _bridge_result(request, raw)
+    except (httpx.HTTPError, KeyError, ValueError, InvalidOperation) as exc:
+        result = _error_result(request, f"ibkr bridge unavailable: {exc}"[:500])
+    _persist_execution(request, result)
+    return result
+
+
+def _ibkr_execute(
+    request: ExecutionRequest,
+    symbol: str,
+    side: str,
+    quantity_kind: str,
+    base_qty: str,
+    quote_qty: str,
+    mode: str,
+    market_url: str,
+    order_type: str,
+    limit_price: str,
+    time_in_force: str,
+) -> ExecutionResult:
+    if mode == "live":
+        result = _error_result(request, "ibkr live trading not yet available")
+        _persist_execution(request, result)
+        return result
+    if IBKR_MODE == "bridge":
+        return _ibkr_bridge_execute(
+            request,
+            symbol,
+            side,
+            quantity_kind,
+            base_qty,
+            quote_qty,
+            order_type,
+            limit_price,
+            time_in_force,
+        )
+    return _ibkr_paper_stub_execute(
+        request, symbol, side, quantity_kind, base_qty, quote_qty, mode, market_url
+    )
+
+
 def _route_execution(
     request: ExecutionRequest,
     venue: str,
@@ -335,7 +499,7 @@ def _route_execution(
     time_in_force: str,
 ) -> ExecutionResult:
     if venue == "ibkr_us_equity":
-        return _ibkr_paper_execute(
+        return _ibkr_execute(
             request,
             symbol,
             side,
@@ -344,6 +508,9 @@ def _route_execution(
             quote_qty,
             mode,
             os.getenv("MARKET_DATA_URL", "http://market-data:8083"),
+            order_type,
+            limit_price,
+            time_in_force,
         )
     if venue != "binance_spot":
         result = _error_result(request, f"unsupported venue: {venue}")
@@ -439,10 +606,23 @@ def readyz() -> dict[str, str]:
 def cancel_order(
     request: ExecutionRequest,
     x_mode: str = Header(default="paper"),
+    x_venue: str = Header(default="binance_spot"),
     x_symbol: str = Header(default="BTCUSDT"),
     x_venue_order_id: str = Header(default=""),
     x_order_type: str = Header(default="limit"),
 ) -> ExecutionResult:
+    if x_venue == "ibkr_us_equity" and IBKR_MODE == "bridge":
+        try:
+            response = httpx.delete(f"{IBKR_BRIDGE_URL}/orders/{x_venue_order_id}", timeout=5.0)
+            response.raise_for_status()
+            raw = response.json()
+            if not isinstance(raw, dict):
+                raise ValueError("unexpected IBKR bridge response")
+            result = _bridge_result(request, raw)
+        except Exception as exc:  # noqa: BLE001
+            result = _error_result(request, str(exc)[:500])
+        _persist_execution(request, result)
+        return result
     if x_mode != "live" or not LIVE_TRADING_ENABLED:
         raise HTTPException(status_code=403, detail={"code": "LIVE_TRADING_DISABLED"})
     if not EXCHANGE_API_KEY or not EXCHANGE_API_SECRET:
@@ -478,10 +658,23 @@ def cancel_order(
 def refresh_order(
     request: ExecutionRequest,
     x_mode: str = Header(default="paper"),
+    x_venue: str = Header(default="binance_spot"),
     x_symbol: str = Header(default="BTCUSDT"),
     x_venue_order_id: str = Header(default=""),
     x_order_type: str = Header(default="limit"),
 ) -> ExecutionResult:
+    if x_venue == "ibkr_us_equity" and IBKR_MODE == "bridge":
+        try:
+            response = httpx.get(f"{IBKR_BRIDGE_URL}/orders/{x_venue_order_id}", timeout=5.0)
+            response.raise_for_status()
+            raw = response.json()
+            if not isinstance(raw, dict):
+                raise ValueError("unexpected IBKR bridge response")
+            result = _bridge_result(request, raw)
+        except Exception as exc:  # noqa: BLE001
+            result = _error_result(request, str(exc)[:500])
+        _persist_execution(request, result)
+        return result
     if x_mode != "live" or not LIVE_TRADING_ENABLED:
         raise HTTPException(status_code=403, detail={"code": "LIVE_TRADING_DISABLED"})
     if not EXCHANGE_API_KEY or not EXCHANGE_API_SECRET:

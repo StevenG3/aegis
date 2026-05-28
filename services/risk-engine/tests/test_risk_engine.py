@@ -257,7 +257,7 @@ def test_risk_rejects_ibkr_live_when_live_globally_enabled(monkeypatch) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["approved"] is False
-    assert body["reasons"][0]["code"] == "LIVE_NOT_AVAILABLE"
+    assert body["reasons"][0]["code"] == "LIVE_NOT_AVAILABLE_PHASE_21"
     assert "ibkr_us_equity" in body["reasons"][0]["detail"]
 
 

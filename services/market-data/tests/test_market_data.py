@@ -168,6 +168,46 @@ def test_stock_polygon_skipped_when_key_unset(monkeypatch) -> None:
     assert calls["n"] == 0
 
 
+def test_stock_ibkr_provider_returns_price(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setenv("IBKR_BRIDGE_URL", "http://ibkr-bridge:8086")
+
+    def fake_get(url: str, **kwargs: object) -> FakeJSONResponse:
+        calls.append((url, kwargs))
+        return FakeJSONResponse({"symbol": "NVDA", "price": "453.12", "source": "ibkr"})
+
+    monkeypatch.setattr(market_app.httpx, "get", fake_get)
+    assert market_app._ibkr_fetch("NVDA") == {
+        "symbol": "NVDA",
+        "price": "453.12",
+        "source": "ibkr",
+        "asset_type": "stock",
+    }
+    assert calls[0][0] == "http://ibkr-bridge:8086/tickers/NVDA"
+
+
+def test_stock_default_chain_tries_ibkr_before_fallback(monkeypatch) -> None:
+    market_app._STOCK_QUOTE_CACHE.clear()
+    monkeypatch.setenv("FIXTURES_ONLY", "false")
+    monkeypatch.delenv("STOCK_QUOTE_PROVIDER_CHAIN", raising=False)
+    order: list[str] = []
+    monkeypatch.setattr(
+        market_app,
+        "_ibkr_fetch",
+        lambda symbol: order.append("ibkr")
+        or {"symbol": symbol, "price": "453.12", "source": "ibkr", "asset_type": "stock"},
+    )
+    monkeypatch.setattr(
+        market_app,
+        "_polygon_fetch",
+        lambda symbol: order.append("polygon") or None,
+    )
+    response = TestClient(app).get("/ticker", params={"symbol": "NVDA", "asset_type": "stock"})
+    assert response.status_code == 200
+    assert response.json()["source"] == "ibkr"
+    assert order == ["ibkr"]
+
+
 def test_stock_yahoo_provider_returns_price(monkeypatch) -> None:
     def fake_get(url: str, **kwargs: object) -> FakeJSONResponse:
         assert url == "https://query1.finance.yahoo.com/v8/finance/chart/NVDA"

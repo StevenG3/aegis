@@ -86,6 +86,33 @@ STOCK_QUOTE_PROVIDER_CHAIN=polygon,yahoo,fixture
 Yahoo is an unofficial fallback, not a contracted API. Free-form stock orders
 remain out of scope; use scorecards first, then trade from the scorecard.
 
+## Phase 21: IBKR Paper Bridge
+
+Phase 21 adds an optional internal `ibkr-bridge` service for Interactive Brokers
+paper Gateway/TWS. The default remains safe:
+
+```text
+IBKR_MODE=stub
+IBKR_GATEWAY_HOST=host.docker.internal
+IBKR_GATEWAY_PORT=4002
+IBKR_CLIENT_ID=1
+```
+
+`IBKR_MODE=stub` preserves Phase 20 simulated stock fills. To try real IBKR
+paper order routing, start IB Gateway or TWS in paper mode on the host, verify it
+listens on port `4002`, set `IBKR_MODE=bridge`, then restart `ibkr-bridge`,
+`execution-service`, and `market-data`.
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d --build ibkr-bridge execution-service market-data
+curl -s http://127.0.0.1:18086/healthz
+curl -s http://127.0.0.1:18086/readyz
+```
+
+`/healthz` only proves the bridge process is running. `/readyz` returns ready
+only when it can connect to Gateway/TWS. Live IBKR stock trading is still blocked
+with `LIVE_NOT_AVAILABLE_PHASE_21`; Phase 21 is paper-only.
+
 
 ## Phase 2
 

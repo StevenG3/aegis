@@ -39,7 +39,7 @@ def _stock_provider_chain() -> list[str]:
     return [
         provider.strip()
         for provider in os.getenv(
-            "STOCK_QUOTE_PROVIDER_CHAIN", "polygon,yahoo,fixture"
+            "STOCK_QUOTE_PROVIDER_CHAIN", "ibkr,polygon,yahoo,fixture"
         ).split(",")
         if provider.strip()
     ]
@@ -124,6 +124,28 @@ def _polygon_fetch(symbol: str) -> dict[str, str] | None:
     return {"symbol": symbol, "price": str(price), "source": "polygon", "asset_type": "stock"}
 
 
+def _ibkr_fetch(symbol: str) -> dict[str, str] | None:
+    bridge_url = os.getenv("IBKR_BRIDGE_URL", "http://ibkr-bridge:8086").rstrip("/")
+    try:
+        response = httpx.get(f"{bridge_url}/tickers/{symbol}", timeout=5.0)
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    price_raw = body.get("price")
+    if price_raw is None:
+        return None
+    try:
+        price = Decimal(str(price_raw))
+    except (InvalidOperation, ValueError):
+        return None
+    if price <= 0:
+        return None
+    return {"symbol": symbol, "price": str(price), "source": "ibkr", "asset_type": "stock"}
+
+
 def _yahoo_fetch(symbol: str) -> dict[str, str] | None:
     try:
         response = httpx.get(
@@ -161,6 +183,8 @@ def _yahoo_fetch(symbol: str) -> dict[str, str] | None:
 
 
 def _fetch_stock_provider(provider_name: str, symbol: str) -> dict[str, str] | None:
+    if provider_name == "ibkr":
+        return _ibkr_fetch(symbol)
     if provider_name == "polygon":
         return _polygon_fetch(symbol)
     if provider_name == "yahoo":

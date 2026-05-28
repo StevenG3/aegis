@@ -128,8 +128,11 @@ def evaluate(intent: OrderIntent) -> RiskDecision:
         if intent.venue not in LIVE_AVAILABLE_VENUES:
             reasons.append(
                 RiskReason(
-                    code="LIVE_NOT_AVAILABLE",
-                    detail=f"live trading is not yet available for venue={intent.venue}",
+                    code="LIVE_NOT_AVAILABLE_PHASE_21",
+                    detail=(
+                        f"live trading is not yet available for venue={intent.venue}; "
+                        "IBKR live trading remains gated until Phase 22 exposure caps"
+                    ),
                 )
             )
             return _decision(intent, evaluated_at, False, reasons)
