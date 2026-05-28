@@ -3110,3 +3110,122 @@ def test_auto_trade_tick_fail_open_on_http_error(monkeypatch, tmp_path: Path) ->
         .json()["spent_usdt"]
         == "0"
     )
+
+
+def test_live_auto_global_disabled_blocks(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "LIVE_AUTONOMY_GLOBAL_ENABLED", False)
+    payload = {
+        "source": "tradingagents",
+        "conviction": "0.7500",
+        "metadata": {"asset_type": "crypto", "heuristic_conviction": "0.7200"},
+    }
+    settings = {
+        "enabled": True,
+        "daily_live_budget_usdt": "100",
+        "daily_live_trade_count_max": 3,
+        "min_calibrated_conviction": "0.70",
+        "min_closed_outcomes": 20,
+        "allowed_sources": "tradingagents",
+    }
+    assert orchestrator_app._eligible_for_live_auto("tg_1", payload, settings) == (
+        False,
+        "LIVE_AUTONOMY_GLOBAL_DISABLED",
+    )
+    assert orchestrator_app.live_auto_trade_tick() == {
+        "placed": 0,
+        "skipped": 0,
+        "reason": "GLOBAL_DISABLED",
+    }
+
+
+def test_live_auto_no_calibration_blocks(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "LIVE_AUTONOMY_GLOBAL_ENABLED", True)
+    payload = {
+        "source": "tradingagents",
+        "conviction": "0.7500",
+        "metadata": {"asset_type": "crypto", "heuristic_conviction": "0.7200"},
+    }
+    settings = {
+        "enabled": True,
+        "daily_live_budget_usdt": "100",
+        "daily_live_trade_count_max": 3,
+        "min_calibrated_conviction": "0.70",
+        "min_closed_outcomes": 20,
+        "allowed_sources": "tradingagents",
+    }
+    assert orchestrator_app._eligible_for_live_auto("tg_1", payload, settings) == (
+        False,
+        "NO_CALIBRATION_DATA",
+    )
+
+
+def test_live_autonomy_settings_default_and_validation(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+    assert (
+        client.get("/live-autonomy/settings", params={"actor": "tg_1"}).json()["enabled"] is False
+    )
+    assert (
+        client.post(
+            "/live-autonomy/settings", json={"actor": "tg_1", "min_calibrated_conviction": "0.1"}
+        ).json()["code"]
+        == "INVALID_MIN_CONVICTION"
+    )
+    assert (
+        client.post(
+            "/live-autonomy/settings", json={"actor": "tg_1", "per_live_trade_max_usdt": "501"}
+        ).json()["code"]
+        == "INVALID_PER_TRADE"
+    )
+    assert (
+        client.post(
+            "/live-autonomy/settings",
+            json={"actor": "tg_1", "enabled": True, "daily_live_budget_usdt": "100"},
+        ).json()["enabled"]
+        is True
+    )
+
+
+def test_auto_unlock_token_single_use_actor_and_expiry(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    token = orchestrator_app._mint_auto_unlock_unbound_token("tg_1")
+    assert (
+        orchestrator_app._consume_live_unlock_or_error(token, "tg_2", dry=True).status_code == 403
+    )
+    assert orchestrator_app._consume_live_unlock_or_error(token, "tg_1", dry=False) is None
+    assert (
+        orchestrator_app._consume_live_unlock_or_error(token, "tg_1", dry=False).status_code == 403
+    )
+    with orchestrator_app.connect() as conn:
+        expired = orchestrator_app._mint_auto_unlock_unbound_token("tg_1")
+        conn.execute(
+            "update live_unlock_tokens set expires_at = ? where token = ?",
+            ("2000-01-01T00:00:00+00:00", expired),
+        )
+        conn.commit()
+    assert (
+        orchestrator_app._consume_live_unlock_or_error(expired, "tg_1", dry=True).status_code == 410
+    )
+
+
+def test_disable_and_enable_live_autonomy_kill_switch(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "OPS_TOKEN", "ops")
+    monkeypatch.setattr(orchestrator_app, "LIVE_AUTONOMY_GLOBAL_ENABLED", True)
+    client = TestClient(orchestrator_app.app)
+    assert (
+        client.post("/admin/live-autonomy/disable", headers={"x-ops-token": "bad"}).status_code
+        == 403
+    )
+    assert (
+        client.post("/admin/live-autonomy/disable", headers={"x-ops-token": "ops"}).json()["killed"]
+        is True
+    )
+    assert orchestrator_app.LIVE_AUTONOMY_GLOBAL_ENABLED is False
+    assert (
+        client.post("/admin/live-autonomy/enable", headers={"x-ops-token": "ops"}).json()["killed"]
+        is False
+    )
+    assert orchestrator_app.LIVE_AUTONOMY_GLOBAL_ENABLED is False

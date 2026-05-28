@@ -248,3 +248,20 @@ The orchestrator can keep an actor-scoped watchlist and periodically ask the ana
 ### Phase 15 paper autonomy
 
 The orchestrator can recompute conviction calibration from reflected closed scorecard outcomes with `POST /calibration/recompute`; analysis-adapter records both `heuristic_conviction` and `calibrated_conviction` in scorecard metadata. Paper autonomy is opt-in per actor via `/autonomy/settings`, bounded by `daily_budget_usdt`, `per_trade_usdt`, `min_conviction`, and `allowed_sources`. Auto-trades hard-code `mode=paper` and call the existing `/intents/from_scorecard` path through `ORCHESTRATOR_SELF_URL`.
+
+## Phase 16: Gated Live Autonomy
+
+Phase 16 adds live-autonomy controls, but the default remains fully off. A live autonomous order can fire only when all gates pass: `LIVE_TRADING_ENABLED=true`, exchange credentials are present, `LIVE_AUTONOMY_GLOBAL_ENABLED=true`, the actor has opted in through `/live-autonomy/settings`, calibration sample thresholds pass, daily spend and trade-count limits have room, drawdown is not breached, and the global live-autonomy kill switch is not engaged.
+
+Operator controls:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/live-autonomy/settings   -H 'content-type: application/json'   -d '{"actor":"tg_5175667339","enabled":true,"daily_live_budget_usdt":"100","per_live_trade_max_usdt":"25","min_calibrated_conviction":"0.75"}'
+
+curl -s 'http://127.0.0.1:8080/live-autonomy/settings?actor=tg_5175667339'
+curl -s 'http://127.0.0.1:8080/live-autonomy/today?actor=tg_5175667339'
+curl -s -X POST http://127.0.0.1:8080/admin/live-autonomy/disable
+curl -s -X POST http://127.0.0.1:8080/admin/live-autonomy/enable
+```
+
+The autonomous live path mints a two-minute, single-use, actor-scoped unlock token internally. Because `/intents/from_scorecard` still generates `intent_id` internally, Phase 16 auto-minted tokens are not pre-bound to an intent id; manual live unlock tokens remain single-use and can be bound by future schema work.

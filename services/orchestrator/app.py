@@ -68,6 +68,9 @@ SCHEDULER_BATCH_LIMIT = int(os.getenv("SCHEDULER_BATCH_LIMIT", "5"))
 ORCHESTRATOR_SELF_URL = os.getenv("ORCHESTRATOR_SELF_URL", "http://localhost:8080")
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "true").lower() == "true"
 AUTO_TRADE_BATCH_LIMIT = int(os.getenv("AUTO_TRADE_BATCH_LIMIT", "5"))
+LIVE_AUTONOMY_GLOBAL_ENABLED = os.getenv("LIVE_AUTONOMY_GLOBAL_ENABLED", "false").lower() == "true"
+LIVE_AUTO_TICK_SEC = float(os.getenv("LIVE_AUTO_TICK_SEC", "300"))
+LIVE_AUTO_BATCH_LIMIT = int(os.getenv("LIVE_AUTO_BATCH_LIMIT", "1"))
 CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "5"))
 CALIBRATION_SHRINKAGE_K = Decimal(os.getenv("CALIBRATION_SHRINKAGE_K", "10"))
 _scheduler_task: asyncio.Task[None] | None = None
@@ -142,6 +145,19 @@ class ScorecardIntentRequest(BaseModel):
     request_id: UUID | None = None
 
 
+class LiveAutonomyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = PydanticField(min_length=1)
+    enabled: bool | None = None
+    daily_live_budget_usdt: str | None = None
+    per_live_trade_max_usdt: str | None = None
+    daily_live_trade_count_max: int | None = None
+    min_calibrated_conviction: str | None = None
+    min_closed_outcomes: int | None = None
+    allowed_sources: str | None = None
+
+
 class AutonomyUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -170,6 +186,7 @@ class LiveUnlockRequest(BaseModel):
 
 ScorecardCreateRequest.model_rebuild(_types_namespace={"Literal": Literal})
 ScorecardIntentRequest.model_rebuild(_types_namespace={"Literal": Literal, "UUID": UUID})
+LiveAutonomyUpdateRequest.model_rebuild()
 AutonomyUpdateRequest.model_rebuild()
 WatchlistAddRequest.model_rebuild(_types_namespace={"Literal": Literal})
 LiveUnlockRequest.model_rebuild()
@@ -264,6 +281,7 @@ def scheduler_tick(now: datetime | None = None) -> dict[str, int]:
 
 
 async def _scheduler_loop() -> None:
+    last_live_auto_tick = 0.0
     while True:
         try:
             scheduler_tick()
@@ -273,6 +291,13 @@ async def _scheduler_loop() -> None:
             auto_trade_tick()
         except Exception:
             pass
+        now_mono = time.monotonic()
+        if now_mono - last_live_auto_tick >= LIVE_AUTO_TICK_SEC:
+            try:
+                live_auto_trade_tick()
+            except Exception:
+                pass
+            last_live_auto_tick = now_mono
         await asyncio.sleep(SCHEDULER_TICK_SEC)
 
 
@@ -833,14 +858,17 @@ def _build_intent_from_nl(nl: NLIntentRequest, fields: dict[str, object]) -> Ord
     )
 
 
-def _consume_live_unlock_or_error(token: str, actor: str, dry: bool) -> JSONResponse | None:
+def _consume_live_unlock_or_error(
+    token: str, actor: str, dry: bool, intent_id: UUID | None = None
+) -> JSONResponse | None:
     """Validate or consume a single-use live-unlock token."""
     if not token:
         return JSONResponse(status_code=403, content={"code": "LIVE_UNLOCK_REQUIRED"})
     now_iso = _now().isoformat()
     with connect() as conn:
         row = conn.execute(
-            "select actor, expires_at, consumed_at from live_unlock_tokens where token = ?",
+            "select actor, expires_at, consumed_at, bound_intent_id "
+            "from live_unlock_tokens where token = ?",
             (token,),
         ).fetchone()
     if row is None:
@@ -851,6 +879,9 @@ def _consume_live_unlock_or_error(token: str, actor: str, dry: bool) -> JSONResp
         return JSONResponse(status_code=403, content={"code": "LIVE_UNLOCK_ALREADY_USED"})
     if row["expires_at"] < now_iso:
         return JSONResponse(status_code=410, content={"code": "LIVE_UNLOCK_EXPIRED"})
+    if row["bound_intent_id"] is not None:
+        if intent_id is None or row["bound_intent_id"] != str(intent_id):
+            return JSONResponse(status_code=403, content={"code": "LIVE_UNLOCK_INTENT_MISMATCH"})
     if not dry:
         with connect() as conn:
             cursor = conn.execute(
@@ -935,6 +966,244 @@ def healthz() -> dict[str, str]:
 @app.get("/readyz")
 def readyz() -> dict[str, str]:
     return {"status": "ready"}
+
+
+def _live_kill_switch_active() -> bool:
+    with connect() as conn:
+        row = conn.execute("select killed from live_autonomy_kill where id = 1").fetchone()
+    return bool(row and row["killed"])
+
+
+def _default_live_autonomy(actor: str) -> dict[str, object]:
+    return {
+        "actor": actor,
+        "enabled": False,
+        "daily_live_budget_usdt": "0",
+        "per_live_trade_max_usdt": "50",
+        "daily_live_trade_count_max": 3,
+        "min_calibrated_conviction": "0.70",
+        "min_closed_outcomes": 20,
+        "allowed_sources": "tradingagents",
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+def _live_autonomy_row_to_dict(actor: str, row: sqlite3.Row | None) -> dict[str, object]:
+    if row is None:
+        return _default_live_autonomy(actor)
+    return {
+        "actor": actor,
+        "enabled": bool(row["enabled"]),
+        "daily_live_budget_usdt": str(row["daily_live_budget_usdt"]),
+        "per_live_trade_max_usdt": str(row["per_live_trade_max_usdt"]),
+        "daily_live_trade_count_max": int(row["daily_live_trade_count_max"]),
+        "min_calibrated_conviction": str(row["min_calibrated_conviction"]),
+        "min_closed_outcomes": int(row["min_closed_outcomes"]),
+        "allowed_sources": str(row["allowed_sources"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _check_drawdown_for_live_auto(actor: str) -> str | None:
+    try:
+        body = get_pnl_today(actor=actor)
+    except Exception:
+        return "DRAWDOWN_CHECK_UNAVAILABLE"
+    if isinstance(body, JSONResponse):
+        return "DRAWDOWN_CHECK_UNAVAILABLE"
+    try:
+        total = Decimal(str(body.get("total_pnl", "0")))
+    except (InvalidOperation, ValueError):
+        return "DRAWDOWN_CHECK_UNAVAILABLE"
+    cap = Decimal(os.getenv("DAILY_DRAWDOWN_HARD_STOP_USDT", "1000"))
+    if total <= -cap:
+        return "DAILY_DRAWDOWN_BREACHED"
+    return None
+
+
+def _eligible_for_live_auto(
+    actor: str, scorecard: dict[str, object], settings: dict[str, object]
+) -> tuple[bool, str]:
+    if not LIVE_AUTONOMY_GLOBAL_ENABLED:
+        return False, "LIVE_AUTONOMY_GLOBAL_DISABLED"
+    if _live_kill_switch_active():
+        return False, "LIVE_AUTONOMY_KILL_SWITCH"
+    if not settings.get("enabled"):
+        return False, "ACTOR_NOT_OPTED_IN"
+    source = str(scorecard.get("source", ""))
+    allowed = {s.strip() for s in str(settings.get("allowed_sources", "")).split(",") if s.strip()}
+    if source not in allowed:
+        return False, "SOURCE_NOT_ALLOWED"
+    try:
+        conviction = Decimal(str(scorecard.get("conviction", "0")))
+        min_conv = Decimal(str(settings.get("min_calibrated_conviction", "0.70")))
+    except (InvalidOperation, ValueError):
+        return False, "INVALID_CONVICTION"
+    if conviction < min_conv:
+        return False, "BELOW_MIN_CONVICTION"
+    metadata = scorecard.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return False, "MISSING_METADATA"
+    asset_type = str(metadata.get("asset_type") or "crypto")
+    heuristic_raw = metadata.get("heuristic_conviction")
+    if heuristic_raw is None:
+        return False, "MISSING_HEURISTIC"
+    try:
+        heuristic = Decimal(str(heuristic_raw))
+    except (InvalidOperation, ValueError):
+        return False, "INVALID_HEURISTIC"
+    bucket = _bucket_label(heuristic)
+    if bucket is None:
+        return False, "HEURISTIC_OUT_OF_RANGE"
+    with connect() as conn:
+        cal = conn.execute(
+            "select sample_count, calibrated_conviction from conviction_calibration "
+            "where source = ? and asset_type = ? and heuristic_bucket = ?",
+            (source, asset_type, bucket),
+        ).fetchone()
+    if cal is None:
+        return False, "NO_CALIBRATION_DATA"
+    if int(cal["sample_count"]) < int(str(settings.get("min_closed_outcomes", 20))):
+        return False, "INSUFFICIENT_SAMPLES"
+    today = _today()
+    with connect() as conn:
+        spend = conn.execute(
+            "select spent_usdt, trade_count from live_autonomy_spend where actor = ? and date = ?",
+            (actor, today),
+        ).fetchone()
+    spent = Decimal(str(spend["spent_usdt"])) if spend else Decimal("0")
+    count = int(spend["trade_count"]) if spend else 0
+    budget = Decimal(str(settings.get("daily_live_budget_usdt", "0")))
+    if spent >= budget:
+        return False, "DAILY_BUDGET_EXHAUSTED"
+    if count >= int(str(settings.get("daily_live_trade_count_max", 3))):
+        return False, "DAILY_TRADE_COUNT_EXHAUSTED"
+    pnl_block = _check_drawdown_for_live_auto(actor)
+    if pnl_block is not None:
+        return False, pnl_block
+    return True, "OK"
+
+
+def _mint_auto_unlock_unbound_token(actor: str) -> str:
+    token = str(uuid4())
+    created = _now()
+    expires = created + timedelta(minutes=2)
+    with connect() as conn:
+        conn.execute(
+            "insert into live_unlock_tokens "
+            "(token, actor, created_at, expires_at, consumed_at, bound_intent_id) "
+            "values (?, ?, ?, ?, NULL, NULL)",
+            (token, actor, created.isoformat(), expires.isoformat()),
+        )
+        conn.commit()
+    return token
+
+
+def _record_live_autonomy_spend(actor: str, date: str, amount: Decimal) -> None:
+    now_iso = _now().isoformat()
+    with connect() as conn:
+        row = conn.execute(
+            "select spent_usdt, trade_count from live_autonomy_spend where actor = ? and date = ?",
+            (actor, date),
+        ).fetchone()
+        spent = _q8((Decimal(str(row["spent_usdt"])) if row else Decimal("0")) + amount)
+        count = (int(row["trade_count"]) if row else 0) + 1
+        conn.execute(
+            "insert into live_autonomy_spend "
+            "(actor, date, spent_usdt, trade_count, last_updated) values (?, ?, ?, ?, ?) "
+            "on conflict(actor, date) do update set spent_usdt = excluded.spent_usdt, "
+            "trade_count = excluded.trade_count, last_updated = excluded.last_updated",
+            (actor, date, _q8s(spent), count, now_iso),
+        )
+        conn.commit()
+
+
+def _fire_live_autonomous_trade(actor: str, scorecard_id: str, usdt_budget: Decimal) -> bool:
+    token = _mint_auto_unlock_unbound_token(actor)
+    payload = {
+        "scorecard_id": scorecard_id,
+        "actor": actor,
+        "idempotency_key": f"live-auto-{actor}-{scorecard_id[:8]}-{int(time.time())}",
+        "usdt_budget": str(usdt_budget),
+        "position_fraction": "1.0",
+        "mode": "live",
+    }
+    try:
+        response = httpx.post(
+            f"{ORCHESTRATOR_SELF_URL}/intents/from_scorecard",
+            json=payload,
+            headers={"x-live-unlock": token},
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    return isinstance(body, dict) and body.get("status") == "executed"
+
+
+def live_auto_trade_tick(now: datetime | None = None) -> dict[str, object]:
+    if not LIVE_AUTONOMY_GLOBAL_ENABLED:
+        return {"placed": 0, "skipped": 0, "reason": "GLOBAL_DISABLED"}
+    if _live_kill_switch_active():
+        return {"placed": 0, "skipped": 0, "reason": "KILL_SWITCH"}
+    current = now or _now()
+    placed = 0
+    skipped = 0
+    with connect() as conn:
+        actors = conn.execute(
+            "select actor, enabled, daily_live_budget_usdt, per_live_trade_max_usdt, "
+            "daily_live_trade_count_max, min_calibrated_conviction, min_closed_outcomes, "
+            "allowed_sources, created_at, updated_at from live_autonomy_settings where enabled = 1"
+        ).fetchall()
+    for actor_row in actors:
+        actor = str(actor_row["actor"])
+        settings = _live_autonomy_row_to_dict(actor, actor_row)
+        with connect() as conn:
+            candidates = conn.execute(
+                """
+                select scorecard_id, payload_json, source from scorecards
+                where actor = ? and consumed_by_intent_id is NULL
+                  and expires_at > ?
+                  and action in ('buy','sell')
+                order by created_at asc limit ?
+                """,
+                (actor, current.isoformat(), LIVE_AUTO_BATCH_LIMIT),
+            ).fetchall()
+        for row in candidates:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if not isinstance(payload, dict):
+                skipped += 1
+                continue
+            eligible, _reason = _eligible_for_live_auto(actor, payload, settings)
+            if not eligible:
+                skipped += 1
+                continue
+            today = current.strftime("%Y-%m-%d")
+            with connect() as conn:
+                spend_row = conn.execute(
+                    "select spent_usdt from live_autonomy_spend where actor = ? and date = ?",
+                    (actor, today),
+                ).fetchone()
+            spent = Decimal(str(spend_row["spent_usdt"])) if spend_row else Decimal("0")
+            budget = Decimal(str(settings["daily_live_budget_usdt"]))
+            per_trade = Decimal(str(settings["per_live_trade_max_usdt"]))
+            spend_amount = min(per_trade, budget - spent)
+            if spend_amount < Decimal("10"):
+                skipped += 1
+                continue
+            if _fire_live_autonomous_trade(actor, str(row["scorecard_id"]), spend_amount):
+                placed += 1
+                _record_live_autonomy_spend(actor, today, spend_amount)
+                break
+            skipped += 1
+    return {"placed": placed, "skipped": skipped}
 
 
 def _record_autonomy_spend(actor: str, date: str, amount: Decimal) -> None:
@@ -1239,6 +1508,150 @@ def get_autonomy_today(actor: str | None = None) -> JSONResponse | dict[str, obj
     with connect() as conn:
         row = conn.execute(
             "select spent_usdt, trade_count from autonomy_spend where actor = ? and date = ?",
+            (actor, today),
+        ).fetchone()
+    return {
+        "actor": actor,
+        "date": today,
+        "spent_usdt": str(row["spent_usdt"]) if row else "0",
+        "trade_count": int(row["trade_count"]) if row else 0,
+    }
+
+
+@app.post("/admin/live-autonomy/disable", response_model=None)
+def disable_live_autonomy(
+    x_ops_token: str = Header(default=""),
+) -> JSONResponse | dict[str, object]:
+    if not OPS_TOKEN or x_ops_token != OPS_TOKEN:
+        return JSONResponse(status_code=403, content={"code": "INVALID_OPS_TOKEN"})
+    global LIVE_AUTONOMY_GLOBAL_ENABLED
+    LIVE_AUTONOMY_GLOBAL_ENABLED = False
+    killed_at = _now().isoformat()
+    with connect() as conn:
+        conn.execute(
+            "update live_autonomy_kill set killed = 1, killed_at = ?, killed_by = ? where id = 1",
+            (killed_at, "ops_token"),
+        )
+        conn.commit()
+    return {"killed": True, "killed_at": killed_at}
+
+
+@app.post("/admin/live-autonomy/enable", response_model=None)
+def reenable_live_autonomy(
+    x_ops_token: str = Header(default=""),
+) -> JSONResponse | dict[str, object]:
+    if not OPS_TOKEN or x_ops_token != OPS_TOKEN:
+        return JSONResponse(status_code=403, content={"code": "INVALID_OPS_TOKEN"})
+    with connect() as conn:
+        conn.execute(
+            "update live_autonomy_kill set killed = 0, killed_at = ?, "
+            "killed_by = NULL where id = 1",
+            (_now().isoformat(),),
+        )
+        conn.commit()
+    return {"killed": False, "note": "kill flag cleared; env var still gates"}
+
+
+@app.post("/live-autonomy/settings", response_model=None)
+def update_live_autonomy(req: LiveAutonomyUpdateRequest) -> JSONResponse | dict[str, object]:
+    with connect() as conn:
+        row = conn.execute(
+            "select enabled, daily_live_budget_usdt, per_live_trade_max_usdt, "
+            "daily_live_trade_count_max, min_calibrated_conviction, min_closed_outcomes, "
+            "allowed_sources, created_at, updated_at from live_autonomy_settings where actor = ?",
+            (req.actor,),
+        ).fetchone()
+    current = _live_autonomy_row_to_dict(req.actor, row)
+    now_iso = _now().isoformat()
+    if current["created_at"] is None:
+        current["created_at"] = now_iso
+    if req.enabled is not None:
+        current["enabled"] = req.enabled
+    try:
+        if req.daily_live_budget_usdt is not None:
+            if Decimal(req.daily_live_budget_usdt) < 0:
+                return JSONResponse(status_code=400, content={"code": "INVALID_BUDGET"})
+            current["daily_live_budget_usdt"] = req.daily_live_budget_usdt
+        if req.per_live_trade_max_usdt is not None:
+            per_trade = Decimal(req.per_live_trade_max_usdt)
+            if per_trade <= 0 or per_trade > Decimal("500"):
+                return JSONResponse(status_code=400, content={"code": "INVALID_PER_TRADE"})
+            current["per_live_trade_max_usdt"] = req.per_live_trade_max_usdt
+        if req.min_calibrated_conviction is not None:
+            min_conv = Decimal(req.min_calibrated_conviction)
+            if not (Decimal("0.5") <= min_conv <= Decimal("1.0")):
+                return JSONResponse(status_code=400, content={"code": "INVALID_MIN_CONVICTION"})
+            current["min_calibrated_conviction"] = req.min_calibrated_conviction
+    except (InvalidOperation, ValueError):
+        return JSONResponse(status_code=400, content={"code": "INVALID_DECIMAL"})
+    if req.daily_live_trade_count_max is not None:
+        if req.daily_live_trade_count_max < 1 or req.daily_live_trade_count_max > 10:
+            return JSONResponse(status_code=400, content={"code": "INVALID_TRADE_COUNT"})
+        current["daily_live_trade_count_max"] = req.daily_live_trade_count_max
+    if req.min_closed_outcomes is not None:
+        if req.min_closed_outcomes < 5:
+            return JSONResponse(status_code=400, content={"code": "INVALID_MIN_CLOSED_OUTCOMES"})
+        current["min_closed_outcomes"] = req.min_closed_outcomes
+    if req.allowed_sources is not None:
+        current["allowed_sources"] = req.allowed_sources
+    current["updated_at"] = now_iso
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into live_autonomy_settings
+              (actor, enabled, daily_live_budget_usdt, per_live_trade_max_usdt,
+               daily_live_trade_count_max, min_calibrated_conviction, min_closed_outcomes,
+               allowed_sources, created_at, updated_at)
+            values (?,?,?,?,?,?,?,?,?,?)
+            on conflict(actor) do update set
+              enabled = excluded.enabled,
+              daily_live_budget_usdt = excluded.daily_live_budget_usdt,
+              per_live_trade_max_usdt = excluded.per_live_trade_max_usdt,
+              daily_live_trade_count_max = excluded.daily_live_trade_count_max,
+              min_calibrated_conviction = excluded.min_calibrated_conviction,
+              min_closed_outcomes = excluded.min_closed_outcomes,
+              allowed_sources = excluded.allowed_sources,
+              updated_at = excluded.updated_at
+            """,
+            (
+                req.actor,
+                1 if current["enabled"] else 0,
+                current["daily_live_budget_usdt"],
+                current["per_live_trade_max_usdt"],
+                current["daily_live_trade_count_max"],
+                current["min_calibrated_conviction"],
+                current["min_closed_outcomes"],
+                current["allowed_sources"],
+                current["created_at"],
+                current["updated_at"],
+            ),
+        )
+        conn.commit()
+    return current
+
+
+@app.get("/live-autonomy/settings", response_model=None)
+def get_live_autonomy_settings(actor: str | None = None) -> JSONResponse | dict[str, object]:
+    if not actor:
+        return JSONResponse(status_code=400, content={"code": "ACTOR_REQUIRED"})
+    with connect() as conn:
+        row = conn.execute(
+            "select enabled, daily_live_budget_usdt, per_live_trade_max_usdt, "
+            "daily_live_trade_count_max, min_calibrated_conviction, min_closed_outcomes, "
+            "allowed_sources, created_at, updated_at from live_autonomy_settings where actor = ?",
+            (actor,),
+        ).fetchone()
+    return _live_autonomy_row_to_dict(actor, row)
+
+
+@app.get("/live-autonomy/today", response_model=None)
+def get_live_autonomy_today(actor: str | None = None) -> JSONResponse | dict[str, object]:
+    if not actor:
+        return JSONResponse(status_code=400, content={"code": "ACTOR_REQUIRED"})
+    today = _today()
+    with connect() as conn:
+        row = conn.execute(
+            "select spent_usdt, trade_count from live_autonomy_spend where actor = ? and date = ?",
             (actor, today),
         ).fetchone()
     return {
@@ -1846,7 +2259,9 @@ def create_intent(
         return _idempotent_response(existing)
 
     if intent.mode == "live":
-        unlock_error = _consume_live_unlock_or_error(str(x_live_unlock), intent.actor, dry=True)
+        unlock_error = _consume_live_unlock_or_error(
+            str(x_live_unlock), intent.actor, dry=True, intent_id=intent.intent_id
+        )
         if unlock_error is not None:
             return unlock_error
 
@@ -1886,7 +2301,7 @@ def create_intent(
             base_qty, _ = _resolve_qty(intent, _market_url())
         if intent.mode == "live":
             unlock_error = _consume_live_unlock_or_error(
-                str(x_live_unlock), intent.actor, dry=False
+                str(x_live_unlock), intent.actor, dry=False, intent_id=intent.intent_id
             )
             if unlock_error is not None:
                 return unlock_error
