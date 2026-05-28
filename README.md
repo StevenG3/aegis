@@ -1,8 +1,10 @@
-# Trading Agent Phase 1
+# Aegis
+
+> Aegis is a private Hermes trading gateway. It is not the official TradingAgents project.
 
 > This system can place real orders in later phases. Phase 1 ships with all trading paths disabled. Do not enable live mode until Phase 9.
 
-Phase 1 creates four local HTTP service skeletons for paper-only order-intent validation and simulated execution. Live trading is disabled, no exchange keys are required or used, and no service connects to Binance or any other exchange.
+Phase 1 creates local HTTP service skeletons for paper-only order-intent validation and simulated execution. Live trading is disabled, no exchange keys are required or used, and no service connects to Binance or any other exchange.
 
 ## Run
 
@@ -288,6 +290,10 @@ The request returns immediately with `{"job_id":"...","status":"queued"}`. Poll 
 TradingAgents analysts are originally equity-focused. Crypto support depends on TradingAgents' own dataflows; this adapter does not compensate for missing crypto-native data sources, so treat crypto reports with appropriate skepticism until upstream data sources improve.
 
 The conviction heuristic is intentionally simple: hold maps to `0.30`; buy/sell starts at `0.50` and adds `0.10` for each populated analyst report, capped at `0.90`. Future phases can refine this from TA debate margins and historical hit rate.
+
+Notification webhooks still sign requests with the legacy
+`x-trading-agent-signature` header for compatibility with existing Hermes
+routes. New user-facing documentation should call this service Aegis.
 
 ## Phase 12: Scorecard Outcomes
 

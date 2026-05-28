@@ -152,7 +152,7 @@ def _yahoo_fetch(symbol: str) -> dict[str, str] | None:
             f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
             params={"interval": "1d", "range": "1d"},
             timeout=5.0,
-            headers={"user-agent": "trading-agent/1.0"},
+            headers={"user-agent": "aegis/1.0"},
         )
         response.raise_for_status()
         body = response.json()

@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def db_path() -> Path:
-    data_dir = Path(os.getenv("DATA_DIR", "/tmp/trading-agent-data"))
+    data_dir = Path(os.getenv("DATA_DIR", "/tmp/aegis-data"))
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir / "analysis_adapter.sqlite"
 
