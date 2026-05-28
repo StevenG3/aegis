@@ -110,6 +110,53 @@ def _canonical_crypto_symbol(symbol: str, asset_type: str) -> str:
     return f"{base}USDT"
 
 
+def _bucket_label_for(heuristic: float) -> str | None:
+    for lo, hi in [
+        (0.30, 0.40),
+        (0.40, 0.50),
+        (0.50, 0.60),
+        (0.60, 0.70),
+        (0.70, 0.80),
+        (0.80, 0.90),
+        (0.90, 1.01),
+    ]:
+        if lo <= heuristic < hi:
+            return f"{lo:.2f}-{hi:.2f}"
+    return None
+
+
+def _calibrated_conviction(heuristic: float, source: str, asset_type: str) -> float:
+    bucket = _bucket_label_for(heuristic)
+    if bucket is None:
+        return heuristic
+    try:
+        response = httpx.get(
+            f"{ORCHESTRATOR_URL}/calibration",
+            params={"source": source, "asset_type": asset_type},
+            timeout=3.0,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return heuristic
+    items = body.get("items", []) if isinstance(body, dict) else []
+    if not isinstance(items, list):
+        return heuristic
+    for row in items:
+        if not isinstance(row, dict) or row.get("heuristic_bucket") != bucket:
+            continue
+        if int(row.get("sample_count", 0)) < int(body.get("min_samples", 5)):
+            return heuristic
+        try:
+            calibrated = row.get("calibrated_conviction")
+            if calibrated is None:
+                return heuristic
+            return float(str(calibrated))
+        except (TypeError, ValueError):
+            return heuristic
+    return heuristic
+
+
 def _benchmark_for(asset_type: str) -> str:
     return BENCHMARK_FOR_ASSET.get(asset_type, "SPY")
 
@@ -361,8 +408,14 @@ def _translate_to_scorecard_payload(
     reports = raw.get("reports", {}) or {}
     if not isinstance(reports, dict):
         reports = {}
-    conviction = _derive_conviction(action, reports)
+    heuristic = _derive_conviction(action, reports)
+    calibrated = _calibrated_conviction(
+        heuristic=heuristic, source="tradingagents", asset_type=req.asset_type
+    )
+    conviction = calibrated
     metadata = {f"report_{k}": _truncate(str(v), 2000) for k, v in reports.items() if v}
+    metadata["heuristic_conviction"] = f"{heuristic:.4f}"
+    metadata["calibrated_conviction"] = f"{calibrated:.4f}"
     metadata["ta_decision"] = decision
     metadata["asset_type"] = req.asset_type
     metadata["provider"] = str(raw.get("provider", req.provider or TA_DEFAULT_PROVIDER))

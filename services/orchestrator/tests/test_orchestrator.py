@@ -2837,3 +2837,276 @@ def test_scheduler_tick_fires_due_watchlist_and_reschedules(monkeypatch, tmp_pat
         ).fetchone()
     assert row["last_run_at"] == now.isoformat()
     assert row["next_run_at"] == (now + timedelta(minutes=15)).isoformat()
+
+
+def _seed_calibration_outcome(
+    *,
+    actor: str = "tg_1",
+    source: str = "tradingagents",
+    asset_type: str = "crypto",
+    heuristic: str = "0.7000",
+    alpha: str = "0.01000000",
+) -> None:
+    import uuid
+
+    scorecard_id = str(uuid.uuid4())
+    outcome_id = str(uuid.uuid4())
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into scorecards "
+            "(scorecard_id, actor, symbol, action, source, payload_json, created_at, expires_at) "
+            "values (?,?,?,?,?,?,?,?)",
+            (
+                scorecard_id,
+                actor,
+                "ETHUSDT",
+                "buy",
+                source,
+                json.dumps(
+                    {
+                        "conviction": heuristic,
+                        "metadata": {
+                            "heuristic_conviction": heuristic,
+                            "asset_type": asset_type,
+                        },
+                    }
+                ),
+                "2026-05-25T00:00:00+00:00",
+                "2026-05-26T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            "insert into scorecard_outcomes "
+            "(outcome_id, scorecard_id, actor, symbol, source, action, opened_intent_id, "
+            "opened_at, opened_qty, opened_avg_cost, opened_cost_basis, status, closed_at, "
+            "closed_realized_pnl, closed_return_pct, notes, reflected_at) "
+            "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                outcome_id,
+                scorecard_id,
+                actor,
+                "ETHUSDT",
+                source,
+                "buy",
+                str(uuid.uuid4()),
+                "2026-05-25T00:00:00+00:00",
+                "1.00000000",
+                "100.00000000",
+                "100.00000000",
+                "closed",
+                "2026-05-26T00:00:00+00:00",
+                "1.00000000",
+                alpha,
+                None,
+                "2026-05-26T00:01:00+00:00",
+            ),
+        )
+        conn.commit()
+
+
+def _seed_autonomy_scorecard(
+    *,
+    actor: str = "tg_1",
+    source: str = "tradingagents",
+    action: str = "buy",
+    conviction: str = "0.8000",
+    consumed: bool = False,
+    expires_at: str = "2026-05-26T00:00:00+00:00",
+) -> str:
+    import uuid
+
+    scorecard_id = str(uuid.uuid4())
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into scorecards "
+            "(scorecard_id, actor, symbol, action, source, payload_json, created_at, "
+            "expires_at, consumed_by_intent_id) values (?,?,?,?,?,?,?,?,?)",
+            (
+                scorecard_id,
+                actor,
+                "ETHUSDT",
+                action,
+                source,
+                json.dumps({"conviction": conviction}),
+                "2026-05-25T00:00:00+00:00",
+                expires_at,
+                "intent-used" if consumed else None,
+            ),
+        )
+        conn.commit()
+    return scorecard_id
+
+
+def test_recompute_with_no_outcomes_returns_zero_buckets(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+    response = client.post("/calibration/recompute")
+    assert response.status_code == 200
+    assert response.json() == {"buckets_written": 0, "rows_considered": 0}
+
+
+def test_recompute_bucketing_correct(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    for _ in range(12):
+        _seed_calibration_outcome(heuristic="0.7200", alpha="0.01000000")
+    for _ in range(8):
+        _seed_calibration_outcome(heuristic="0.6200", alpha="-0.01000000")
+    client = TestClient(orchestrator_app.app)
+    assert client.post("/calibration/recompute").json()["buckets_written"] == 2
+    items = client.get("/calibration", params={"source": "tradingagents"}).json()["items"]
+    by_bucket = {item["heuristic_bucket"]: item for item in items}
+    assert by_bucket["0.70-0.80"]["sample_count"] == 12
+    assert by_bucket["0.70-0.80"]["hit_count"] == 12
+    assert by_bucket["0.60-0.70"]["sample_count"] == 8
+    assert by_bucket["0.60-0.70"]["hit_count"] == 0
+
+
+def test_recompute_shrinkage_pulls_low_sample_toward_half(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    for _ in range(2):
+        _seed_calibration_outcome(heuristic="0.8200", alpha="0.01000000")
+    client = TestClient(orchestrator_app.app)
+    client.post("/calibration/recompute")
+    item = client.get("/calibration").json()["items"][0]
+    assert item["empirical_hit_rate"] == "1.00000000"
+    assert Decimal(item["calibrated_conviction"]) < Decimal("1")
+    assert Decimal(item["calibrated_conviction"]) > Decimal("0.5")
+
+
+def test_recompute_is_idempotent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _seed_calibration_outcome(heuristic="0.7200", alpha="0.01000000")
+    client = TestClient(orchestrator_app.app)
+    client.post("/calibration/recompute")
+    first = [
+        {k: v for k, v in item.items() if k != "updated_at"}
+        for item in client.get("/calibration").json()["items"]
+    ]
+    client.post("/calibration/recompute")
+    second = [
+        {k: v for k, v in item.items() if k != "updated_at"}
+        for item in client.get("/calibration").json()["items"]
+    ]
+    assert second == first
+
+
+def test_autonomy_settings_default_disabled(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    body = (
+        TestClient(orchestrator_app.app).get("/autonomy/settings", params={"actor": "tg_1"}).json()
+    )
+    assert body["enabled"] is False
+    assert body["daily_budget_usdt"] == "0"
+
+
+def test_autonomy_settings_update_and_validation(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+    assert (
+        client.post("/autonomy/settings", json={"actor": "tg_1", "daily_budget_usdt": "-1"}).json()[
+            "code"
+        ]
+        == "INVALID_BUDGET"
+    )
+    assert (
+        client.post("/autonomy/settings", json={"actor": "tg_1", "min_conviction": "1.5"}).json()[
+            "code"
+        ]
+        == "INVALID_MIN_CONVICTION"
+    )
+    updated = client.post(
+        "/autonomy/settings",
+        json={"actor": "tg_1", "enabled": True, "daily_budget_usdt": "100", "per_trade_usdt": "50"},
+    ).json()
+    assert updated["enabled"] is True
+    assert (
+        client.get("/autonomy/settings", params={"actor": "tg_1"}).json()["daily_budget_usdt"]
+        == "100"
+    )
+
+
+def test_auto_trade_tick_places_paper_trade_and_records_spend(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    now = datetime(2026, 5, 25, 0, 0, tzinfo=UTC)
+    scorecard_id = _seed_autonomy_scorecard()
+    TestClient(orchestrator_app.app).post(
+        "/autonomy/settings",
+        json={"actor": "tg_1", "enabled": True, "daily_budget_usdt": "100", "per_trade_usdt": "50"},
+    )
+    captured: list[dict[str, object]] = []
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        captured.append(kwargs.get("json") or {})
+        return FakeResponse({"ok": True})
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    assert orchestrator_app.auto_trade_tick(now=now) == {
+        "placed": 1,
+        "skipped_budget": 0,
+        "skipped_other": 0,
+    }
+    assert captured[0]["scorecard_id"] == scorecard_id
+    assert captured[0]["mode"] == "paper"
+    with orchestrator_app.connect() as conn:
+        spend = conn.execute(
+            "select spent_usdt from autonomy_spend where actor = ? and date = ?",
+            ("tg_1", "2026-05-25"),
+        ).fetchone()
+    assert spend["spent_usdt"] == "50.00000000"
+
+
+def test_auto_trade_tick_filters_and_budget(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    now = datetime(2026, 5, 25, 0, 0, tzinfo=UTC)
+    _seed_autonomy_scorecard(conviction="0.6000")
+    _seed_autonomy_scorecard(source="manual")
+    _seed_autonomy_scorecard(action="hold")
+    _seed_autonomy_scorecard(consumed=True)
+    _seed_autonomy_scorecard(expires_at="2026-05-24T00:00:00+00:00")
+    _seed_autonomy_scorecard(conviction="0.8000")
+    TestClient(orchestrator_app.app).post(
+        "/autonomy/settings",
+        json={
+            "actor": "tg_1",
+            "enabled": True,
+            "daily_budget_usdt": "50",
+            "per_trade_usdt": "50",
+            "min_conviction": "0.7",
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "post",
+        lambda *args, **kwargs: (
+            calls.append(kwargs.get("json") or {}) or FakeResponse({"ok": True})
+        ),
+    )
+    result = orchestrator_app.auto_trade_tick(now=now)
+    assert result["placed"] == 1
+    assert len(calls) == 1
+    assert calls[0]["mode"] == "paper"
+
+
+def test_auto_trade_tick_fail_open_on_http_error(monkeypatch, tmp_path: Path) -> None:
+    import httpx as _httpx
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _seed_autonomy_scorecard()
+    TestClient(orchestrator_app.app).post(
+        "/autonomy/settings",
+        json={"actor": "tg_1", "enabled": True, "daily_budget_usdt": "100", "per_trade_usdt": "50"},
+    )
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(_httpx.HTTPError("down")),
+    )
+    result = orchestrator_app.auto_trade_tick(now=datetime(2026, 5, 25, 0, 0, tzinfo=UTC))
+    assert result["placed"] == 0
+    assert (
+        TestClient(orchestrator_app.app)
+        .get("/autonomy/today", params={"actor": "tg_1"})
+        .json()["spent_usdt"]
+        == "0"
+    )

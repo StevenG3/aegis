@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Literal, cast
@@ -33,6 +34,15 @@ from schemas import (
 app = FastAPI(title="orchestrator", version="0.1.0")
 PER_SYMBOL_DAILY_LIMIT_USDT = Decimal(os.getenv("PER_SYMBOL_DAILY_LIMIT_USDT", "50000"))
 DECIMAL_8 = Decimal("0.00000001")
+CALIBRATION_BUCKETS = [
+    (Decimal("0.30"), Decimal("0.40")),
+    (Decimal("0.40"), Decimal("0.50")),
+    (Decimal("0.50"), Decimal("0.60")),
+    (Decimal("0.60"), Decimal("0.70")),
+    (Decimal("0.70"), Decimal("0.80")),
+    (Decimal("0.80"), Decimal("0.90")),
+    (Decimal("0.90"), Decimal("1.01")),
+]
 
 
 class _OutcomeSummaryBucket:
@@ -55,6 +65,11 @@ REFLECT_TIMEOUT_SEC = float(os.getenv("REFLECT_TIMEOUT_SEC", "60"))
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
 SCHEDULER_TICK_SEC = float(os.getenv("SCHEDULER_TICK_SEC", "60"))
 SCHEDULER_BATCH_LIMIT = int(os.getenv("SCHEDULER_BATCH_LIMIT", "5"))
+ORCHESTRATOR_SELF_URL = os.getenv("ORCHESTRATOR_SELF_URL", "http://localhost:8080")
+AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "true").lower() == "true"
+AUTO_TRADE_BATCH_LIMIT = int(os.getenv("AUTO_TRADE_BATCH_LIMIT", "5"))
+CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "5"))
+CALIBRATION_SHRINKAGE_K = Decimal(os.getenv("CALIBRATION_SHRINKAGE_K", "10"))
 _scheduler_task: asyncio.Task[None] | None = None
 
 _HERMES_SYSTEM_PROMPT = """\
@@ -127,6 +142,17 @@ class ScorecardIntentRequest(BaseModel):
     request_id: UUID | None = None
 
 
+class AutonomyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = PydanticField(min_length=1)
+    enabled: bool | None = None
+    daily_budget_usdt: str | None = None
+    min_conviction: str | None = None
+    per_trade_usdt: str | None = None
+    allowed_sources: str | None = None
+
+
 class WatchlistAddRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -144,6 +170,7 @@ class LiveUnlockRequest(BaseModel):
 
 ScorecardCreateRequest.model_rebuild(_types_namespace={"Literal": Literal})
 ScorecardIntentRequest.model_rebuild(_types_namespace={"Literal": Literal, "UUID": UUID})
+AutonomyUpdateRequest.model_rebuild()
 WatchlistAddRequest.model_rebuild(_types_namespace={"Literal": Literal})
 LiveUnlockRequest.model_rebuild()
 
@@ -158,6 +185,27 @@ async def validation_exception_handler(
 ) -> JSONResponse:
     _ = request
     return JSONResponse(status_code=400, content=jsonable_encoder({"detail": exc.errors()}))
+
+
+def _bucket_label(heuristic: Decimal) -> str | None:
+    for lo, hi in CALIBRATION_BUCKETS:
+        if lo <= heuristic < hi:
+            return f"{lo:.2f}-{hi:.2f}"
+    return None
+
+
+def _calibration_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "source": row["source"],
+        "asset_type": row["asset_type"],
+        "heuristic_bucket": row["heuristic_bucket"],
+        "sample_count": row["sample_count"],
+        "hit_count": row["hit_count"],
+        "avg_alpha_return": row["avg_alpha_return"],
+        "empirical_hit_rate": row["empirical_hit_rate"],
+        "calibrated_conviction": row["calibrated_conviction"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def _watchlist_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
@@ -217,7 +265,14 @@ def scheduler_tick(now: datetime | None = None) -> dict[str, int]:
 
 async def _scheduler_loop() -> None:
     while True:
-        scheduler_tick()
+        try:
+            scheduler_tick()
+        except Exception:
+            pass
+        try:
+            auto_trade_tick()
+        except Exception:
+            pass
         await asyncio.sleep(SCHEDULER_TICK_SEC)
 
 
@@ -880,6 +935,318 @@ def healthz() -> dict[str, str]:
 @app.get("/readyz")
 def readyz() -> dict[str, str]:
     return {"status": "ready"}
+
+
+def _record_autonomy_spend(actor: str, date: str, amount: Decimal) -> None:
+    now_iso = _now().isoformat()
+    with connect() as conn:
+        row = conn.execute(
+            "select spent_usdt, trade_count from autonomy_spend where actor = ? and date = ?",
+            (actor, date),
+        ).fetchone()
+        if row is None:
+            spent = _q8(amount)
+            count = 1
+        else:
+            spent = _q8(Decimal(str(row["spent_usdt"])) + amount)
+            count = int(row["trade_count"]) + 1
+        conn.execute(
+            "insert into autonomy_spend "
+            "(actor, date, spent_usdt, trade_count, last_updated) "
+            "values (?, ?, ?, ?, ?) "
+            "on conflict(actor, date) do update set "
+            "spent_usdt = excluded.spent_usdt, "
+            "trade_count = excluded.trade_count, "
+            "last_updated = excluded.last_updated",
+            (actor, date, _q8s(spent), count, now_iso),
+        )
+        conn.commit()
+
+
+def _fire_autonomous_trade(actor: str, scorecard_id: str, usdt_budget: Decimal) -> bool:
+    payload = {
+        "scorecard_id": scorecard_id,
+        "actor": actor,
+        "idempotency_key": f"auto-{actor}-{scorecard_id[:8]}-{int(time.time())}",
+        "usdt_budget": str(usdt_budget),
+        "position_fraction": "1.0",
+        "mode": "paper",
+    }
+    try:
+        response = httpx.post(
+            f"{ORCHESTRATOR_SELF_URL}/intents/from_scorecard",
+            json=payload,
+            headers={"x-live-unlock": ""},
+            timeout=10.0,
+        )
+        return getattr(response, "status_code", 200) in {200, 202}
+    except httpx.HTTPError:
+        return False
+
+
+def auto_trade_tick(now: datetime | None = None) -> dict[str, object]:
+    if not AUTO_TRADE_ENABLED:
+        return {"placed": 0, "skipped_budget": 0, "skipped_other": 0, "reason": "disabled"}
+    current = now or _now()
+    today = current.strftime("%Y-%m-%d")
+    placed = 0
+    skipped_budget = 0
+    skipped_other = 0
+    with connect() as conn:
+        actors = conn.execute(
+            "select actor, daily_budget_usdt, min_conviction, per_trade_usdt, allowed_sources "
+            "from autonomy_settings where enabled = 1"
+        ).fetchall()
+    for actor_row in actors:
+        try:
+            actor = str(actor_row["actor"])
+            budget = Decimal(str(actor_row["daily_budget_usdt"]))
+            min_conv = Decimal(str(actor_row["min_conviction"]))
+            per_trade = Decimal(str(actor_row["per_trade_usdt"]))
+        except (InvalidOperation, ValueError):
+            skipped_other += 1
+            continue
+        allowed = {
+            item.strip() for item in str(actor_row["allowed_sources"]).split(",") if item.strip()
+        }
+        with connect() as conn:
+            spend_row = conn.execute(
+                "select spent_usdt from autonomy_spend where actor = ? and date = ?",
+                (actor, today),
+            ).fetchone()
+        spent = Decimal(str(spend_row["spent_usdt"])) if spend_row else Decimal("0")
+        if spent >= budget:
+            continue
+        with connect() as conn:
+            candidates = conn.execute(
+                """
+                select scorecard_id, payload_json, source from scorecards
+                where actor = ? and consumed_by_intent_id is NULL
+                  and expires_at > ?
+                  and action in ('buy','sell')
+                  and cast(json_extract(payload_json, '$.conviction') as real) >= ?
+                order by created_at asc limit ?
+                """,
+                (actor, current.isoformat(), float(min_conv), AUTO_TRADE_BATCH_LIMIT),
+            ).fetchall()
+        for row in candidates:
+            if str(row["source"]) not in allowed:
+                skipped_other += 1
+                continue
+            remaining = budget - spent
+            spend = min(per_trade, remaining)
+            if spend < Decimal("1"):
+                skipped_budget += 1
+                continue
+            if _fire_autonomous_trade(actor, str(row["scorecard_id"]), spend):
+                spent += spend
+                placed += 1
+                _record_autonomy_spend(actor, today, spend)
+            else:
+                skipped_other += 1
+            if spent >= budget:
+                break
+    return {"placed": placed, "skipped_budget": skipped_budget, "skipped_other": skipped_other}
+
+
+@app.post("/calibration/recompute", response_model=None)
+def recompute_calibration() -> dict[str, object]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select o.source, s.payload_json, o.closed_return_pct
+            from scorecard_outcomes o
+            join scorecards s on s.scorecard_id = o.scorecard_id
+            where o.status = 'closed' and o.reflected_at is not null
+            """
+        ).fetchall()
+    buckets: dict[tuple[str, str, str], list[tuple[Decimal, Decimal]]] = {}
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            metadata = payload.get("metadata") or {}
+            heuristic_raw = metadata.get("heuristic_conviction") or payload.get("conviction")
+            asset_type = str(metadata.get("asset_type") or "crypto")
+            heuristic = Decimal(str(heuristic_raw))
+            alpha = Decimal(str(row["closed_return_pct"]))
+        except (json.JSONDecodeError, InvalidOperation, KeyError, TypeError):
+            continue
+        bucket = _bucket_label(heuristic)
+        if bucket is None:
+            continue
+        buckets.setdefault((str(row["source"]), asset_type, bucket), []).append((heuristic, alpha))
+    now_iso = _now().isoformat()
+    written = 0
+    with connect() as conn:
+        conn.execute("delete from conviction_calibration")
+        for (source, asset_type, bucket), samples in buckets.items():
+            sample_count = len(samples)
+            hit_count = sum(1 for _, alpha in samples if alpha > 0)
+            avg_alpha = sum((alpha for _, alpha in samples), Decimal("0")) / Decimal(sample_count)
+            empirical = Decimal(hit_count) / Decimal(sample_count)
+            k = CALIBRATION_SHRINKAGE_K
+            calibrated = (Decimal(hit_count) + k * Decimal("0.5")) / (Decimal(sample_count) + k)
+            conn.execute(
+                """
+                insert into conviction_calibration
+                  (source, asset_type, heuristic_bucket, sample_count, hit_count,
+                   avg_alpha_return, empirical_hit_rate, calibrated_conviction, updated_at)
+                values (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    source,
+                    asset_type,
+                    bucket,
+                    sample_count,
+                    hit_count,
+                    _q8s(avg_alpha),
+                    _q8s(empirical),
+                    _q8s(calibrated),
+                    now_iso,
+                ),
+            )
+            written += 1
+        conn.commit()
+    return {"buckets_written": written, "rows_considered": len(rows)}
+
+
+@app.get("/calibration", response_model=None)
+def get_calibration(source: str | None = None, asset_type: str | None = None) -> dict[str, object]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if source:
+        clauses.append("source = ?")
+        params.append(source)
+    if asset_type:
+        clauses.append("asset_type = ?")
+        params.append(asset_type)
+    where = (" where " + " and ".join(clauses)) if clauses else ""
+    with connect() as conn:
+        rows = conn.execute(
+            "select source, asset_type, heuristic_bucket, sample_count, hit_count, "
+            "avg_alpha_return, empirical_hit_rate, calibrated_conviction, updated_at "
+            f"from conviction_calibration{where} "
+            "order by source, asset_type, heuristic_bucket",
+            params,
+        ).fetchall()
+    return {
+        "shrinkage_k": str(CALIBRATION_SHRINKAGE_K),
+        "min_samples": CALIBRATION_MIN_SAMPLES,
+        "items": [_calibration_row_to_dict(row) for row in rows],
+    }
+
+
+@app.post("/autonomy/settings", response_model=None)
+def update_autonomy(req: AutonomyUpdateRequest) -> JSONResponse | dict[str, object]:
+    with connect() as conn:
+        existing = conn.execute(
+            "select enabled, daily_budget_usdt, min_conviction, per_trade_usdt, "
+            "allowed_sources from autonomy_settings where actor = ?",
+            (req.actor,),
+        ).fetchone()
+    current: dict[str, object] = {
+        "enabled": int(existing["enabled"]) if existing else 0,
+        "daily_budget_usdt": str(existing["daily_budget_usdt"]) if existing else "0",
+        "min_conviction": str(existing["min_conviction"]) if existing else "0.65",
+        "per_trade_usdt": str(existing["per_trade_usdt"]) if existing else "50",
+        "allowed_sources": str(existing["allowed_sources"]) if existing else "tradingagents",
+    }
+    if req.enabled is not None:
+        current["enabled"] = 1 if req.enabled else 0
+    try:
+        if req.daily_budget_usdt is not None:
+            if Decimal(req.daily_budget_usdt) < 0:
+                return JSONResponse(status_code=400, content={"code": "INVALID_BUDGET"})
+            current["daily_budget_usdt"] = req.daily_budget_usdt
+        if req.min_conviction is not None:
+            min_conviction = Decimal(req.min_conviction)
+            if not (Decimal("0") <= min_conviction <= Decimal("1")):
+                return JSONResponse(status_code=400, content={"code": "INVALID_MIN_CONVICTION"})
+            current["min_conviction"] = req.min_conviction
+        if req.per_trade_usdt is not None:
+            if Decimal(req.per_trade_usdt) <= 0:
+                return JSONResponse(status_code=400, content={"code": "INVALID_PER_TRADE"})
+            current["per_trade_usdt"] = req.per_trade_usdt
+    except InvalidOperation:
+        return JSONResponse(status_code=400, content={"code": "INVALID_DECIMAL"})
+    if req.allowed_sources is not None:
+        current["allowed_sources"] = req.allowed_sources
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into autonomy_settings
+              (actor, enabled, daily_budget_usdt, min_conviction, per_trade_usdt,
+               allowed_sources, updated_at)
+            values (?,?,?,?,?,?,?)
+            on conflict(actor) do update set
+              enabled = excluded.enabled,
+              daily_budget_usdt = excluded.daily_budget_usdt,
+              min_conviction = excluded.min_conviction,
+              per_trade_usdt = excluded.per_trade_usdt,
+              allowed_sources = excluded.allowed_sources,
+              updated_at = excluded.updated_at
+            """,
+            (
+                req.actor,
+                current["enabled"],
+                current["daily_budget_usdt"],
+                current["min_conviction"],
+                current["per_trade_usdt"],
+                current["allowed_sources"],
+                _now().isoformat(),
+            ),
+        )
+        conn.commit()
+    return {"actor": req.actor, **current, "enabled": bool(current["enabled"])}
+
+
+@app.get("/autonomy/settings", response_model=None)
+def get_autonomy_settings(actor: str | None = None) -> JSONResponse | dict[str, object]:
+    if not actor:
+        return JSONResponse(status_code=400, content={"code": "ACTOR_REQUIRED"})
+    with connect() as conn:
+        row = conn.execute(
+            "select enabled, daily_budget_usdt, min_conviction, per_trade_usdt, "
+            "allowed_sources, updated_at from autonomy_settings where actor = ?",
+            (actor,),
+        ).fetchone()
+    if row is None:
+        return {
+            "actor": actor,
+            "enabled": False,
+            "daily_budget_usdt": "0",
+            "min_conviction": "0.65",
+            "per_trade_usdt": "50",
+            "allowed_sources": "tradingagents",
+            "updated_at": None,
+        }
+    return {
+        "actor": actor,
+        "enabled": bool(row["enabled"]),
+        "daily_budget_usdt": str(row["daily_budget_usdt"]),
+        "min_conviction": str(row["min_conviction"]),
+        "per_trade_usdt": str(row["per_trade_usdt"]),
+        "allowed_sources": str(row["allowed_sources"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.get("/autonomy/today", response_model=None)
+def get_autonomy_today(actor: str | None = None) -> JSONResponse | dict[str, object]:
+    if not actor:
+        return JSONResponse(status_code=400, content={"code": "ACTOR_REQUIRED"})
+    today = _today()
+    with connect() as conn:
+        row = conn.execute(
+            "select spent_usdt, trade_count from autonomy_spend where actor = ? and date = ?",
+            (actor, today),
+        ).fetchone()
+    return {
+        "actor": actor,
+        "date": today,
+        "spent_usdt": str(row["spent_usdt"]) if row else "0",
+        "trade_count": int(row["trade_count"]) if row else 0,
+    }
 
 
 @app.post("/watchlist", response_model=None)

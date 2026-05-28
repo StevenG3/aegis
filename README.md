@@ -243,3 +243,8 @@ Closed scorecard outcomes are pushed back through the analysis adapter to the Tr
 ### Watchlists and scheduled analysis
 
 The orchestrator can keep an actor-scoped watchlist and periodically ask the analysis adapter to create fresh scorecards. Use `POST /watchlist` with `actor`, `symbol`, `asset_type`, and `cadence_minutes` (15-1440), `GET /watchlist?actor=...` to inspect active entries, and `DELETE /watchlist/{symbol}?actor=...` to disable one. Scheduler knobs live in `deploy/.env.example`: `SCHEDULER_ENABLED`, `SCHEDULER_TICK_SEC`, and `SCHEDULER_BATCH_LIMIT`.
+
+
+### Phase 15 paper autonomy
+
+The orchestrator can recompute conviction calibration from reflected closed scorecard outcomes with `POST /calibration/recompute`; analysis-adapter records both `heuristic_conviction` and `calibrated_conviction` in scorecard metadata. Paper autonomy is opt-in per actor via `/autonomy/settings`, bounded by `daily_budget_usdt`, `per_trade_usdt`, `min_conviction`, and `allowed_sources`. Auto-trades hard-code `mode=paper` and call the existing `/intents/from_scorecard` path through `ORCHESTRATOR_SELF_URL`.

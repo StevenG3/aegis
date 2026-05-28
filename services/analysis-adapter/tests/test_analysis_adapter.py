@@ -461,3 +461,67 @@ def test_scorecard_payload_omits_benchmark_price_when_unavailable(monkeypatch) -
     metadata = payload["metadata"]
     assert metadata["benchmark_symbol"] == "SPY"
     assert "benchmark_open_price" not in metadata
+
+
+def test_translate_includes_heuristic_and_calibrated_in_metadata(monkeypatch) -> None:
+    def fake_get(url: str, **kwargs: object) -> FakeResponse:
+        return FakeResponse(
+            {
+                "min_samples": 5,
+                "items": [
+                    {
+                        "heuristic_bucket": "0.70-0.80",
+                        "sample_count": 10,
+                        "calibrated_conviction": "0.6500",
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(adapter_app.httpx, "get", fake_get)
+    req = adapter_app.AnalyzeRequest(actor="u", symbol="ETHUSDT")
+    payload = adapter_app._translate_to_scorecard_payload(
+        req, {"ok": True, "decision": "BUY", "reports": {"market": "x", "news": "y"}}
+    )
+    assert payload["metadata"]["heuristic_conviction"] == "0.7000"
+    assert payload["metadata"]["calibrated_conviction"] == "0.6500"
+    assert payload["conviction"] == "0.6500"
+
+
+def test_translate_calibration_fetch_failure_falls_back_to_heuristic(monkeypatch) -> None:
+    import httpx as _httpx
+
+    monkeypatch.setattr(
+        adapter_app.httpx,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(_httpx.HTTPError("down")),
+    )
+    req = adapter_app.AnalyzeRequest(actor="u", symbol="ETHUSDT")
+    payload = adapter_app._translate_to_scorecard_payload(
+        req, {"ok": True, "decision": "BUY", "reports": {"market": "x", "news": "y"}}
+    )
+    assert payload["conviction"] == payload["metadata"]["heuristic_conviction"]
+
+
+def test_translate_low_sample_bucket_falls_back_to_heuristic(monkeypatch) -> None:
+    monkeypatch.setattr(
+        adapter_app.httpx,
+        "get",
+        lambda *args, **kwargs: FakeResponse(
+            {
+                "min_samples": 5,
+                "items": [
+                    {
+                        "heuristic_bucket": "0.70-0.80",
+                        "sample_count": 2,
+                        "calibrated_conviction": "0.9000",
+                    }
+                ],
+            }
+        ),
+    )
+    req = adapter_app.AnalyzeRequest(actor="u", symbol="ETHUSDT")
+    payload = adapter_app._translate_to_scorecard_payload(
+        req, {"ok": True, "decision": "BUY", "reports": {"market": "x", "news": "y"}}
+    )
+    assert payload["conviction"] == "0.7000"

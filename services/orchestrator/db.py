@@ -101,12 +101,9 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
-        "create index if not exists idx_scorecards_actor_symbol "
-        "on scorecards(actor, symbol)"
+        "create index if not exists idx_scorecards_actor_symbol on scorecards(actor, symbol)"
     )
-    conn.execute(
-        "create index if not exists idx_scorecards_expires_at on scorecards(expires_at)"
-    )
+    conn.execute("create index if not exists idx_scorecards_expires_at on scorecards(expires_at)")
     conn.execute(
         """
         create table if not exists daily_pnl (
@@ -118,9 +115,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    conn.execute(
-        "create index if not exists idx_daily_pnl_actor_date on daily_pnl(actor, date)"
-    )
+    conn.execute("create index if not exists idx_daily_pnl_actor_date on daily_pnl(actor, date)")
     conn.execute(
         """
         create table if not exists live_unlock_tokens (
@@ -151,8 +146,49 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
-        "create index if not exists idx_watchlist_due "
-        "on watchlist_entries(enabled, next_run_at)"
+        "create index if not exists idx_watchlist_due on watchlist_entries(enabled, next_run_at)"
+    )
+
+    conn.execute(
+        """
+        create table if not exists conviction_calibration (
+            source text not null,
+            asset_type text not null,
+            heuristic_bucket text not null,
+            sample_count integer not null,
+            hit_count integer not null,
+            avg_alpha_return text not null,
+            empirical_hit_rate text not null,
+            calibrated_conviction text not null,
+            updated_at text not null,
+            primary key (source, asset_type, heuristic_bucket)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists autonomy_settings (
+            actor text primary key,
+            enabled integer not null default 0,
+            daily_budget_usdt text not null default '0',
+            min_conviction text not null default '0.65',
+            per_trade_usdt text not null default '50',
+            allowed_sources text not null default 'tradingagents',
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists autonomy_spend (
+            actor text not null,
+            date text not null,
+            spent_usdt text not null default '0',
+            trade_count integer not null default 0,
+            last_updated text not null,
+            primary key (actor, date)
+        )
+        """
     )
     conn.execute(
         """
