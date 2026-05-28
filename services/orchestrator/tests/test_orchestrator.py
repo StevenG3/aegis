@@ -3478,6 +3478,73 @@ def test_position_updates_keep_paper_and_live_buckets_separate(
     assert row["avg_cost"] == "96666.66666667"
 
 
+def test_position_records_venue(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    stock_intent = orchestrator_app.OrderIntent.model_validate(
+        {
+            **VALID,
+            "venue": "ibkr_us_equity",
+            "symbol": "NVDA",
+            "quantity": {"kind": "base", "value": "10"},
+        }
+    )
+    orchestrator_app._update_position(
+        orchestrator_app.ExecutionResult.model_validate(
+            execution(filled_qty="10", avg_price="450.00")
+        ),
+        stock_intent,
+    )
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select venue from paper_positions where actor = ? and symbol = ?",
+            ("user_1", "NVDA"),
+        ).fetchone()
+    assert row["venue"] == "ibkr_us_equity"
+
+
+def test_stock_scorecard_trade_creates_ibkr_paper_position(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    seen_headers: dict[str, str] = {}
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/validate"):
+            return FakeResponse(decision())
+        headers = kwargs.get("headers")
+        assert isinstance(headers, dict)
+        seen_headers.update({str(key): str(value) for key, value in headers.items()})
+        return FakeResponse(execution(filled_qty="1.77780000", avg_price="450.00"))
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    client = TestClient(orchestrator_app.app)
+    scorecard_response = client.post(
+        "/scorecards",
+        json=make_scorecard_payload(
+            symbol="NVDA",
+            source="tradingagents",
+            metadata={"asset_type": "stock"},
+        ),
+    )
+    assert scorecard_response.status_code == 200
+    scorecard_id = scorecard_response.json()["scorecard_id"]
+    trade = client.post(
+        "/intents/from_scorecard",
+        json={
+            "scorecard_id": scorecard_id,
+            "actor": "user_1",
+            "idempotency_key": "stock-scorecard-1",
+            "usdt_budget": "1000",
+        },
+    )
+    assert trade.status_code == 200
+    assert seen_headers["x-venue"] == "ibkr_us_equity"
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select symbol, venue from paper_positions where actor = ? and symbol = ?",
+            ("user_1", "NVDA"),
+        ).fetchone()
+    assert row["venue"] == "ibkr_us_equity"
+
+
 def test_legacy_position_qty_backfills_paper_bucket(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     db_file = tmp_path / "trading.sqlite"
@@ -3505,7 +3572,7 @@ def test_legacy_position_qty_backfills_paper_bucket(monkeypatch, tmp_path: Path)
 
     with orchestrator_app.connect() as migrated:
         row = migrated.execute(
-            "select paper_qty, paper_avg_cost, live_qty, live_avg_cost "
+            "select paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue "
             "from paper_positions where actor = ? and symbol = ?",
             ("tg_1", "BTCUSDT"),
         ).fetchone()
@@ -3513,6 +3580,7 @@ def test_legacy_position_qty_backfills_paper_bucket(monkeypatch, tmp_path: Path)
     assert row["paper_avg_cost"] == "50000"
     assert row["live_qty"] == "0"
     assert row["live_avg_cost"] == "0"
+    assert row["venue"] == "binance_spot"
 
 
 def test_live_exposure_cap_uses_live_bucket_only(monkeypatch, tmp_path: Path) -> None:
@@ -3549,6 +3617,81 @@ def test_live_exposure_cap_uses_live_bucket_only(monkeypatch, tmp_path: Path) ->
     assert current == Decimal("90.00000000")
 
 
+def test_live_exposure_cap_ignores_stock_positions(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            """
+            insert into paper_positions
+              (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+               paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue, last_updated)
+            values (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "tg_1",
+                "NVDA",
+                "10",
+                "450",
+                "4500",
+                "0",
+                "0",
+                "0",
+                "10",
+                "450",
+                "ibkr_us_equity",
+                "now",
+            ),
+        )
+        conn.execute(
+            """
+            insert into paper_positions
+              (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+               paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue, last_updated)
+            values (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "tg_1",
+                "BTCUSDT",
+                "0.001",
+                "90000",
+                "90",
+                "0",
+                "0",
+                "0",
+                "0.001",
+                "90000",
+                "binance_spot",
+                "now",
+            ),
+        )
+        conn.commit()
+
+    allowed, current = orchestrator_app._check_live_exposure_cap(
+        "tg_1", Decimal("5"), Decimal("100")
+    )
+    assert allowed is True
+    assert current == Decimal("90.00000000")
+
+
+def test_execution_filled_rejects_pending_confirmation() -> None:
+    assert (
+        orchestrator_app._execution_filled(
+            {"status": "pending_confirmation", "execution": {"status": "pending_confirmation"}}
+        )
+        is False
+    )
+
+
+def test_execution_filled_rejects_open() -> None:
+    body = {"status": "open", "execution": {"status": "open"}}
+    assert orchestrator_app._execution_filled(body) is False
+
+
+def test_execution_filled_accepts_simulated_filled_partial() -> None:
+    for status in ("simulated", "filled", "partial"):
+        assert orchestrator_app._execution_filled({"execution": {"status": status}}) is True
+
+
 def test_stop_loss_watchdog_fires_paper_protective_sell(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -3563,7 +3706,7 @@ def test_stop_loss_watchdog_fires_paper_protective_sell(
 
     def fake_post(url: str, **kwargs: object) -> FakeResponse:
         calls.append({"url": url, **kwargs})
-        return FakeResponse({"status": "executed"})
+        return FakeResponse({"status": "executed", "execution": {"status": "simulated"}})
 
     monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
     _seed_open_outcome_with_position(
@@ -3603,7 +3746,7 @@ def test_stop_loss_watchdog_mints_bound_token_for_live_sell(
 
     def fake_post(url: str, **kwargs: object) -> FakeResponse:
         captured.update({"url": url, **kwargs})
-        return FakeResponse({"status": "executed"})
+        return FakeResponse({"status": "executed", "execution": {"status": "filled"}})
 
     monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
     _seed_open_outcome_with_position(
@@ -3693,7 +3836,7 @@ def test_trailing_stop_fires_at_5pct_drop(monkeypatch, tmp_path: Path) -> None:
 
     def fake_post(url: str, **kwargs: object) -> FakeResponse:
         calls.append({"url": url, **kwargs})
-        return FakeResponse({"status": "executed"})
+        return FakeResponse({"status": "executed", "execution": {"status": "simulated"}})
 
     monkeypatch.setattr(
         orchestrator_app.httpx,

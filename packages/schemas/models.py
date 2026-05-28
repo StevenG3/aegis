@@ -56,7 +56,7 @@ class OrderIntent(StrictModel):
     actor: str = Field(min_length=1)
     created_at: datetime
     mode: Literal["paper", "live"]
-    venue: Literal["binance_spot", "binance_futures"]
+    venue: Literal["binance_spot", "binance_futures", "ibkr_us_equity"]
     symbol: str = Field(min_length=1)
     side: Literal["buy", "sell"]
     order_type: Literal["market", "limit"]

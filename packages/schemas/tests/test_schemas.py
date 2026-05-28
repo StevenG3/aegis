@@ -76,6 +76,19 @@ def test_order_intent_round_trip() -> None:
     assert again == intent
 
 
+def test_order_intent_accepts_ibkr_us_equity_venue() -> None:
+    intent = OrderIntent.model_validate(
+        {**VALID_INTENT, "venue": "ibkr_us_equity", "symbol": "NVDA"}
+    )
+    assert intent.venue == "ibkr_us_equity"
+    assert intent.symbol == "NVDA"
+
+
+def test_order_intent_rejects_unknown_venue() -> None:
+    with pytest.raises(ValidationError):
+        OrderIntent.model_validate({**VALID_INTENT, "venue": "nasdaq_arca"})
+
+
 def test_unknown_fields_are_rejected() -> None:
     with pytest.raises(ValidationError):
         OrderIntent.model_validate(dict(VALID_INTENT, extra="nope"))

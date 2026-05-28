@@ -87,6 +87,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         ("paper_avg_cost", "0"),
         ("live_qty", "0"),
         ("live_avg_cost", "0"),
+        ("venue", "binance_spot"),
     ):
         try:
             conn.execute(

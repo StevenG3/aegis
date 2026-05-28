@@ -382,7 +382,10 @@ def _market_url() -> str:
 
 def _resolve_qty(intent: OrderIntent, market_url: str) -> tuple[str, str]:
     try:
-        response = httpx.get(f"{market_url}/ticker", params={"symbol": intent.symbol}, timeout=3.0)
+        params = {"symbol": intent.symbol}
+        if intent.venue == "ibkr_us_equity":
+            params["asset_type"] = "stock"
+        response = httpx.get(f"{market_url}/ticker", params=params, timeout=3.0)
         response.raise_for_status()
         price_str = str(response.json()["price"])
         price = Decimal(price_str)
@@ -416,6 +419,7 @@ def _call_execution(intent: OrderIntent, decision: RiskDecision, base_qty: str) 
             "content-type": "application/json",
             "x-decision-approved": str(decision.approved).lower(),
             "x-mode": intent.mode,
+            "x-venue": intent.venue,
             "x-symbol": intent.symbol,
             "x-quantity": base_qty,
             "x-side": intent.side,
@@ -871,7 +875,7 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
     with connect() as conn:
         row = conn.execute(
             "select qty, avg_cost, total_cost, realized_pnl, "
-            "paper_qty, paper_avg_cost, live_qty, live_avg_cost from paper_positions "
+            "paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue from paper_positions "
             "where actor = ? and symbol = ?",
             (intent.actor, intent.symbol),
         ).fetchone()
@@ -913,8 +917,8 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
             """
             insert into paper_positions
             (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
-             paper_qty, paper_avg_cost, live_qty, live_avg_cost, last_updated)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue, last_updated)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(actor, symbol) do update set
                 qty = excluded.qty,
                 avg_cost = excluded.avg_cost,
@@ -924,6 +928,7 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
                 paper_avg_cost = excluded.paper_avg_cost,
                 live_qty = excluded.live_qty,
                 live_avg_cost = excluded.live_avg_cost,
+                venue = excluded.venue,
                 last_updated = excluded.last_updated
             """,
             (
@@ -937,6 +942,7 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
                 _q8s(paper_avg),
                 _q8s(live_qty),
                 _q8s(live_avg),
+                intent.venue,
                 _now().isoformat(),
             ),
         )
@@ -970,7 +976,10 @@ def _mark_for_symbol_str(symbol: str) -> tuple[Decimal | None, str | None]:
 
 def _mark_for_symbol(symbol: str) -> tuple[Decimal | None, str | None]:
     try:
-        response = httpx.get(f"{_market_url()}/ticker", params={"symbol": symbol}, timeout=3.0)
+        params = {"symbol": symbol}
+        if not symbol.upper().endswith("USDT"):
+            params["asset_type"] = "stock"
+        response = httpx.get(f"{_market_url()}/ticker", params=params, timeout=3.0)
         response.raise_for_status()
         payload = response.json()
         return Decimal(str(payload["price"])), str(payload.get("source", "binance"))
@@ -1317,6 +1326,7 @@ def _check_live_exposure_cap(
             select p.live_qty, p.live_avg_cost
             from paper_positions p
             where p.actor = ?
+              and p.venue = 'binance_spot'
               and cast(p.live_qty as real) > 0
             """,
             (actor,),
@@ -1421,6 +1431,7 @@ def _fire_protective_sell(row: sqlite3.Row, *, reason: str = "static") -> bool:
     symbol = str(row["symbol"])
     opened_intent_id = str(row["opened_intent_id"])
     mode = _opened_intent_mode(opened_intent_id)
+    venue = _opened_intent_venue(opened_intent_id)
     qty = _protective_sell_qty(actor, symbol, mode, str(row["opened_qty"]))
     if qty <= 0:
         return False
@@ -1432,7 +1443,7 @@ def _fire_protective_sell(row: sqlite3.Row, *, reason: str = "static") -> bool:
         "actor": actor,
         "created_at": _now().isoformat(),
         "mode": mode,
-        "venue": "binance_spot",
+        "venue": venue,
         "symbol": symbol,
         "side": "sell",
         "order_type": "market",
@@ -1464,11 +1475,16 @@ def _fire_protective_sell(row: sqlite3.Row, *, reason: str = "static") -> bool:
         body = response.json()
     except (httpx.HTTPError, ValueError):
         return False
-    return isinstance(body, dict) and body.get("status") in {
-        "executed",
-        "pending_confirmation",
-        "open",
-    }
+    return _execution_filled(body)
+
+
+def _execution_filled(body: object) -> bool:
+    if not isinstance(body, dict):
+        return False
+    execution = body.get("execution")
+    if not isinstance(execution, dict):
+        return False
+    return execution.get("status") in {"simulated", "filled", "partial"}
 
 
 def _opened_intent_mode(intent_id: str) -> Literal["paper", "live"]:
@@ -1485,6 +1501,22 @@ def _opened_intent_mode(intent_id: str) -> Literal["paper", "live"]:
         return "paper"
     mode = payload.get("mode") if isinstance(payload, dict) else None
     return "live" if mode == "live" else "paper"
+
+
+def _opened_intent_venue(intent_id: str) -> str:
+    with connect() as conn:
+        row = conn.execute(
+            "select payload_json from intents where intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+    if row is None:
+        return "binance_spot"
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        return "binance_spot"
+    venue = payload.get("venue") if isinstance(payload, dict) else None
+    return str(venue) if venue in {"binance_spot", "ibkr_us_equity"} else "binance_spot"
 
 
 def _protective_sell_qty(actor: str, symbol: str, mode: str, opened_qty: str) -> Decimal:
@@ -2732,6 +2764,11 @@ def create_intent_from_scorecard(
 
     side: Literal["buy", "sell"] = scorecard.action
     intent_id = req.intent_id or uuid4()
+    metadata = scorecard.metadata or {}
+    asset_type = metadata.get("asset_type", "crypto")
+    venue: Literal["binance_spot", "ibkr_us_equity"] = (
+        "ibkr_us_equity" if asset_type == "stock" else "binance_spot"
+    )
     intent = OrderIntent(
         intent_id=intent_id,
         request_id=req.request_id or uuid4(),
@@ -2739,7 +2776,7 @@ def create_intent_from_scorecard(
         actor=req.actor,
         created_at=_now(),
         mode=req.mode,
-        venue="binance_spot",
+        venue=venue,
         symbol=scorecard.symbol,
         side=side,
         order_type=req.order_type,
@@ -3009,7 +3046,7 @@ def get_paper_positions(actor: str | None = None) -> JSONResponse | dict[str, ob
         return JSONResponse(status_code=400, content={"code": "ACTOR_REQUIRED"})
     with connect() as conn:
         rows = conn.execute(
-            "select symbol, qty, avg_cost, total_cost, realized_pnl from paper_positions "
+            "select symbol, qty, avg_cost, total_cost, realized_pnl, venue from paper_positions "
             "where actor = ? order by symbol",
             (actor,),
         ).fetchall()
@@ -3035,6 +3072,7 @@ def get_paper_positions(actor: str | None = None) -> JSONResponse | dict[str, ob
         positions.append(
             {
                 "symbol": row["symbol"],
+                "venue": row["venue"],
                 "qty": _q8s(qty),
                 "avg_cost": _q8s(avg_cost),
                 "total_cost": _q8s(total_cost),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from decimal import Decimal, InvalidOperation
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -14,10 +15,34 @@ FIXTURES = {
 }
 CACHE_TTL_SECONDS = 5.0
 _CACHE: dict[str, tuple[float, dict[str, str]]] = {}
+STOCK_QUOTE_CACHE_TTL_SEC = float(os.getenv("STOCK_QUOTE_CACHE_TTL_SEC", "60"))
+_STOCK_QUOTE_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
+_STOCK_FIXTURES = {
+    "NVDA": "450.00",
+    "MSFT": "420.00",
+    "AAPL": "190.00",
+    "GOOGL": "175.00",
+    "AMZN": "185.00",
+    "META": "510.00",
+    "TSLA": "240.00",
+    "SPY": "550.00",
+    "QQQ": "470.00",
+    "IWM": "215.00",
+}
 
 
 def _fixtures_only() -> bool:
     return os.getenv("FIXTURES_ONLY", "false").lower() == "true"
+
+
+def _stock_provider_chain() -> list[str]:
+    return [
+        provider.strip()
+        for provider in os.getenv(
+            "STOCK_QUOTE_PROVIDER_CHAIN", "polygon,yahoo,fixture"
+        ).split(",")
+        if provider.strip()
+    ]
 
 
 def _fixture(symbol: str, source: str) -> dict[str, str]:
@@ -56,6 +81,117 @@ def _ticker(symbol: str) -> dict[str, str]:
         ) from exc
 
 
+def _stock_fixture(symbol: str) -> dict[str, str]:
+    return {
+        "symbol": symbol,
+        "price": _STOCK_FIXTURES.get(symbol, "100.00"),
+        "source": "fixture",
+        "asset_type": "stock",
+    }
+
+
+def _polygon_fetch(symbol: str) -> dict[str, str] | None:
+    api_key = os.getenv("POLYGON_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        response = httpx.get(
+            f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev",
+            params={"adjusted": "true", "apiKey": api_key},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    results = body.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+    first = results[0]
+    if not isinstance(first, dict):
+        return None
+    close = first.get("c")
+    if close is None:
+        return None
+    try:
+        price = Decimal(str(close))
+    except (InvalidOperation, ValueError):
+        return None
+    if price <= 0:
+        return None
+    return {"symbol": symbol, "price": str(price), "source": "polygon", "asset_type": "stock"}
+
+
+def _yahoo_fetch(symbol: str) -> dict[str, str] | None:
+    try:
+        response = httpx.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+            params={"interval": "1d", "range": "1d"},
+            timeout=5.0,
+            headers={"user-agent": "trading-agent/1.0"},
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    chart = body.get("chart")
+    if not isinstance(chart, dict):
+        return None
+    results = chart.get("result")
+    if not isinstance(results, list) or not results:
+        return None
+    first = results[0]
+    meta = first.get("meta") if isinstance(first, dict) else None
+    if not isinstance(meta, dict):
+        return None
+    price_raw = meta.get("regularMarketPrice")
+    if price_raw is None:
+        return None
+    try:
+        price = Decimal(str(price_raw))
+    except (InvalidOperation, ValueError):
+        return None
+    if price <= 0:
+        return None
+    return {"symbol": symbol, "price": str(price), "source": "yahoo", "asset_type": "stock"}
+
+
+def _fetch_stock_provider(provider_name: str, symbol: str) -> dict[str, str] | None:
+    if provider_name == "polygon":
+        return _polygon_fetch(symbol)
+    if provider_name == "yahoo":
+        return _yahoo_fetch(symbol)
+    if provider_name == "fixture":
+        return _stock_fixture(symbol)
+    return None
+
+
+def _stock_ticker(symbol: str) -> dict[str, str]:
+    normalized = symbol.upper().strip()
+    if not normalized:
+        return _stock_fixture(normalized)
+    now = time.monotonic()
+    cached = _STOCK_QUOTE_CACHE.get(normalized)
+    if cached is not None and now - cached[0] < STOCK_QUOTE_CACHE_TTL_SEC:
+        return cached[1]
+    if _fixtures_only():
+        result = _stock_fixture(normalized)
+        _STOCK_QUOTE_CACHE[normalized] = (now, result)
+        return result
+    for provider in _stock_provider_chain():
+        candidate = _fetch_stock_provider(provider, normalized)
+        if candidate is not None:
+            _STOCK_QUOTE_CACHE[normalized] = (now, candidate)
+            return candidate
+    fallback = _stock_fixture(normalized)
+    _STOCK_QUOTE_CACHE[normalized] = (now, fallback)
+    return fallback
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -67,7 +203,9 @@ def readyz() -> dict[str, str]:
 
 
 @app.get("/ticker")
-def ticker(symbol: str) -> dict[str, str]:
+def ticker(symbol: str, asset_type: str = "crypto") -> dict[str, str]:
+    if asset_type == "stock":
+        return _stock_ticker(symbol)
     return _ticker(symbol)
 
 

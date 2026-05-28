@@ -102,6 +102,9 @@ services:
       dockerfile: services/market-data/Dockerfile
     environment:
       FIXTURES_ONLY: "false"
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      STOCK_QUOTE_CACHE_TTL_SEC: ${STOCK_QUOTE_CACHE_TTL_SEC:-60}
+      STOCK_QUOTE_PROVIDER_CHAIN: ${STOCK_QUOTE_PROVIDER_CHAIN:-polygon,yahoo,fixture}
     networks: [trading_net, host_access_net]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/healthz')"]

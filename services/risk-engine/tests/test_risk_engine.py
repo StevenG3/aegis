@@ -237,7 +237,38 @@ def test_unsupported_venue_rejected_without_market_data(monkeypatch) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["approved"] is False
-    assert body["reasons"][0]["code"] == "UNSUPPORTED_VENUE_PHASE1"
+    assert body["reasons"][0]["code"] == "UNSUPPORTED_VENUE"
+
+
+def test_risk_accepts_ibkr_paper(monkeypatch) -> None:
+    monkeypatch.setattr(risk_app, "LIVE_TRADING_ENABLED", False)
+    payload = dict(VALID, venue="ibkr_us_equity", symbol="NVDA")
+    response = TestClient(app).post("/validate", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["approved"] is True
+    assert body["reasons"] == []
+
+
+def test_risk_rejects_ibkr_live_when_live_globally_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(risk_app, "LIVE_TRADING_ENABLED", True)
+    payload = dict(VALID, mode="live", venue="ibkr_us_equity", symbol="NVDA")
+    response = TestClient(app).post("/validate", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["approved"] is False
+    assert body["reasons"][0]["code"] == "LIVE_NOT_AVAILABLE"
+    assert "ibkr_us_equity" in body["reasons"][0]["detail"]
+
+
+def test_risk_live_disabled_global_takes_precedence_over_stock_venue(monkeypatch) -> None:
+    monkeypatch.setattr(risk_app, "LIVE_TRADING_ENABLED", False)
+    payload = dict(VALID, mode="live", venue="ibkr_us_equity", symbol="NVDA")
+    response = TestClient(app).post("/validate", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["approved"] is False
+    assert body["reasons"][0]["code"] == "LIVE_TRADING_DISABLED"
 
 
 def test_schema_rejects_unknown_fields_and_zero_quantity() -> None:

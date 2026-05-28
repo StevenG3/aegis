@@ -38,6 +38,7 @@ def execution_headers(**overrides: str) -> dict[str, str]:
     headers = {
         "x-decision-approved": "true",
         "x-mode": "paper",
+        "x-venue": "binance_spot",
         "x-symbol": "BTCUSDT",
         "x-quantity": "0.001",
         "x-side": "buy",
@@ -409,6 +410,139 @@ def test_paper_market_order_still_fetches_market_price(monkeypatch, tmp_path: Pa
     )
     assert response.status_code == 200
     assert response.json()["avg_price"] == "100000.00"
+
+
+def test_route_to_ibkr_paper_for_us_equity(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class StockTickerResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"symbol": "NVDA", "price": "450.00", "asset_type": "stock"}
+
+    def fake_get(url: str, **kwargs: object) -> StockTickerResponse:
+        calls.append((url, kwargs))
+        return StockTickerResponse()
+
+    monkeypatch.setattr(execution_app.httpx, "get", fake_get)
+    response = TestClient(execution_app.app).post(
+        "/execute",
+        json=request_payload(),
+        headers=execution_headers(
+            **{"x-venue": "ibkr_us_equity", "x-symbol": "NVDA", "x-quantity": "10"}
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "simulated"
+    assert body["venue_order_id"].startswith("ibkr-paper-")
+    assert body["avg_price"] == "450.00"
+    assert body["filled_qty"] == "10"
+    assert calls == [
+        (
+            "http://market-data:8083/ticker",
+            {"params": {"symbol": "NVDA", "asset_type": "stock"}, "timeout": 5.0},
+        )
+    ]
+
+
+def test_ibkr_paper_quote_kind_converts_to_shares(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    class StockTickerResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"symbol": "NVDA", "price": "450.00", "asset_type": "stock"}
+
+    monkeypatch.setattr(execution_app.httpx, "get", lambda *args, **kwargs: StockTickerResponse())
+    response = TestClient(execution_app.app).post(
+        "/execute",
+        json=request_payload(),
+        headers=execution_headers(
+            **{
+                "x-venue": "ibkr_us_equity",
+                "x-symbol": "NVDA",
+                "x-quantity-kind": "quote",
+                "x-quote-qty": "1000",
+            }
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filled_qty"] == "2.2222"
+    assert body["avg_price"] == "450.00"
+
+
+def test_ibkr_paper_rejects_live_without_broker_call(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    seen_urls: list[str] = []
+
+    def fake_get(url: str, **kwargs: object) -> None:
+        seen_urls.append(url)
+        raise AssertionError("IBKR live should not call any outbound URL")
+
+    monkeypatch.setattr(execution_app.httpx, "get", fake_get)
+    response = TestClient(execution_app.app).post(
+        "/execute",
+        json=request_payload(),
+        headers=execution_headers(
+            **{"x-mode": "live", "x-venue": "ibkr_us_equity", "x-symbol": "NVDA"}
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "error"
+    assert "not yet available" in body["error"]
+    assert seen_urls == []
+
+
+def test_ibkr_paper_market_data_failure_returns_error(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise httpx.HTTPError("offline")
+
+    monkeypatch.setattr(execution_app.httpx, "get", fail)
+    response = TestClient(execution_app.app).post(
+        "/execute",
+        json=request_payload(),
+        headers=execution_headers(**{"x-venue": "ibkr_us_equity", "x-symbol": "NVDA"}),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "error"
+    assert "market data unavailable" in body["error"]
+
+
+def test_ibkr_paper_zero_outbound_to_ibkr(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    urls: list[str] = []
+
+    class StockTickerResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"symbol": "NVDA", "price": "450.00", "asset_type": "stock"}
+
+    def fake_get(url: str, **kwargs: object) -> StockTickerResponse:
+        urls.append(url)
+        return StockTickerResponse()
+
+    monkeypatch.setattr(execution_app.httpx, "get", fake_get)
+    response = TestClient(execution_app.app).post(
+        "/execute",
+        json=request_payload(),
+        headers=execution_headers(**{"x-venue": "ibkr_us_equity", "x-symbol": "NVDA"}),
+    )
+    assert response.status_code == 200
+    bad = ("interactivebroker", "ibkr-api", "tws", "7497", "4001")
+    assert not any(marker in url.lower() for url in urls for marker in bad)
 
 
 def test_cancel_returns_403_when_live_disabled(monkeypatch) -> None:

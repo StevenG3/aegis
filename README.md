@@ -59,6 +59,33 @@ The stop-loss watchdog keeps `peak_mark` monotonic and fires a protective sell
 when the mark falls below the trailing floor. Static `stop_loss` remains active;
 whichever condition triggers first wins.
 
+## Phase 20: US Equity Seam
+
+Phase 20 adds a paper-only US equity venue, `ibkr_us_equity`, without connecting
+to IBKR/TWS. Stock scorecards use the same `/intents/from_scorecard` flow as
+crypto, but live stock trading is rejected with `LIVE_NOT_AVAILABLE` until a
+real IBKR adapter ships in a later phase.
+
+Market-data now supports:
+
+```bash
+curl 'http://127.0.0.1:18081/healthz'
+curl 'http://127.0.0.1:18083/ticker?symbol=NVDA&asset_type=stock'
+```
+
+The stock quote chain is Polygon previous-day close, then Yahoo chart fallback,
+then deterministic fixtures. Polygon Starter is the recommended production
+source; leave `POLYGON_API_KEY` blank to use Yahoo/fixtures:
+
+```text
+POLYGON_API_KEY=
+STOCK_QUOTE_CACHE_TTL_SEC=60
+STOCK_QUOTE_PROVIDER_CHAIN=polygon,yahoo,fixture
+```
+
+Yahoo is an unofficial fallback, not a contracted API. Free-form stock orders
+remain out of scope; use scorecards first, then trade from the scorecard.
+
 
 ## Phase 2
 

@@ -24,6 +24,8 @@ ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8080")
 DAILY_DRAWDOWN_HARD_STOP_USDT = Decimal(
     os.getenv("DAILY_DRAWDOWN_HARD_STOP_USDT", "1000")
 )
+SUPPORTED_VENUES = {"binance_spot", "ibkr_us_equity"}
+LIVE_AVAILABLE_VENUES = {"binance_spot"}
 
 
 @app.exception_handler(RequestValidationError)
@@ -69,8 +71,11 @@ def _notional(intent: OrderIntent) -> Decimal | RiskReason:
     if intent.quantity.kind == "quote":
         return intent.quantity.value
     try:
+        params = {"symbol": intent.symbol}
+        if intent.venue == "ibkr_us_equity":
+            params["asset_type"] = "stock"
         response = httpx.get(
-            f"{MARKET_DATA_URL}/ticker", params={"symbol": intent.symbol}, timeout=3.0
+            f"{MARKET_DATA_URL}/ticker", params=params, timeout=3.0
         )
         response.raise_for_status()
         price = Decimal(str(response.json()["price"]))
@@ -120,6 +125,14 @@ def evaluate(intent: OrderIntent) -> RiskDecision:
                 )
             )
             return _decision(intent, evaluated_at, False, reasons)
+        if intent.venue not in LIVE_AVAILABLE_VENUES:
+            reasons.append(
+                RiskReason(
+                    code="LIVE_NOT_AVAILABLE",
+                    detail=f"live trading is not yet available for venue={intent.venue}",
+                )
+            )
+            return _decision(intent, evaluated_at, False, reasons)
     if intent.order_type == "limit" and intent.limit_price is None:
         reasons.append(
             RiskReason(
@@ -128,9 +141,9 @@ def evaluate(intent: OrderIntent) -> RiskDecision:
             )
         )
         return _decision(intent, evaluated_at, False, reasons)
-    if intent.venue != "binance_spot":
+    if intent.venue not in SUPPORTED_VENUES:
         reasons.append(
-            RiskReason(code="UNSUPPORTED_VENUE_PHASE1", detail="only binance_spot is allowed")
+            RiskReason(code="UNSUPPORTED_VENUE", detail=intent.venue)
         )
         return _decision(intent, evaluated_at, False, reasons)
 

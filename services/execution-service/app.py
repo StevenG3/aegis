@@ -5,9 +5,10 @@ import hmac as hmac_lib
 import os
 import time as time_lib
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Literal, cast
 from urllib.parse import urlencode
+from uuid import uuid4
 
 import httpx
 from db import connect
@@ -225,6 +226,155 @@ def _error_result(request: ExecutionRequest, error: str) -> ExecutionResult:
     )
 
 
+def _binance_paper_execute(
+    request: ExecutionRequest,
+    symbol: str,
+    side: str,
+    quantity_kind: str,
+    base_qty: str,
+    quote_qty: str,
+    order_type: str = "market",
+    limit_price: str = "",
+) -> ExecutionResult:
+    _ = side, quantity_kind, quote_qty
+    if order_type.lower() == "limit" and limit_price:
+        price = Decimal(limit_price)
+    else:
+        market_url = os.getenv("MARKET_DATA_URL", "http://market-data:8083")
+        response = httpx.get(f"{market_url}/ticker", params={"symbol": symbol}, timeout=5.0)
+        response.raise_for_status()
+        price = Decimal(response.json()["price"])
+    qty = Decimal(base_qty)
+    result = ExecutionResult(
+        execution_id=request.execution_id,
+        intent_id=request.intent_id,
+        decision_id=request.decision_id,
+        idempotency_key=request.idempotency_key,
+        status="simulated",
+        venue_order_id=None,
+        fills=[Fill(price=price, qty=qty, fee=Decimal("0"), fee_asset="USDT", ts=_now())],
+        avg_price=price,
+        filled_qty=qty,
+        remaining_qty=Decimal("0"),
+        error=None,
+        raw_venue_response_ref=None,
+        finalized_at=_now(),
+    )
+    _persist_execution(request, result)
+    return result
+
+
+def _ibkr_paper_execute(
+    request: ExecutionRequest,
+    symbol: str,
+    side: str,
+    quantity_kind: str,
+    base_qty: str,
+    quote_qty: str,
+    mode: str,
+    market_url: str,
+) -> ExecutionResult:
+    if mode == "live":
+        result = _error_result(request, "ibkr live trading not yet available")
+        _persist_execution(request, result)
+        return result
+    try:
+        response = httpx.get(
+            f"{market_url}/ticker",
+            params={"symbol": symbol, "asset_type": "stock"},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        price = Decimal(str(response.json().get("price") or ""))
+    except (httpx.HTTPError, ValueError, KeyError, InvalidOperation):
+        result = _error_result(request, f"market data unavailable for {symbol}")
+        _persist_execution(request, result)
+        return result
+    if price <= 0:
+        result = _error_result(request, f"invalid price for {symbol}")
+        _persist_execution(request, result)
+        return result
+    if quantity_kind == "base":
+        qty = Decimal(base_qty)
+    else:
+        qty = (Decimal(quote_qty) / price).quantize(Decimal("0.0001"))
+    if qty <= 0:
+        result = _error_result(request, "computed quantity is zero")
+        _persist_execution(request, result)
+        return result
+    result = ExecutionResult(
+        execution_id=request.execution_id,
+        intent_id=request.intent_id,
+        decision_id=request.decision_id,
+        idempotency_key=request.idempotency_key,
+        status="simulated",
+        venue_order_id=f"ibkr-paper-{uuid4().hex[:12]}",
+        fills=[Fill(price=price, qty=qty, fee=Decimal("0"), fee_asset="USD", ts=_now())],
+        avg_price=price,
+        filled_qty=qty,
+        remaining_qty=Decimal("0"),
+        error=None,
+        raw_venue_response_ref=None,
+        finalized_at=_now(),
+    )
+    _persist_execution(request, result)
+    return result
+
+
+def _route_execution(
+    request: ExecutionRequest,
+    venue: str,
+    mode: str,
+    symbol: str,
+    side: str,
+    quantity_kind: str,
+    base_qty: str,
+    quote_qty: str,
+    order_type: str,
+    limit_price: str,
+    time_in_force: str,
+) -> ExecutionResult:
+    if venue == "ibkr_us_equity":
+        return _ibkr_paper_execute(
+            request,
+            symbol,
+            side,
+            quantity_kind,
+            base_qty,
+            quote_qty,
+            mode,
+            os.getenv("MARKET_DATA_URL", "http://market-data:8083"),
+        )
+    if venue != "binance_spot":
+        result = _error_result(request, f"unsupported venue: {venue}")
+        _persist_execution(request, result)
+        return result
+    if mode == "live":
+        if not LIVE_TRADING_ENABLED:
+            raise HTTPException(status_code=403, detail={"code": "LIVE_TRADING_DISABLED"})
+        return _execute_live(
+            request,
+            symbol,
+            side,
+            quantity_kind,
+            base_qty,
+            quote_qty,
+            order_type,
+            limit_price,
+            time_in_force,
+        )
+    return _binance_paper_execute(
+        request,
+        symbol,
+        side,
+        quantity_kind,
+        base_qty,
+        quote_qty,
+        order_type,
+        limit_price,
+    )
+
+
 def _execute_live(
     request: ExecutionRequest,
     symbol: str,
@@ -354,6 +504,7 @@ def execute(
     request: ExecutionRequest,
     x_decision_approved: str = Header(default="false"),
     x_mode: str = Header(default="paper"),
+    x_venue: str = Header(default="binance_spot"),
     x_symbol: str = Header(default="BTCUSDT"),
     x_quantity: str = Header(default="0"),
     x_side: str = Header(default="buy"),
@@ -366,43 +517,16 @@ def execute(
     if x_decision_approved.lower() != "true":
         raise HTTPException(status_code=403, detail={"code": "RISK_DECISION_NOT_APPROVED"})
 
-    if x_mode == "live":
-        if not LIVE_TRADING_ENABLED:
-            raise HTTPException(status_code=403, detail={"code": "LIVE_TRADING_DISABLED"})
-        return _execute_live(
-            request,
-            x_symbol,
-            x_side,
-            x_quantity_kind,
-            x_quantity,
-            x_quote_qty,
-            x_order_type,
-            x_limit_price,
-            x_time_in_force,
-        )
-
-    if x_order_type.lower() == "limit" and x_limit_price:
-        price = Decimal(x_limit_price)
-    else:
-        market_url = os.getenv("MARKET_DATA_URL", "http://market-data:8083")
-        response = httpx.get(f"{market_url}/ticker", params={"symbol": x_symbol}, timeout=5.0)
-        response.raise_for_status()
-        price = Decimal(response.json()["price"])
-    qty = Decimal(x_quantity)
-    result = ExecutionResult(
-        execution_id=request.execution_id,
-        intent_id=request.intent_id,
-        decision_id=request.decision_id,
-        idempotency_key=request.idempotency_key,
-        status="simulated",
-        venue_order_id=None,
-        fills=[Fill(price=price, qty=qty, fee=Decimal("0"), fee_asset="USDT", ts=_now())],
-        avg_price=price,
-        filled_qty=qty,
-        remaining_qty=Decimal("0"),
-        error=None,
-        raw_venue_response_ref=None,
-        finalized_at=_now(),
+    return _route_execution(
+        request,
+        x_venue,
+        x_mode,
+        x_symbol,
+        x_side,
+        x_quantity_kind,
+        x_quantity,
+        x_quote_qty,
+        x_order_type,
+        x_limit_price,
+        x_time_in_force,
     )
-    _persist_execution(request, result)
-    return result
