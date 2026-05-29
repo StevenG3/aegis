@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import hmac as hmac_lib
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -72,6 +73,10 @@ ORCHESTRATOR_SELF_URL = os.getenv("ORCHESTRATOR_SELF_URL", "http://localhost:808
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "true").lower() == "true"
 AUTO_TRADE_BATCH_LIMIT = int(os.getenv("AUTO_TRADE_BATCH_LIMIT", "5"))
 LIVE_AUTONOMY_GLOBAL_ENABLED = os.getenv("LIVE_AUTONOMY_GLOBAL_ENABLED", "false").lower() == "true"
+IBKR_MODE = os.getenv("IBKR_MODE", "stub")
+IBKR_LIVE_TRADING_ENABLED = os.getenv("IBKR_LIVE_TRADING_ENABLED", "false").lower() == "true"
+IBKR_BRIDGE_URL = os.getenv("IBKR_BRIDGE_URL", "http://ibkr-bridge:8086").rstrip("/")
+RECONCILE_AVG_COST_TOLERANCE = Decimal(os.getenv("RECONCILE_AVG_COST_TOLERANCE", "0.01"))
 LIVE_AUTO_TICK_SEC = float(os.getenv("LIVE_AUTO_TICK_SEC", "300"))
 LIVE_AUTO_BATCH_LIMIT = int(os.getenv("LIVE_AUTO_BATCH_LIMIT", "1"))
 STOP_LOSS_WATCHDOG_ENABLED = os.getenv("STOP_LOSS_WATCHDOG_ENABLED", "true").lower() == "true"
@@ -359,6 +364,19 @@ async def _stop_scheduler() -> None:
     with contextlib.suppress(asyncio.CancelledError):
         await _scheduler_task
     _scheduler_task = None
+
+
+@app.on_event("startup")
+async def _startup_ibkr_reconcile() -> None:
+    if IBKR_MODE != "bridge" or not IBKR_LIVE_TRADING_ENABLED:
+        return
+    await asyncio.sleep(2.0)
+    try:
+        run_ibkr_reconciliation()
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "RECONCILE_IBKR startup_hook_exception error=%s", exc
+        )
 
 
 def _now() -> datetime:
@@ -3221,3 +3239,195 @@ def _persist(
         if "intent_id" in str(exc):
             raise DuplicateIntentIdError from exc
         raise
+
+
+# ---------------------------------------------------------------------------
+# IBKR Portfolio Reconciliation (Phase 23)
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+def _write_reconcile_log(
+    run_at: str,
+    ibkr_positions: list[dict[str, str]],
+    aegis_positions: list[dict[str, str]],
+    drift: list[dict[str, object]],
+    status: str,
+    error: str | None,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into reconcile_log
+              (run_at, ibkr_positions_json, aegis_positions_json,
+               drift_json, status, error)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_at,
+                json.dumps(ibkr_positions),
+                json.dumps(aegis_positions),
+                json.dumps(drift),
+                status,
+                error,
+            ),
+        )
+        conn.commit()
+
+
+def run_ibkr_reconciliation(
+    bridge_url: str | None = None,
+    tolerance: Decimal | None = None,
+) -> dict[str, object]:
+    """
+    Fetch IBKR positions from the bridge and compare against paper_positions
+    where venue='ibkr_us_equity'.  Read-only: never modifies paper_positions.
+
+    Returns a result dict and writes one row to reconcile_log.
+    """
+    url = (bridge_url or IBKR_BRIDGE_URL).rstrip("/")
+    tol = tolerance if tolerance is not None else RECONCILE_AVG_COST_TOLERANCE
+    run_at = _now().isoformat()
+
+    try:
+        resp = httpx.get(f"{url}/positions", timeout=10.0)
+        resp.raise_for_status()
+        ibkr_raw: list[dict[str, str]] = resp.json().get("positions", [])
+    except Exception as exc:
+        _write_reconcile_log(run_at, [], [], [], "error", str(exc)[:500])
+        logger.warning("RECONCILE_IBKR bridge_unreachable error=%s", exc)
+        return {
+            "run_at": run_at,
+            "ibkr_positions": [],
+            "aegis_positions": [],
+            "drift": [],
+            "status": "error",
+            "error": str(exc)[:500],
+        }
+
+    with connect() as conn:
+        rows = conn.execute(
+            "select actor, symbol, live_qty, live_avg_cost "
+            "from paper_positions "
+            "where venue = 'ibkr_us_equity' "
+            "  and cast(live_qty as real) != 0"
+        ).fetchall()
+
+    aegis_raw: list[dict[str, str]] = [
+        {
+            "actor": row["actor"],
+            "symbol": row["symbol"],
+            "live_qty": row["live_qty"],
+            "live_avg_cost": row["live_avg_cost"],
+        }
+        for row in rows
+    ]
+
+    ibkr_map: dict[str, dict[str, str]] = {
+        p["symbol"].upper(): p for p in ibkr_raw
+    }
+    aegis_map: dict[str, list[dict[str, str]]] = {}
+    for pos in aegis_raw:
+        aegis_map.setdefault(pos["symbol"].upper(), []).append(pos)
+
+    all_symbols = sorted(set(ibkr_map) | set(aegis_map))
+    drift: list[dict[str, object]] = []
+
+    for symbol in all_symbols:
+        ibkr_pos = ibkr_map.get(symbol)
+        aegis_list = aegis_map.get(symbol, [])
+
+        if ibkr_pos and not aegis_list:
+            drift.append({
+                "kind": "unknown_ibkr_position",
+                "symbol": symbol,
+                "actor": None,
+                "ibkr_qty": ibkr_pos["qty"],
+                "ibkr_avg_cost": ibkr_pos["avg_cost"],
+                "aegis_qty": "0.00000000",
+                "aegis_avg_cost": "0.00000000",
+                "qty_delta": ibkr_pos["qty"],
+                "avg_cost_delta": ibkr_pos["avg_cost"],
+            })
+            continue
+
+        if not ibkr_pos and aegis_list:
+            for ap in aegis_list:
+                drift.append({
+                    "kind": "phantom_aegis_position",
+                    "symbol": symbol,
+                    "actor": ap["actor"],
+                    "ibkr_qty": "0.00000000",
+                    "ibkr_avg_cost": "0.00000000",
+                    "aegis_qty": ap["live_qty"],
+                    "aegis_avg_cost": ap["live_avg_cost"],
+                    "qty_delta": _q8s(-_q8(Decimal(ap["live_qty"]))),
+                    "avg_cost_delta": _q8s(-_q8(Decimal(ap["live_avg_cost"]))),
+                })
+            continue
+
+        for ap in aegis_list:
+            ibkr_qty = _q8(Decimal(ibkr_pos["qty"]))       # type: ignore[index]
+            ibkr_avg = _q8(Decimal(ibkr_pos["avg_cost"]))  # type: ignore[index]
+            aegis_qty = _q8(Decimal(ap["live_qty"]))
+            aegis_avg = _q8(Decimal(ap["live_avg_cost"]))
+            qty_delta = ibkr_qty - aegis_qty
+            avg_delta = ibkr_avg - aegis_avg
+            if qty_delta != Decimal("0") or abs(avg_delta) > tol:
+                drift.append({
+                    "kind": "qty_mismatch",
+                    "symbol": symbol,
+                    "actor": ap["actor"],
+                    "ibkr_qty": _q8s(ibkr_qty),
+                    "ibkr_avg_cost": _q8s(ibkr_avg),
+                    "aegis_qty": _q8s(aegis_qty),
+                    "aegis_avg_cost": _q8s(aegis_avg),
+                    "qty_delta": _q8s(qty_delta),
+                    "avg_cost_delta": _q8s(avg_delta),
+                })
+
+    status = "ok" if not drift else "drift"
+    _write_reconcile_log(run_at, ibkr_raw, aegis_raw, drift, status, None)
+
+    log_level = logging.INFO if status == "ok" else logging.WARNING
+    logger.log(log_level, "RECONCILE_IBKR status=%s drift_count=%d", status, len(drift))
+
+    return {
+        "run_at": run_at,
+        "ibkr_positions": ibkr_raw,
+        "aegis_positions": aegis_raw,
+        "drift": drift,
+        "status": status,
+        "error": None,
+    }
+
+
+@app.post("/reconcile/ibkr", response_model=None)
+def trigger_ibkr_reconcile() -> JSONResponse | dict[str, object]:
+    result = run_ibkr_reconciliation()
+    if result["status"] == "error":
+        return JSONResponse(status_code=503, content=result)
+    return result
+
+
+@app.get("/reconcile/ibkr/latest", response_model=None)
+def get_latest_ibkr_reconcile() -> dict[str, object]:
+    with connect() as conn:
+        row = conn.execute(
+            "select run_at, ibkr_positions_json, aegis_positions_json, "
+            "drift_json, status, error "
+            "from reconcile_log "
+            "order by run_at desc, id desc "
+            "limit 1"
+        ).fetchone()
+    if row is None:
+        return {"status": "never_run"}
+    return {
+        "run_at": row["run_at"],
+        "ibkr_positions": json.loads(str(row["ibkr_positions_json"])),
+        "aegis_positions": json.loads(str(row["aegis_positions_json"])),
+        "drift": json.loads(str(row["drift_json"])),
+        "status": row["status"],
+        "error": row["error"],
+    }

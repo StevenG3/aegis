@@ -32,6 +32,17 @@ class TickerResponse(BaseModel):
     source: str = "ibkr"
 
 
+class BridgePositionItem(BaseModel):
+    symbol: str
+    qty: str
+    avg_cost: str
+
+
+class BridgePositionsResponse(BaseModel):
+    positions: list[BridgePositionItem]
+    source: str = "ibkr"
+
+
 def _config_from_env() -> IBKRConfig:
     return IBKRConfig(
         host=os.getenv("IBKR_GATEWAY_HOST", "host.docker.internal"),
@@ -117,6 +128,18 @@ def cancel_order(order_id: str) -> dict[str, object]:
     if payload is None:
         raise HTTPException(status_code=404, detail={"code": "ORDER_NOT_FOUND"})
     return payload
+
+
+@app.get("/positions", response_model=BridgePositionsResponse)
+def get_positions() -> dict[str, object]:
+    _ensure_ready()
+    try:
+        return {"positions": client.positions(), "source": "ibkr"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "IBKR_POSITIONS_FAILED", "error": str(exc)},
+        ) from exc
 
 
 @app.get("/tickers/{symbol}", response_model=TickerResponse)

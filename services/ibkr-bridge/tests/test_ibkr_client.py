@@ -62,6 +62,20 @@ class FakeIB:
     def sleep(self, seconds: float) -> None:
         assert seconds == 1.0
 
+    def reqPositions(self) -> list[object]:  # noqa: N802
+        return [
+            SimpleNamespace(
+                contract=SimpleNamespace(symbol="NVDA"),
+                position=10.0,
+                avgCost=450.25,
+            ),
+            SimpleNamespace(
+                contract=SimpleNamespace(symbol="MSFT"),
+                position=5.0,
+                avgCost=420.00,
+            ),
+        ]
+
 
 def test_connect_disconnect_and_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("ibkr_client.IB", FakeIB)
@@ -199,3 +213,72 @@ def test_paper_port_logs_audit_info(
     client.connect()
     assert client.is_ready() is True
     assert "IBKR_AUDIT paper_port" in caplog.text
+
+
+def test_positions_returns_list_when_connected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    result = client.positions()
+    assert isinstance(result, list)
+    assert len(result) == 2
+    symbols = {p["symbol"] for p in result}
+    assert "NVDA" in symbols
+    assert "MSFT" in symbols
+    nvda = next(p for p in result if p["symbol"] == "NVDA")
+    assert nvda["qty"] == "10.00000000"
+    assert nvda["avg_cost"] == "450.25000000"
+
+
+def test_positions_raises_when_not_connected() -> None:
+    client = IBKRClient(IBKRConfig())
+    with pytest.raises(RuntimeError, match="not connected"):
+        client.positions()
+
+
+def test_positions_skips_zero_qty(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ZeroQtyIB(FakeIB):
+        def reqPositions(self) -> list[object]:  # noqa: N802
+            return [
+                SimpleNamespace(
+                    contract=SimpleNamespace(symbol="AAPL"),
+                    position=0.0,
+                    avgCost=150.0,
+                ),
+                SimpleNamespace(
+                    contract=SimpleNamespace(symbol="NVDA"),
+                    position=5.0,
+                    avgCost=450.0,
+                ),
+            ]
+
+    monkeypatch.setattr("ibkr_client.IB", ZeroQtyIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    result = client.positions()
+    assert len(result) == 1
+    assert result[0]["symbol"] == "NVDA"
+
+
+def test_positions_skips_empty_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
+    class EmptySymbolIB(FakeIB):
+        def reqPositions(self) -> list[object]:  # noqa: N802
+            return [
+                SimpleNamespace(
+                    contract=SimpleNamespace(symbol=""),
+                    position=10.0,
+                    avgCost=100.0,
+                ),
+                SimpleNamespace(
+                    contract=SimpleNamespace(symbol="MSFT"),
+                    position=3.0,
+                    avgCost=420.0,
+                ),
+            ]
+
+    monkeypatch.setattr("ibkr_client.IB", EmptySymbolIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    result = client.positions()
+    assert len(result) == 1
+    assert result[0]["symbol"] == "MSFT"
