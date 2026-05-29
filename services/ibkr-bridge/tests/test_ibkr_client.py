@@ -19,11 +19,11 @@ class FakeEvent:
     def __init__(self) -> None:
         self._handlers: list[Callable[..., None]] = []
 
-    def __iadd__(self, handler: Callable[..., None]) -> "FakeEvent":
+    def __iadd__(self, handler: Callable[..., None]) -> FakeEvent:
         self._handlers.append(handler)
         return self
 
-    def __isub__(self, handler: Callable[..., None]) -> "FakeEvent":
+    def __isub__(self, handler: Callable[..., None]) -> FakeEvent:
         if handler in self._handlers:
             self._handlers.remove(handler)
         return self
