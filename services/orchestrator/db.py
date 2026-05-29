@@ -392,4 +392,9 @@ def init_db(conn: sqlite3.Connection) -> None:
         "create index if not exists idx_reconcile_log_run_at "
         "on reconcile_log(run_at desc)"
     )
+    try:
+        conn.execute("alter table reconcile_log add column bridge_last_update text")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     conn.commit()

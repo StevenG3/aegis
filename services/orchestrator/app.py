@@ -3255,14 +3255,15 @@ def _write_reconcile_log(
     drift: list[dict[str, object]],
     status: str,
     error: str | None,
+    bridge_last_update: str | None = None,
 ) -> None:
     with connect() as conn:
         conn.execute(
             """
             insert into reconcile_log
               (run_at, ibkr_positions_json, aegis_positions_json,
-               drift_json, status, error)
-            values (?, ?, ?, ?, ?, ?)
+               drift_json, status, error, bridge_last_update)
+            values (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_at,
@@ -3271,6 +3272,7 @@ def _write_reconcile_log(
                 json.dumps(drift),
                 status,
                 error,
+                bridge_last_update,
             ),
         )
         conn.commit()
@@ -3289,11 +3291,30 @@ def run_ibkr_reconciliation(
     url = (bridge_url or IBKR_BRIDGE_URL).rstrip("/")
     tol = tolerance if tolerance is not None else RECONCILE_AVG_COST_TOLERANCE
     run_at = _now().isoformat()
+    bridge_last_update: str | None = None
 
     try:
         resp = httpx.get(f"{url}/positions", timeout=10.0)
+        if getattr(resp, "status_code", 200) == 503:
+            try:
+                detail = resp.json().get("detail", {})
+            except Exception:
+                detail = {}
+            if isinstance(detail, dict) and detail.get("code") == "IBKR_POSITIONS_NOT_READY":
+                msg = "bridge position cache not ready"
+                _write_reconcile_log(run_at, [], [], [], "error", msg)
+                logger.warning("RECONCILE_IBKR bridge_not_ready")
+                return {
+                    "run_at": run_at,
+                    "ibkr_positions": [],
+                    "aegis_positions": [],
+                    "drift": [],
+                    "status": "error",
+                    "error": msg,
+                    "bridge_last_update": None,
+                }
         resp.raise_for_status()
-        ibkr_raw: list[dict[str, str]] = resp.json().get("positions", [])
+        payload = resp.json()
     except Exception as exc:
         _write_reconcile_log(run_at, [], [], [], "error", str(exc)[:500])
         logger.warning("RECONCILE_IBKR bridge_unreachable error=%s", exc)
@@ -3304,7 +3325,25 @@ def run_ibkr_reconciliation(
             "drift": [],
             "status": "error",
             "error": str(exc)[:500],
+            "bridge_last_update": None,
         }
+
+    bridge_last_update = cast(str | None, payload.get("last_update"))
+    if not payload.get("ready", True):
+        msg = "bridge position cache not ready"
+        _write_reconcile_log(run_at, [], [], [], "error", msg, bridge_last_update)
+        logger.warning("RECONCILE_IBKR bridge_not_ready")
+        return {
+            "run_at": run_at,
+            "ibkr_positions": [],
+            "aegis_positions": [],
+            "drift": [],
+            "status": "error",
+            "error": msg,
+            "bridge_last_update": bridge_last_update,
+        }
+
+    ibkr_raw = cast(list[dict[str, str]], payload.get("positions", []))
 
     with connect() as conn:
         rows = conn.execute(
@@ -3388,7 +3427,7 @@ def run_ibkr_reconciliation(
                 })
 
     status = "ok" if not drift else "drift"
-    _write_reconcile_log(run_at, ibkr_raw, aegis_raw, drift, status, None)
+    _write_reconcile_log(run_at, ibkr_raw, aegis_raw, drift, status, None, bridge_last_update)
 
     log_level = logging.INFO if status == "ok" else logging.WARNING
     logger.log(log_level, "RECONCILE_IBKR status=%s drift_count=%d", status, len(drift))
@@ -3400,6 +3439,7 @@ def run_ibkr_reconciliation(
         "drift": drift,
         "status": status,
         "error": None,
+        "bridge_last_update": bridge_last_update,
     }
 
 
@@ -3416,7 +3456,7 @@ def get_latest_ibkr_reconcile() -> dict[str, object]:
     with connect() as conn:
         row = conn.execute(
             "select run_at, ibkr_positions_json, aegis_positions_json, "
-            "drift_json, status, error "
+            "drift_json, status, error, bridge_last_update "
             "from reconcile_log "
             "order by run_at desc, id desc "
             "limit 1"
@@ -3430,4 +3470,5 @@ def get_latest_ibkr_reconcile() -> dict[str, object]:
         "drift": json.loads(str(row["drift_json"])),
         "status": row["status"],
         "error": row["error"],
+        "bridge_last_update": row["bridge_last_update"],
     }

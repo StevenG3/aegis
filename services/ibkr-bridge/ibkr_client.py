@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from threading import RLock
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -54,6 +55,7 @@ class IBKRConfig:
     client_id: int = 1
     timeout_sec: float = 10.0
     allow_live_port: bool = False
+    account_code: str = ""
 
 
 def _is_live_gateway_port(port: int) -> bool:
@@ -95,6 +97,12 @@ class IBKRClient:
         self._ib: Any | None = None
         self._orders: dict[str, dict[str, object]] = {}
         self._idempotency: dict[str, str] = {}
+        self._position_cache: dict[str, dict[str, str]] = {}
+        self._positions_primed: bool = False
+        self._positions_last_update: str | None = None
+        self._position_cache_lock = RLock()
+        self._position_handler_registered = False
+        self._position_end_handler_registered = False
 
     def connect(self) -> None:
         if IB is None:
@@ -115,10 +123,32 @@ class IBKRClient:
             clientId=self._config.client_id,
             timeout=self._config.timeout_sec,
         )
+        try:
+            self._subscribe_positions()
+        except Exception:
+            try:
+                self._unsubscribe_positions()
+            finally:
+                with self._position_cache_lock:
+                    self._position_cache.clear()
+                    self._positions_primed = False
+                    self._positions_last_update = None
+                if self._ib is not None and self._ib.isConnected():
+                    self._ib.disconnect()
+                self._ib = None
+            raise
 
     def disconnect(self) -> None:
-        if self._ib is not None and self._ib.isConnected():
-            self._ib.disconnect()
+        if self._ib is not None:
+            try:
+                self._unsubscribe_positions()
+            finally:
+                with self._position_cache_lock:
+                    self._position_cache.clear()
+                    self._positions_primed = False
+                    self._positions_last_update = None
+                if self._ib.isConnected():
+                    self._ib.disconnect()
 
     def is_ready(self) -> bool:
         return self._ib is not None and bool(self._ib.isConnected())
@@ -127,6 +157,73 @@ class IBKRClient:
         if self._ib is None or not self._ib.isConnected():
             raise RuntimeError("IBKR client is not connected")
         return self._ib
+
+    def _subscribe_positions(self) -> None:
+        ib = self._require_ready()
+        with self._position_cache_lock:
+            self._position_cache.clear()
+            self._positions_primed = False
+            self._positions_last_update = None
+        if not hasattr(ib, "positionEvent"):
+            # TODO(STOP-AND-ASK): Installed ib_async lacks positionEvent; native
+            # streaming is required, so fail closed instead of adding polling.
+            raise RuntimeError("ib_async positionEvent is not available")
+        ib.positionEvent += self._on_position_event
+        self._position_handler_registered = True
+        if hasattr(ib, "positionEndEvent"):
+            ib.positionEndEvent += self._on_position_end_event
+            self._position_end_handler_registered = True
+        else:
+            # TODO(STOP-AND-ASK): Without positionEndEvent an empty IBKR account
+            # may never prime; /positions remains 503 until a positionEvent.
+            self._position_end_handler_registered = False
+        ib.reqPositions()
+
+    def _unsubscribe_positions(self) -> None:
+        if self._ib is None:
+            return
+        try:
+            if self._position_handler_registered and hasattr(self._ib, "positionEvent"):
+                self._ib.positionEvent -= self._on_position_event
+            if self._position_end_handler_registered and hasattr(self._ib, "positionEndEvent"):
+                self._ib.positionEndEvent -= self._on_position_end_event
+            if hasattr(self._ib, "cancelPositions"):
+                self._ib.cancelPositions()
+            else:
+                # TODO(STOP-AND-ASK): Installed ib_async lacks cancelPositions;
+                # handler removal plus disconnect is the safest available cleanup.
+                pass
+        except Exception:
+            logger.exception("IBKR position subscription cleanup failed")
+        finally:
+            self._position_handler_registered = False
+            self._position_end_handler_registered = False
+
+    def _on_position_event(self, position: Any) -> None:
+        """ib_async positionEvent callback. Read-only cache update."""
+        contract = getattr(position, "contract", None)
+        symbol = str(getattr(contract, "symbol", "")).upper().strip()
+        if not symbol:
+            return
+        qty = _decimal(getattr(position, "position", 0)).quantize(Decimal("0.00000001"))
+        avg_cost = _decimal(getattr(position, "avgCost", 0)).quantize(Decimal("0.00000001"))
+        with self._position_cache_lock:
+            if qty == Decimal("0"):
+                self._position_cache.pop(symbol, None)
+            else:
+                self._position_cache[symbol] = {
+                    "symbol": symbol,
+                    "qty": str(qty),
+                    "avg_cost": str(avg_cost),
+                }
+            self._positions_last_update = _now_iso()
+            self._positions_primed = True
+
+    def _on_position_end_event(self, *args: Any) -> None:
+        _ = args
+        with self._position_cache_lock:
+            self._positions_last_update = _now_iso()
+            self._positions_primed = True
 
     def place_order(self, request: PlaceOrderRequest) -> dict[str, object]:
         existing_id = self._idempotency.get(request.idempotency_key)
@@ -194,26 +291,19 @@ class IBKRClient:
         return {"symbol": normalized, "price": str(price), "source": "ibkr"}
 
     def positions(self) -> list[dict[str, str]]:
-        ib = self._require_ready()
-        raw = ib.reqPositions()
-        result: list[dict[str, str]] = []
-        for pos in raw:
-            qty = _decimal(getattr(pos, "position", 0)).quantize(
-                Decimal("0.00000001")
-            )
-            if qty == Decimal("0"):
-                continue
-            contract = getattr(pos, "contract", None)
-            symbol = str(getattr(contract, "symbol", "")).upper().strip()
-            if not symbol:
-                continue
-            avg_cost = _decimal(getattr(pos, "avgCost", 0)).quantize(
-                Decimal("0.00000001")
-            )
-            result.append(
-                {"symbol": symbol, "qty": str(qty), "avg_cost": str(avg_cost)}
-            )
-        return result
+        self._require_ready()
+        with self._position_cache_lock:
+            if not self._positions_primed:
+                raise RuntimeError("IBKR positions cache is not ready")
+            return [dict(v) for v in self._position_cache.values()]
+
+    def positions_ready(self) -> bool:
+        with self._position_cache_lock:
+            return self._positions_primed
+
+    def positions_last_update(self) -> str | None:
+        with self._position_cache_lock:
+            return self._positions_last_update
 
     def _result_from_trade(self, trade: Any) -> dict[str, object]:
         order_id = str(getattr(getattr(trade, "order", object()), "orderId", ""))

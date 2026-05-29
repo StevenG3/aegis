@@ -160,6 +160,7 @@ services:
       IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
       IBKR_CONNECT_TIMEOUT_SEC: ${IBKR_CONNECT_TIMEOUT_SEC:-10}
       IBKR_ALLOW_LIVE_PORT: ${IBKR_ALLOW_LIVE_PORT:-false}
+      IBKR_ACCOUNT_CODE: ${IBKR_ACCOUNT_CODE:-}
     extra_hosts:
       - "ibkr-host:host-gateway"
     ports:

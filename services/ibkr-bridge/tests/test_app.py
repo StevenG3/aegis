@@ -26,6 +26,8 @@ class FakeClient:
     def __init__(self) -> None:
         self.connected = False
         self.orders: dict[str, dict[str, object]] = {}
+        self.position_cache_ready = True
+        self.position_last_update = "2026-05-30T00:00:00+00:00"
 
     def connect(self) -> None:
         self.connected = True
@@ -67,6 +69,12 @@ class FakeClient:
 
     def positions(self) -> list[dict[str, str]]:
         return [{"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25000000"}]
+
+    def positions_ready(self) -> bool:
+        return self.position_cache_ready
+
+    def positions_last_update(self) -> str | None:
+        return self.position_last_update
 
 
 class RuntimeErrorClient(FakeClient):
@@ -174,12 +182,14 @@ def test_ticker(monkeypatch) -> None:
 def test_config_reads_live_port_authorization(monkeypatch) -> None:
     monkeypatch.setenv("IBKR_GATEWAY_PORT", "7496")
     monkeypatch.setenv("IBKR_ALLOW_LIVE_PORT", "true")
+    monkeypatch.setenv("IBKR_ACCOUNT_CODE", "DU123")
     cfg = bridge_app._config_from_env()
     assert cfg.port == 7496
     assert cfg.allow_live_port is True
+    assert cfg.account_code == "DU123"
 
 
-def test_get_positions_when_ready(monkeypatch) -> None:
+def test_get_positions_returns_freshness_when_primed(monkeypatch) -> None:
     fake = FakeClient()
     fake.connect()
     monkeypatch.setattr(bridge_app, "client", fake)
@@ -187,13 +197,25 @@ def test_get_positions_when_ready(monkeypatch) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["source"] == "ibkr"
+    assert body["ready"] is True
+    assert body["last_update"] == "2026-05-30T00:00:00+00:00"
     assert len(body["positions"]) == 1
     assert body["positions"][0]["symbol"] == "NVDA"
     assert body["positions"][0]["qty"] == "10.00000000"
 
 
-def test_get_positions_when_not_ready(monkeypatch) -> None:
+def test_get_positions_when_not_connected(monkeypatch) -> None:
     monkeypatch.setattr(bridge_app, "client", FakeClient())
     response = TestClient(bridge_app.app).get("/positions")
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "IBKR_NOT_READY"
+
+
+def test_get_positions_503_when_not_primed(monkeypatch) -> None:
+    fake = FakeClient()
+    fake.connect()
+    fake.position_cache_ready = False
+    monkeypatch.setattr(bridge_app, "client", fake)
+    response = TestClient(bridge_app.app).get("/positions")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "IBKR_POSITIONS_NOT_READY"

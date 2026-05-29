@@ -4364,9 +4364,13 @@ class FakeBridgePositionsResponse:
         self,
         positions: list[dict[str, str]],
         status_code: int = 200,
+        ready: bool = True,
+        last_update: str | None = "2026-05-30T00:00:00+00:00",
     ) -> None:
         self._positions = positions
         self.status_code = status_code
+        self._ready = ready
+        self._last_update = last_update
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -4378,7 +4382,12 @@ class FakeBridgePositionsResponse:
             )
 
     def json(self) -> dict[str, object]:
-        return {"positions": self._positions, "source": "ibkr"}
+        return {
+            "positions": self._positions,
+            "source": "ibkr",
+            "ready": self._ready,
+            "last_update": self._last_update,
+        }
 
 
 def _seed_ibkr_position(
@@ -4431,6 +4440,72 @@ def test_reconcile_clean_match_status_ok(monkeypatch, tmp_path: Path) -> None:
     resp = client.get("/reconcile/ibkr/latest")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+def test_reconcile_clean_match_still_works_with_ready_true(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos = [{"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25000000"}]
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos, ready=True)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(tmp_path, monkeypatch)
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["status"] == "ok"
+    assert result["drift"] == []
+
+
+def test_reconcile_error_when_bridge_not_ready(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse([], ready=False)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(tmp_path, monkeypatch)
+    result = orchestrator_app.run_ibkr_reconciliation(bridge_url="http://fake-bridge")
+    assert result["status"] == "error"
+    assert "not ready" in str(result["error"])
+    assert result["drift"] == []
+    assert result["ibkr_positions"] == []
+    client = TestClient(orchestrator_app.app)
+    resp = client.get("/reconcile/ibkr/latest")
+    assert resp.json()["status"] == "error"
+    assert "not ready" in resp.json()["error"]
+
+
+def test_reconcile_records_bridge_last_update(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    last_update = "2026-05-30T01:02:03+00:00"
+    bridge_pos = [{"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25000000"}]
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(
+            bridge_pos, ready=True, last_update=last_update
+        )
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(tmp_path, monkeypatch)
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["bridge_last_update"] == last_update
+    client = TestClient(orchestrator_app.app)
+    resp = client.get("/reconcile/ibkr/latest")
+    assert resp.json()["bridge_last_update"] == last_update
 
 
 def test_reconcile_qty_mismatch_detected(monkeypatch, tmp_path: Path) -> None:

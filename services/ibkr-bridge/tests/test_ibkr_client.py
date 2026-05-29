@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,12 +15,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ibkr_client import IBKRClient, IBKRConfig, PlaceOrderRequest, _is_live_gateway_port
 
 
+class FakeEvent:
+    def __init__(self) -> None:
+        self._handlers: list[Callable[..., None]] = []
+
+    def __iadd__(self, handler: Callable[..., None]) -> "FakeEvent":
+        self._handlers.append(handler)
+        return self
+
+    def __isub__(self, handler: Callable[..., None]) -> "FakeEvent":
+        if handler in self._handlers:
+            self._handlers.remove(handler)
+        return self
+
+    def emit(self, *args: object) -> None:
+        for handler in list(self._handlers):
+            handler(*args)
+
+
 class FakeIB:
     def __init__(self) -> None:
         self.connected = False
         self.qualified: list[object] = []
         self.placed: list[tuple[object, object]] = []
         self.disconnected = False
+        self.positionEvent = FakeEvent()
+        self.positionEndEvent = FakeEvent()
+        self.req_positions_calls = 0
+        self.cancel_positions_calls = 0
+        self.seed_positions = [
+            SimpleNamespace(
+                contract=SimpleNamespace(symbol="NVDA"),
+                position=10.0,
+                avgCost=450.25,
+            ),
+            SimpleNamespace(
+                contract=SimpleNamespace(symbol="MSFT"),
+                position=5.0,
+                avgCost=420.00,
+            ),
+        ]
 
     def connect(
         self, host: str, port: int, clientId: int, timeout: float
@@ -62,19 +97,14 @@ class FakeIB:
     def sleep(self, seconds: float) -> None:
         assert seconds == 1.0
 
-    def reqPositions(self) -> list[object]:  # noqa: N802
-        return [
-            SimpleNamespace(
-                contract=SimpleNamespace(symbol="NVDA"),
-                position=10.0,
-                avgCost=450.25,
-            ),
-            SimpleNamespace(
-                contract=SimpleNamespace(symbol="MSFT"),
-                position=5.0,
-                avgCost=420.00,
-            ),
-        ]
+    def reqPositions(self) -> None:  # noqa: N802
+        self.req_positions_calls += 1
+        for position in self.seed_positions:
+            self.positionEvent.emit(position)
+        self.positionEndEvent.emit()
+
+    def cancelPositions(self) -> None:  # noqa: N802
+        self.cancel_positions_calls += 1
 
 
 def test_connect_disconnect_and_ready(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -238,8 +268,9 @@ def test_positions_raises_when_not_connected() -> None:
 
 def test_positions_skips_zero_qty(monkeypatch: pytest.MonkeyPatch) -> None:
     class ZeroQtyIB(FakeIB):
-        def reqPositions(self) -> list[object]:  # noqa: N802
-            return [
+        def __init__(self) -> None:
+            super().__init__()
+            self.seed_positions = [
                 SimpleNamespace(
                     contract=SimpleNamespace(symbol="AAPL"),
                     position=0.0,
@@ -262,8 +293,9 @@ def test_positions_skips_zero_qty(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_positions_skips_empty_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
     class EmptySymbolIB(FakeIB):
-        def reqPositions(self) -> list[object]:  # noqa: N802
-            return [
+        def __init__(self) -> None:
+            super().__init__()
+            self.seed_positions = [
                 SimpleNamespace(
                     contract=SimpleNamespace(symbol=""),
                     position=10.0,
@@ -282,3 +314,131 @@ def test_positions_skips_empty_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
     result = client.positions()
     assert len(result) == 1
     assert result[0]["symbol"] == "MSFT"
+
+
+def test_position_event_populates_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    class EmptySeedIB(FakeIB):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seed_positions = []
+
+    monkeypatch.setattr("ibkr_client.IB", EmptySeedIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    client._ib.positionEvent.emit(  # type: ignore[union-attr]
+        SimpleNamespace(
+            contract=SimpleNamespace(symbol="nvda"),
+            position=10,
+            avgCost=450.25,
+        )
+    )
+    assert client.positions() == [
+        {"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25000000"}
+    ]
+    assert client._ib.placed == []  # type: ignore[union-attr]
+
+
+def test_position_event_zero_qty_removes_from_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    assert any(p["symbol"] == "NVDA" for p in client.positions())
+    client._ib.positionEvent.emit(  # type: ignore[union-attr]
+        SimpleNamespace(
+            contract=SimpleNamespace(symbol="NVDA"),
+            position=0,
+            avgCost=450.25,
+        )
+    )
+    assert all(p["symbol"] != "NVDA" for p in client.positions())
+
+
+def test_positions_ready_false_before_first_event() -> None:
+    client = IBKRClient(IBKRConfig())
+    assert client.positions_ready() is False
+
+
+def test_positions_ready_true_after_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoInitialEventIB(FakeIB):
+        def reqPositions(self) -> None:  # noqa: N802
+            self.req_positions_calls += 1
+
+    monkeypatch.setattr("ibkr_client.IB", NoInitialEventIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    assert client.positions_ready() is False
+    client._ib.positionEvent.emit(  # type: ignore[union-attr]
+        SimpleNamespace(contract=SimpleNamespace(symbol="NVDA"), position=1, avgCost=2)
+    )
+    assert client.positions_ready() is True
+
+
+def test_disconnect_clears_cache_and_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    assert client.positions_ready() is True
+    assert client.positions()
+    client.disconnect()
+    assert client.positions_ready() is False
+    with pytest.raises(RuntimeError, match="not connected"):
+        client.positions()
+
+
+def test_positions_does_not_call_reqPositions_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    fake_ib = client._ib
+    assert fake_ib.req_positions_calls == 1
+    client.positions()
+    client.positions()
+    assert fake_ib.req_positions_calls == 1
+
+
+def test_positions_returns_copy_on_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    first = client.positions()
+    first[0]["qty"] = "999"
+    second = client.positions()
+    assert second[0]["qty"] == "10.00000000"
+
+
+def test_reconnect_rebuilds_position_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    instances: list[FakeIB] = []
+
+    class ReconnectIB(FakeIB):
+        def __init__(self) -> None:
+            super().__init__()
+            instances.append(self)
+            if len(instances) == 1:
+                self.seed_positions = [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(symbol="NVDA"),
+                        position=10,
+                        avgCost=450.25,
+                    )
+                ]
+            else:
+                self.seed_positions = [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(symbol="MSFT"),
+                        position=2,
+                        avgCost=420,
+                    )
+                ]
+
+    monkeypatch.setattr("ibkr_client.IB", ReconnectIB)
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+    assert client.positions() == [
+        {"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25000000"}
+    ]
+    client.disconnect()
+    assert client.positions_ready() is False
+    client.connect()
+    assert client.positions() == [
+        {"symbol": "MSFT", "qty": "2.00000000", "avg_cost": "420.00000000"}
+    ]
