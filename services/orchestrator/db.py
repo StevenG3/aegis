@@ -375,4 +375,21 @@ def init_db(conn: sqlite3.Connection) -> None:
         "create index if not exists idx_scorecard_outcomes_source "
         "on scorecard_outcomes(source, status)"
     )
+    conn.execute(
+        """
+        create table if not exists reconcile_log (
+            id                    integer primary key autoincrement,
+            run_at                text    not null,
+            ibkr_positions_json   text    not null,
+            aegis_positions_json  text    not null,
+            drift_json            text    not null,
+            status                text    not null,
+            error                 text
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_reconcile_log_run_at "
+        "on reconcile_log(run_at desc)"
+    )
     conn.commit()

@@ -4352,3 +4352,367 @@ def test_disable_and_enable_live_autonomy_kill_switch(monkeypatch, tmp_path: Pat
         is False
     )
     assert orchestrator_app.LIVE_AUTONOMY_GLOBAL_ENABLED is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 23 — IBKR Portfolio Reconciliation
+# ---------------------------------------------------------------------------
+
+
+class FakeBridgePositionsResponse:
+    def __init__(
+        self,
+        positions: list[dict[str, str]],
+        status_code: int = 200,
+    ) -> None:
+        self._positions = positions
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import httpx
+            raise httpx.HTTPStatusError(
+                "bridge error",
+                request=None,  # type: ignore[arg-type]
+                response=self,  # type: ignore[arg-type]
+            )
+
+    def json(self) -> dict[str, object]:
+        return {"positions": self._positions, "source": "ibkr"}
+
+
+def _seed_ibkr_position(
+    tmp_path: Path,
+    monkeypatch,
+    actor: str = "user_1",
+    symbol: str = "NVDA",
+    live_qty: str = "10",
+    live_avg_cost: str = "450.25000000",
+    venue: str = "ibkr_us_equity",
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    import sqlite3 as _sqlite3
+    db_file = tmp_path / "trading.sqlite"
+    conn = _sqlite3.connect(db_file)
+    conn.row_factory = _sqlite3.Row
+    from db import init_db
+    init_db(conn)
+    conn.execute(
+        """
+        insert into paper_positions
+          (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+           paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue, last_updated)
+        values (?, ?, ?, ?, '0', '0', '0', '0', ?, ?, ?, datetime('now'))
+        """,
+        (actor, symbol, live_qty, live_avg_cost, live_qty, live_avg_cost, venue),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_reconcile_clean_match_status_ok(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos = [{"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25000000"}]
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(tmp_path, monkeypatch)
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["status"] == "ok"
+    assert result["drift"] == []
+    client = TestClient(orchestrator_app.app)
+    resp = client.get("/reconcile/ibkr/latest")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_reconcile_qty_mismatch_detected(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos = [{"symbol": "NVDA", "qty": "9.00000000", "avg_cost": "450.25000000"}]
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(tmp_path, monkeypatch)
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["status"] == "drift"
+    assert len(result["drift"]) == 1
+    assert result["drift"][0]["kind"] == "qty_mismatch"
+    assert result["drift"][0]["qty_delta"] == "-1.00000000"
+
+
+def test_reconcile_avg_cost_within_tolerance_is_clean(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos = [{"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25800000"}]
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(tmp_path, monkeypatch)
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["drift"] == []
+    assert result["status"] == "ok"
+
+
+def test_reconcile_avg_cost_outside_tolerance_is_drift(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos = [{"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.27000000"}]
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(tmp_path, monkeypatch)
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["status"] == "drift"
+    assert result["drift"][0]["kind"] == "qty_mismatch"
+    assert result["drift"][0]["avg_cost_delta"] == "0.02000000"
+
+
+def test_reconcile_unknown_ibkr_position(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos = [{"symbol": "TSLA", "qty": "5.00000000", "avg_cost": "200.00000000"}]
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    import sqlite3 as _sqlite3
+
+    from db import init_db
+    conn = _sqlite3.connect(tmp_path / "trading.sqlite")
+    init_db(conn)
+    conn.commit()
+    conn.close()
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["status"] == "drift"
+    assert result["drift"][0]["kind"] == "unknown_ibkr_position"
+    assert result["drift"][0]["actor"] is None
+    assert result["drift"][0]["aegis_qty"] == "0.00000000"
+
+
+def test_reconcile_phantom_aegis_position(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(
+        tmp_path, monkeypatch, symbol="AAPL",
+        live_qty="5", live_avg_cost="150.00000000",
+    )
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["status"] == "drift"
+    assert result["drift"][0]["kind"] == "phantom_aegis_position"
+    assert result["drift"][0]["ibkr_qty"] == "0.00000000"
+    assert result["drift"][0]["qty_delta"] == "-5.00000000"
+
+
+def test_reconcile_bridge_unreachable_returns_error_status(monkeypatch, tmp_path: Path) -> None:
+    import httpx as _httpx
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    def _raise(url, **kwargs):
+        if "positions" in url:
+            raise _httpx.ConnectError("bridge down")
+        return FakePriceResponse()
+
+    monkeypatch.setattr(orchestrator_app.httpx, "get", _raise)
+    result = orchestrator_app.run_ibkr_reconciliation(bridge_url="http://fake-bridge")
+    assert result["status"] == "error"
+    assert result["error"] is not None
+    assert result["drift"] == []
+    client = TestClient(orchestrator_app.app)
+    resp = client.get("/reconcile/ibkr/latest")
+    assert resp.json()["status"] == "error"
+
+
+def test_get_latest_reconcile_never_run(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    import sqlite3 as _sqlite3
+
+    from db import init_db
+    conn = _sqlite3.connect(tmp_path / "trading.sqlite")
+    init_db(conn)
+    conn.commit()
+    conn.close()
+    client = TestClient(orchestrator_app.app)
+    resp = client.get("/reconcile/ibkr/latest")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "never_run"}
+
+
+def test_get_latest_reconcile_returns_most_recent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    import httpx as _httpx
+
+    call_count = [0]
+
+    def _fake_get(url, **kw):
+        if "positions" in url:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise _httpx.ConnectError("down")
+            return FakeBridgePositionsResponse([])
+        return FakePriceResponse()
+
+    monkeypatch.setattr(orchestrator_app.httpx, "get", _fake_get)
+    orchestrator_app.run_ibkr_reconciliation(bridge_url="http://fake-bridge")
+    orchestrator_app.run_ibkr_reconciliation(bridge_url="http://fake-bridge")
+
+    client = TestClient(orchestrator_app.app)
+    resp = client.get("/reconcile/ibkr/latest")
+    assert resp.json()["status"] == "ok"
+
+
+def test_post_reconcile_ibkr_returns_503_on_bridge_error(monkeypatch, tmp_path: Path) -> None:
+    import httpx as _httpx
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    def _raise(url, **kwargs):
+        if "positions" in url:
+            raise _httpx.ConnectError("bridge down")
+        return FakePriceResponse()
+
+    monkeypatch.setattr(orchestrator_app.httpx, "get", _raise)
+    monkeypatch.setattr(orchestrator_app, "IBKR_BRIDGE_URL", "http://fake-bridge")
+    client = TestClient(orchestrator_app.app)
+    resp = client.post("/reconcile/ibkr")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "error"
+    assert resp.json()["error"] is not None
+
+
+def test_post_reconcile_ibkr_returns_200_on_clean(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "IBKR_BRIDGE_URL", "http://fake-bridge")
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse([])
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    import sqlite3 as _sqlite3
+
+    from db import init_db
+    conn = _sqlite3.connect(tmp_path / "trading.sqlite")
+    init_db(conn)
+    conn.commit()
+    conn.close()
+    client = TestClient(orchestrator_app.app)
+    resp = client.post("/reconcile/ibkr")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_reconcile_skips_binance_positions(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(
+        tmp_path, monkeypatch,
+        symbol="BTCUSDT", live_qty="0.01", live_avg_cost="60000.00000000",
+        venue="binance_spot",
+    )
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["drift"] == []
+    assert result["status"] == "ok"
+
+
+def test_reconcile_skips_zero_live_qty(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    bridge_pos: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "get",
+        lambda url, **kw: FakeBridgePositionsResponse(bridge_pos)
+        if "positions" in url
+        else FakePriceResponse(),
+    )
+    _seed_ibkr_position(
+        tmp_path, monkeypatch,
+        symbol="NVDA", live_qty="0", live_avg_cost="0",
+        venue="ibkr_us_equity",
+    )
+    result = orchestrator_app.run_ibkr_reconciliation(
+        bridge_url="http://fake-bridge",
+        tolerance=orchestrator_app.Decimal("0.01"),
+    )
+    assert result["drift"] == []
+    assert result["status"] == "ok"
+
+
+def test_startup_hook_skips_when_stub_mode(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "IBKR_MODE", "stub")
+    monkeypatch.setattr(orchestrator_app, "IBKR_LIVE_TRADING_ENABLED", True)
+    called = []
+    monkeypatch.setattr(
+        orchestrator_app, "run_ibkr_reconciliation", lambda **kw: called.append(1)
+    )
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(
+        orchestrator_app._startup_ibkr_reconcile()
+    )
+    assert called == []
+
+
+def test_startup_hook_skips_when_live_disabled(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "IBKR_MODE", "bridge")
+    monkeypatch.setattr(orchestrator_app, "IBKR_LIVE_TRADING_ENABLED", False)
+    called = []
+    monkeypatch.setattr(
+        orchestrator_app, "run_ibkr_reconciliation", lambda **kw: called.append(1)
+    )
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(
+        orchestrator_app._startup_ibkr_reconcile()
+    )
+    assert called == []

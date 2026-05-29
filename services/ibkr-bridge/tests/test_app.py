@@ -65,6 +65,9 @@ class FakeClient:
     def ticker(self, symbol: str) -> dict[str, str]:
         return {"symbol": symbol, "price": "452.50", "source": "ibkr"}
 
+    def positions(self) -> list[dict[str, str]]:
+        return [{"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25000000"}]
+
 
 class RuntimeErrorClient(FakeClient):
     def __init__(self, message: str) -> None:
@@ -174,3 +177,23 @@ def test_config_reads_live_port_authorization(monkeypatch) -> None:
     cfg = bridge_app._config_from_env()
     assert cfg.port == 7496
     assert cfg.allow_live_port is True
+
+
+def test_get_positions_when_ready(monkeypatch) -> None:
+    fake = FakeClient()
+    fake.connect()
+    monkeypatch.setattr(bridge_app, "client", fake)
+    response = TestClient(bridge_app.app).get("/positions")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "ibkr"
+    assert len(body["positions"]) == 1
+    assert body["positions"][0]["symbol"] == "NVDA"
+    assert body["positions"][0]["qty"] == "10.00000000"
+
+
+def test_get_positions_when_not_ready(monkeypatch) -> None:
+    monkeypatch.setattr(bridge_app, "client", FakeClient())
+    response = TestClient(bridge_app.app).get("/positions")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "IBKR_NOT_READY"

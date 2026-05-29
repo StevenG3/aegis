@@ -31,6 +31,10 @@ services:
       AUTO_TRADE_ENABLED: ${AUTO_TRADE_ENABLED:-true}
       ORCHESTRATOR_SELF_URL: ${ORCHESTRATOR_SELF_URL:-http://localhost:8080}
       NOTIFICATION_HOST_ALLOWLIST: ${NOTIFICATION_HOST_ALLOWLIST:-hermes-agent,hermes,localhost,127.0.0.1,172.17.0.1,172.23.0.1}
+      IBKR_MODE: ${IBKR_MODE:-stub}
+      IBKR_BRIDGE_URL: ${IBKR_BRIDGE_URL:-http://ibkr-bridge:8086}
+      IBKR_LIVE_TRADING_ENABLED: "false"
+      RECONCILE_AVG_COST_TOLERANCE: "0.01"
     ports:
       - "127.0.0.1:${ORCHESTRATOR_HOST_PORT:-18081}:8080"
     volumes:

@@ -193,6 +193,28 @@ class IBKRClient:
             raise ValueError("MARKET_DATA_UNAVAILABLE")
         return {"symbol": normalized, "price": str(price), "source": "ibkr"}
 
+    def positions(self) -> list[dict[str, str]]:
+        ib = self._require_ready()
+        raw = ib.reqPositions()
+        result: list[dict[str, str]] = []
+        for pos in raw:
+            qty = _decimal(getattr(pos, "position", 0)).quantize(
+                Decimal("0.00000001")
+            )
+            if qty == Decimal("0"):
+                continue
+            contract = getattr(pos, "contract", None)
+            symbol = str(getattr(contract, "symbol", "")).upper().strip()
+            if not symbol:
+                continue
+            avg_cost = _decimal(getattr(pos, "avgCost", 0)).quantize(
+                Decimal("0.00000001")
+            )
+            result.append(
+                {"symbol": symbol, "qty": str(qty), "avg_cost": str(avg_cost)}
+            )
+        return result
+
     def _result_from_trade(self, trade: Any) -> dict[str, object]:
         order_id = str(getattr(getattr(trade, "order", object()), "orderId", ""))
         status_raw = str(getattr(getattr(trade, "orderStatus", object()), "status", "Pending"))
