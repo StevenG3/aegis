@@ -66,6 +66,35 @@ class FakeClient:
         return {"symbol": symbol, "price": "452.50", "source": "ibkr"}
 
 
+class RuntimeErrorClient(FakeClient):
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def connect(self) -> None:
+        raise RuntimeError(self.message)
+
+
+def test_lifespan_keeps_healthz_up_for_ibkr_connection_runtime_errors(monkeypatch) -> None:
+    monkeypatch.setattr(bridge_app, "client", RuntimeErrorClient("Cannot run event loop"))
+    with TestClient(bridge_app.app) as test_client:
+        response = test_client.get("/healthz")
+    assert response.status_code == 200
+
+
+def test_lifespan_fails_closed_for_unauthorized_live_port(monkeypatch) -> None:
+    monkeypatch.setattr(
+        bridge_app,
+        "client",
+        RuntimeErrorClient("LIVE_PORT_NOT_AUTHORIZED: set IBKR_ALLOW_LIVE_PORT=true"),
+    )
+    try:
+        with TestClient(bridge_app.app):
+            raise AssertionError("startup should fail")
+    except RuntimeError as exc:
+        assert "LIVE_PORT_NOT_AUTHORIZED" in str(exc)
+
+
 def test_healthz_ok_even_when_not_ready(monkeypatch) -> None:
     monkeypatch.setattr(bridge_app, "client", FakeClient())
     response = TestClient(bridge_app.app).get("/healthz")

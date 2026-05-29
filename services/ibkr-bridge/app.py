@@ -50,8 +50,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         client.connect()
     except RuntimeError as exc:
-        logger.error("IBKR bridge startup failed: %s", exc)
-        raise
+        if str(exc).startswith("LIVE_PORT_NOT_AUTHORIZED"):
+            logger.error("IBKR bridge startup failed: %s", exc)
+            raise
+        # healthz stays up; readyz exposes disconnected state until Gateway/TWS appears.
+        pass
     except Exception:
         # healthz stays up; readyz exposes disconnected state until Gateway/TWS appears.
         pass
