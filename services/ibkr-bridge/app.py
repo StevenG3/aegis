@@ -41,6 +41,8 @@ class BridgePositionItem(BaseModel):
 class BridgePositionsResponse(BaseModel):
     positions: list[BridgePositionItem]
     source: str = "ibkr"
+    ready: bool = True
+    last_update: str | None = None
 
 
 def _config_from_env() -> IBKRConfig:
@@ -50,6 +52,7 @@ def _config_from_env() -> IBKRConfig:
         client_id=int(os.getenv("IBKR_CLIENT_ID", "1")),
         timeout_sec=float(os.getenv("IBKR_CONNECT_TIMEOUT_SEC", "10")),
         allow_live_port=os.getenv("IBKR_ALLOW_LIVE_PORT", "false").lower() == "true",
+        account_code=os.getenv("IBKR_ACCOUNT_CODE", ""),
     )
 
 
@@ -133,8 +136,21 @@ def cancel_order(order_id: str) -> dict[str, object]:
 @app.get("/positions", response_model=BridgePositionsResponse)
 def get_positions() -> dict[str, object]:
     _ensure_ready()
+    if not client.positions_ready():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "IBKR_POSITIONS_NOT_READY",
+                "message": "position subscription not primed yet",
+            },
+        )
     try:
-        return {"positions": client.positions(), "source": "ibkr"}
+        return {
+            "positions": client.positions(),
+            "source": "ibkr",
+            "ready": True,
+            "last_update": client.positions_last_update(),
+        }
     except Exception as exc:
         raise HTTPException(
             status_code=503,

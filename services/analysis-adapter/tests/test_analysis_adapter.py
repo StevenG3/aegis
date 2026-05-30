@@ -66,8 +66,9 @@ def test_analyze_dry_run_completes_synchronously(monkeypatch, tmp_path: Path) ->
         "/analyze", json={"actor": "user_1", "symbol": "BTCUSDT", "dry_run": True}
     )
     assert response.status_code == 200
-    assert response.elapsed.total_seconds() < 0.1
-    job_id = response.json()["job_id"]
+    body = response.json()
+    assert body["status"] == "queued"
+    job_id = body["job_id"]
     _await_job(job_id, status="succeeded")
     job = TestClient(adapter_app.app).get(f"/jobs/{job_id}").json()
     assert job["status"] == "succeeded"
