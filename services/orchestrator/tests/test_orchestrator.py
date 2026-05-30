@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import logging
 import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
@@ -4419,6 +4420,33 @@ def _seed_ibkr_position(
     conn.close()
 
 
+def _seed_reconcile_log(
+    tmp_path: Path,
+    monkeypatch,
+    drift: list[dict[str, object]] | None = None,
+    status: str = "drift",
+    run_at: str | None = None,
+) -> str:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    reconcile_run_at = run_at or datetime.now(UTC).isoformat()
+    orchestrator_app._write_reconcile_log(
+        reconcile_run_at,
+        [],
+        [],
+        drift or [],
+        status,
+        "bridge failed" if status == "error" else None,
+    )
+    return reconcile_run_at
+
+
+def _enable_reconcile_apply(monkeypatch) -> dict[str, str]:
+    monkeypatch.setattr(orchestrator_app, "RECONCILE_APPLY_ENABLED", True)
+    monkeypatch.setattr(orchestrator_app, "OPS_TOKEN", "ops-secret")
+    monkeypatch.setattr(orchestrator_app, "RECONCILE_MAX_AGE_SECONDS", 300)
+    return {"X-Ops-Token": "ops-secret"}
+
+
 def test_reconcile_clean_match_status_ok(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     bridge_pos = [{"symbol": "NVDA", "qty": "10.00000000", "avg_cost": "450.25000000"}]
@@ -4715,6 +4743,241 @@ def test_post_reconcile_ibkr_returns_200_on_clean(monkeypatch, tmp_path: Path) -
     resp = client.post("/reconcile/ibkr")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+def test_apply_returns_403_when_disabled(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "RECONCILE_APPLY_ENABLED", False)
+    monkeypatch.setattr(orchestrator_app, "OPS_TOKEN", "ops-secret")
+    resp = TestClient(orchestrator_app.app).post(
+        "/reconcile/ibkr/apply",
+        headers={"X-Ops-Token": "ops-secret"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["code"] == "RECONCILE_APPLY_DISABLED"
+
+
+def test_apply_returns_401_missing_token(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _enable_reconcile_apply(monkeypatch)
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply")
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "INVALID_OPS_TOKEN"
+
+
+def test_apply_returns_401_wrong_token(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _enable_reconcile_apply(monkeypatch)
+    resp = TestClient(orchestrator_app.app).post(
+        "/reconcile/ibkr/apply",
+        headers={"X-Ops-Token": "wrong"},
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "INVALID_OPS_TOKEN"
+
+
+def test_apply_returns_409_no_log(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    headers = _enable_reconcile_apply(monkeypatch)
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply", headers=headers)
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "RECONCILE_LOG_EMPTY"
+
+
+def test_apply_returns_409_error_status(monkeypatch, tmp_path: Path) -> None:
+    headers = _enable_reconcile_apply(monkeypatch)
+    _seed_reconcile_log(tmp_path, monkeypatch, [], status="error")
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply", headers=headers)
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "RECONCILE_LOG_ERROR_STATUS"
+
+
+def test_apply_returns_409_stale_log(monkeypatch, tmp_path: Path) -> None:
+    headers = _enable_reconcile_apply(monkeypatch)
+    run_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    _seed_reconcile_log(tmp_path, monkeypatch, [], status="ok", run_at=run_at)
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply", headers=headers)
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "RECONCILE_LOG_STALE"
+
+
+def test_apply_corrects_qty_mismatch(monkeypatch, tmp_path: Path) -> None:
+    headers = _enable_reconcile_apply(monkeypatch)
+    _seed_ibkr_position(tmp_path, monkeypatch, live_qty="8", live_avg_cost="400")
+    _seed_reconcile_log(
+        tmp_path,
+        monkeypatch,
+        [{
+            "kind": "qty_mismatch",
+            "symbol": "NVDA",
+            "actor": "user_1",
+            "ibkr_qty": "10",
+            "ibkr_avg_cost": "500",
+        }],
+    )
+
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["total_patched"] == 1
+    conn = sqlite3.connect(tmp_path / "trading.sqlite")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "select live_qty, live_avg_cost from paper_positions where actor = ? and symbol = ?",
+        ("user_1", "NVDA"),
+    ).fetchone()
+    log = conn.execute("select status, total_patched from reconcile_apply_log").fetchone()
+    conn.close()
+    assert row["live_qty"] == "10"
+    assert row["live_avg_cost"] == "500"
+    assert log["status"] == "ok"
+    assert log["total_patched"] == 1
+
+
+def test_apply_inserts_unknown_ibkr_position(monkeypatch, tmp_path: Path) -> None:
+    headers = _enable_reconcile_apply(monkeypatch)
+    _seed_reconcile_log(
+        tmp_path,
+        monkeypatch,
+        [{
+            "kind": "unknown_ibkr_position",
+            "symbol": "TSLA",
+            "actor": None,
+            "ibkr_qty": "5",
+            "ibkr_avg_cost": "200",
+        }],
+    )
+
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply", headers=headers)
+
+    assert resp.status_code == 200
+    conn = sqlite3.connect(tmp_path / "trading.sqlite")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "select actor, venue, live_qty, live_avg_cost from paper_positions where symbol = ?",
+        ("TSLA",),
+    ).fetchone()
+    log = conn.execute("select status from reconcile_apply_log").fetchone()
+    conn.close()
+    assert row["actor"] == orchestrator_app.RECONCILE_APPLY_DEFAULT_ACTOR
+    assert row["venue"] == "ibkr_us_equity"
+    assert row["live_qty"] == "5"
+    assert row["live_avg_cost"] == "200"
+    assert log["status"] == "ok"
+
+
+def test_apply_zeroes_phantom_position(monkeypatch, tmp_path: Path) -> None:
+    headers = _enable_reconcile_apply(monkeypatch)
+    _seed_ibkr_position(
+        tmp_path,
+        monkeypatch,
+        symbol="AAPL",
+        live_qty="5",
+        live_avg_cost="150",
+    )
+    _seed_reconcile_log(
+        tmp_path,
+        monkeypatch,
+        [{"kind": "phantom_aegis_position", "symbol": "AAPL", "actor": "user_1"}],
+    )
+
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply", headers=headers)
+
+    assert resp.status_code == 200
+    conn = sqlite3.connect(tmp_path / "trading.sqlite")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "select live_qty from paper_positions where actor = ? and symbol = ?",
+        ("user_1", "AAPL"),
+    ).fetchone()
+    conn.close()
+    assert row["live_qty"] == "0"
+
+
+def test_apply_zero_patches_on_clean_run(monkeypatch, tmp_path: Path) -> None:
+    headers = _enable_reconcile_apply(monkeypatch)
+    _seed_reconcile_log(tmp_path, monkeypatch, [], status="ok")
+
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["total_patched"] == 0
+    conn = sqlite3.connect(tmp_path / "trading.sqlite")
+    conn.row_factory = sqlite3.Row
+    log = conn.execute("select status, total_patched from reconcile_apply_log").fetchone()
+    conn.close()
+    assert log["status"] == "ok"
+    assert log["total_patched"] == 0
+
+
+def test_apply_all_patches_atomic_rollback(monkeypatch, tmp_path: Path) -> None:
+    headers = _enable_reconcile_apply(monkeypatch)
+    _seed_ibkr_position(tmp_path, monkeypatch, symbol="NVDA", live_qty="8")
+    _seed_ibkr_position(tmp_path, monkeypatch, symbol="AAPL", live_qty="5")
+    _seed_reconcile_log(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "kind": "qty_mismatch",
+                "symbol": "NVDA",
+                "actor": "user_1",
+                "ibkr_qty": "10",
+                "ibkr_avg_cost": "500",
+            },
+            {"kind": "phantom_aegis_position", "symbol": "AAPL", "actor": "user_1"},
+        ],
+    )
+    original_run_patches = orchestrator_app._run_reconcile_apply_patches
+
+    def fail_after_first_patch(
+        conn: sqlite3.Connection,
+        patches: list[dict[str, object]],
+        applied_at: str,
+    ) -> None:
+        first_patch = [patches[0]]
+        original_run_patches(conn, first_patch, applied_at)
+        raise sqlite3.OperationalError("forced second patch failure")
+
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_run_reconcile_apply_patches",
+        fail_after_first_patch,
+    )
+
+    resp = TestClient(orchestrator_app.app).post("/reconcile/ibkr/apply", headers=headers)
+
+    assert resp.status_code == 500
+    assert resp.json()["detail"]["code"] == "RECONCILE_APPLY_FAILED"
+    conn = sqlite3.connect(tmp_path / "trading.sqlite")
+    conn.row_factory = sqlite3.Row
+    rows = {
+        row["symbol"]: row["live_qty"]
+        for row in conn.execute("select symbol, live_qty from paper_positions")
+    }
+    log = conn.execute("select status, total_patched, error from reconcile_apply_log").fetchone()
+    conn.close()
+    assert rows == {"NVDA": "8", "AAPL": "5"}
+    assert log["status"] == "error"
+    assert log["total_patched"] == 2
+    assert "forced second patch failure" in log["error"]
+
+
+def test_startup_warns_when_reconcile_apply_enabled_without_token(
+    monkeypatch,
+    caplog,
+) -> None:
+    monkeypatch.setattr(orchestrator_app, "RECONCILE_APPLY_ENABLED", True)
+    monkeypatch.setattr(orchestrator_app, "OPS_TOKEN", "")
+    caplog.set_level(logging.WARNING)
+
+    import asyncio
+
+    asyncio.get_event_loop().run_until_complete(
+        orchestrator_app._warn_reconcile_apply_without_token()
+    )
+
+    assert "RECONCILE_APPLY_ENABLED is true but OPS_TOKEN is empty" in caplog.text
 
 
 def test_reconcile_skips_binance_positions(monkeypatch, tmp_path: Path) -> None:

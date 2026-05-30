@@ -11,7 +11,6 @@ services:
       MARKET_DATA_URL: http://market-data:8083
       PER_SYMBOL_DAILY_LIMIT_USDT: "50000"
       CLAUDE_API_KEY: ""
-      OPS_TOKEN: ""
       LIVE_UNLOCK_TTL_MIN: "15"
       SCORECARD_DEFAULT_TTL_MIN: "60"
       ANALYSIS_ADAPTER_URL: http://analysis-adapter:8085
@@ -35,6 +34,9 @@ services:
       IBKR_BRIDGE_URL: ${IBKR_BRIDGE_URL:-http://ibkr-bridge:8086}
       IBKR_LIVE_TRADING_ENABLED: "false"
       RECONCILE_AVG_COST_TOLERANCE: "0.01"
+      RECONCILE_APPLY_ENABLED: ${RECONCILE_APPLY_ENABLED:-false}
+      OPS_TOKEN: ${OPS_TOKEN:-}
+      RECONCILE_MAX_AGE_SECONDS: ${RECONCILE_MAX_AGE_SECONDS:-300}
     ports:
       - "127.0.0.1:${ORCHESTRATOR_HOST_PORT:-18081}:8080"
     volumes:

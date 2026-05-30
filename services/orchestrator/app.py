@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import httpx
-from db import connect
+from db import connect, write_apply_log
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -36,6 +36,7 @@ from schemas import (
 )
 
 app = FastAPI(title="orchestrator", version="0.1.0")
+logger = logging.getLogger(__name__)
 PER_SYMBOL_DAILY_LIMIT_USDT = Decimal(os.getenv("PER_SYMBOL_DAILY_LIMIT_USDT", "50000"))
 DECIMAL_8 = Decimal("0.00000001")
 CALIBRATION_BUCKETS = [
@@ -62,7 +63,10 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "claude-haiku-4-5-20251001")
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 SCORECARD_DEFAULT_TTL_MIN = int(os.getenv("SCORECARD_DEFAULT_TTL_MIN", "60"))
-OPS_TOKEN = os.getenv("OPS_TOKEN", "")
+OPS_TOKEN: str = os.getenv("OPS_TOKEN", "")
+RECONCILE_APPLY_ENABLED: bool = os.getenv("RECONCILE_APPLY_ENABLED", "false").lower() == "true"
+RECONCILE_MAX_AGE_SECONDS: int = int(os.getenv("RECONCILE_MAX_AGE_SECONDS", "300"))
+RECONCILE_APPLY_DEFAULT_ACTOR: str = "ibkr_reconcile"
 LIVE_UNLOCK_TTL_MIN = int(os.getenv("LIVE_UNLOCK_TTL_MIN", "15"))
 ANALYSIS_ADAPTER_URL = os.getenv("ANALYSIS_ADAPTER_URL", "http://analysis-adapter:8085")
 REFLECT_TIMEOUT_SEC = float(os.getenv("REFLECT_TIMEOUT_SEC", "60"))
@@ -222,6 +226,13 @@ class LiveUnlockRequest(BaseModel):
     actor: str = PydanticField(min_length=1)
 
 
+class ReconcileApplyResponse(BaseModel):
+    applied_at: str
+    reconcile_run_at: str
+    total_patched: int
+    patches: list[dict[str, object]]
+
+
 ScorecardCreateRequest.model_rebuild(_types_namespace={"Literal": Literal})
 ScorecardIntentRequest.model_rebuild(_types_namespace={"Literal": Literal, "UUID": UUID})
 LiveAutonomyUpdateRequest.model_rebuild()
@@ -230,6 +241,7 @@ TrailingStopUpdateRequest.model_rebuild()
 AutonomyUpdateRequest.model_rebuild()
 WatchlistAddRequest.model_rebuild(_types_namespace={"Literal": Literal})
 LiveUnlockRequest.model_rebuild()
+ReconcileApplyResponse.model_rebuild()
 
 
 class DuplicateIntentIdError(Exception):
@@ -326,8 +338,8 @@ async def _scheduler_loop() -> None:
     while True:
         try:
             scheduler_tick()
-        except Exception:
-            pass
+        except Exception as log_exc:
+            logger.error("RECONCILE_APPLY_ERROR_LOG_FAILED error=%s", log_exc)
         try:
             auto_trade_tick()
         except Exception:
@@ -379,8 +391,38 @@ async def _startup_ibkr_reconcile() -> None:
         )
 
 
+@app.on_event("startup")
+async def _warn_reconcile_apply_without_token() -> None:
+    if RECONCILE_APPLY_ENABLED and not OPS_TOKEN:
+        logger.warning(
+            "RECONCILE_APPLY_ENABLED is true but OPS_TOKEN is empty; "
+            "POST /reconcile/ibkr/apply will reject all calls"
+        )
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _check_ops_auth(request: Request) -> None:
+    """Double-lock check: env flag + token. Raises HTTPException on failure."""
+    if not RECONCILE_APPLY_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "RECONCILE_APPLY_DISABLED",
+                "message": "set RECONCILE_APPLY_ENABLED=true to use this endpoint",
+            },
+        )
+    token = request.headers.get("X-Ops-Token", "")
+    if not OPS_TOKEN or token != OPS_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "INVALID_OPS_TOKEN",
+                "message": "missing or invalid X-Ops-Token header",
+            },
+        )
 
 
 def _today() -> str:
@@ -3245,8 +3287,6 @@ def _persist(
 # IBKR Portfolio Reconciliation (Phase 23)
 # ---------------------------------------------------------------------------
 
-logger = logging.getLogger(__name__)
-
 
 def _write_reconcile_log(
     run_at: str,
@@ -3276,6 +3316,220 @@ def _write_reconcile_log(
             ),
         )
         conn.commit()
+
+
+def _ibkr_apply_total_cost(qty: object, avg_cost: object) -> str:
+    return _q8s(_q8(Decimal(str(qty)) * Decimal(str(avg_cost))))
+
+
+def _build_reconcile_apply_patches(drift_json: str) -> list[dict[str, object]]:
+    # TODO(STOP-AND-ASK): Phase 25 spec names split JSON columns on reconcile_log,
+    # but the existing Phase 23 schema stores all entries in drift_json.
+    raw_drift = json.loads(drift_json or "[]")
+    patches: list[dict[str, object]] = []
+    if not isinstance(raw_drift, list):
+        return patches
+
+    for raw_item in raw_drift:
+        if not isinstance(raw_item, dict):
+            continue
+        item = cast(dict[str, object], raw_item)
+        kind = item.get("kind") or item.get("type")
+        actor_value = item.get("actor")
+        actor = str(actor_value) if actor_value is not None else None
+        if kind == "qty_mismatch":
+            patch: dict[str, object] = {
+                "type": "qty_mismatch",
+                "symbol": item["symbol"],
+                "ibkr_qty": item["ibkr_qty"],
+                "ibkr_avg_cost": item["ibkr_avg_cost"],
+            }
+            if actor:
+                patch["actor"] = actor
+            patches.append(patch)
+        elif kind == "unknown_ibkr_position":
+            patches.append({
+                "type": "unknown_ibkr_position",
+                "symbol": item["symbol"],
+                "actor": actor or RECONCILE_APPLY_DEFAULT_ACTOR,
+                "ibkr_qty": item["ibkr_qty"],
+                "ibkr_avg_cost": item["ibkr_avg_cost"],
+            })
+        elif kind == "phantom_aegis_position":
+            patch = {
+                "type": "phantom_aegis_position",
+                "symbol": item["symbol"],
+            }
+            if actor:
+                patch["actor"] = actor
+            patches.append(patch)
+    return patches
+
+
+def _run_reconcile_apply_patches(
+    conn: sqlite3.Connection,
+    patches: list[dict[str, object]],
+    applied_at: str,
+) -> None:
+    for patch in patches:
+        sym = str(patch["symbol"])
+        patch_type = str(patch["type"])
+        actor_value = patch.get("actor")
+        actor = str(actor_value) if actor_value is not None else None
+        if patch_type == "qty_mismatch":
+            if actor:
+                conn.execute(
+                    """
+                    update paper_positions
+                    set live_qty = ?, live_avg_cost = ?, last_updated = ?
+                    where actor = ? and symbol = ? and venue = 'ibkr_us_equity'
+                    """,
+                    (patch["ibkr_qty"], patch["ibkr_avg_cost"], applied_at, actor, sym),
+                )
+            else:
+                conn.execute(
+                    """
+                    update paper_positions
+                    set live_qty = ?, live_avg_cost = ?, last_updated = ?
+                    where symbol = ? and venue = 'ibkr_us_equity'
+                    """,
+                    (patch["ibkr_qty"], patch["ibkr_avg_cost"], applied_at, sym),
+                )
+        elif patch_type == "unknown_ibkr_position":
+            # TODO(STOP-AND-ASK): paper_positions is keyed by (actor, symbol), not
+            # UNIQUE(symbol, venue). Unknown IBKR rows have no natural actor, so
+            # they are stored under a deterministic reconcile-owned actor.
+            patch_actor = actor or RECONCILE_APPLY_DEFAULT_ACTOR
+            live_qty = patch["ibkr_qty"]
+            live_avg_cost = patch["ibkr_avg_cost"]
+            conn.execute(
+                """
+                insert into paper_positions
+                  (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+                   paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue, last_updated)
+                values (?, ?, ?, ?, ?, '0', '0', '0', ?, ?, 'ibkr_us_equity', ?)
+                on conflict(actor, symbol) do update set
+                    qty = excluded.qty,
+                    avg_cost = excluded.avg_cost,
+                    total_cost = excluded.total_cost,
+                    live_qty = excluded.live_qty,
+                    live_avg_cost = excluded.live_avg_cost,
+                    venue = excluded.venue,
+                    last_updated = excluded.last_updated
+                """,
+                (
+                    patch_actor,
+                    sym,
+                    live_qty,
+                    live_avg_cost,
+                    _ibkr_apply_total_cost(live_qty, live_avg_cost),
+                    live_qty,
+                    live_avg_cost,
+                    applied_at,
+                ),
+            )
+        elif patch_type == "phantom_aegis_position":
+            if actor:
+                conn.execute(
+                    """
+                    update paper_positions
+                    set live_qty = '0', last_updated = ?
+                    where actor = ? and symbol = ? and venue = 'ibkr_us_equity'
+                    """,
+                    (applied_at, actor, sym),
+                )
+            else:
+                conn.execute(
+                    """
+                    update paper_positions
+                    set live_qty = '0', last_updated = ?
+                    where symbol = ? and venue = 'ibkr_us_equity'
+                    """,
+                    (applied_at, sym),
+                )
+
+
+@app.post("/reconcile/ibkr/apply", response_model=ReconcileApplyResponse)
+def post_reconcile_apply(request: Request) -> dict[str, object]:
+    _check_ops_auth(request)
+
+    applied_at = _now().isoformat()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select run_at, status, drift_json
+            from reconcile_log
+            order by run_at desc, id desc
+            limit 1
+            """
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "RECONCILE_LOG_EMPTY",
+                "message": "no reconciliation has been run yet",
+            },
+        )
+
+    run_at = str(row["run_at"])
+    log_status = str(row["status"])
+    if log_status == "error":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "RECONCILE_LOG_ERROR_STATUS",
+                "message": (
+                    "latest reconcile log has status='error'; "
+                    "re-run POST /reconcile/ibkr first"
+                ),
+            },
+        )
+
+    run_at_dt = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+    if run_at_dt.tzinfo is None:
+        run_at_dt = run_at_dt.replace(tzinfo=UTC)
+    age_seconds = (_now() - run_at_dt.astimezone(UTC)).total_seconds()
+    if age_seconds > RECONCILE_MAX_AGE_SECONDS:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "RECONCILE_LOG_STALE",
+                "message": (
+                    f"reconcile log is {int(age_seconds)}s old "
+                    f"(max {RECONCILE_MAX_AGE_SECONDS}s); "
+                    "re-run POST /reconcile/ibkr first"
+                ),
+            },
+        )
+
+    patches = _build_reconcile_apply_patches(str(row["drift_json"]))
+
+    try:
+        with connect() as conn:
+            _run_reconcile_apply_patches(conn, patches, applied_at)
+            write_apply_log(conn, applied_at, run_at, patches, "ok")
+            conn.commit()
+    except Exception as exc:
+        logger.error("RECONCILE_APPLY_FAILED error=%s", exc)
+        try:
+            with connect() as conn:
+                write_apply_log(conn, applied_at, run_at, patches, "error", str(exc)[:500])
+                conn.commit()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "RECONCILE_APPLY_FAILED", "message": str(exc)[:500]},
+        ) from exc
+
+    return {
+        "applied_at": applied_at,
+        "reconcile_run_at": run_at,
+        "total_patched": len(patches),
+        "patches": patches,
+    }
 
 
 def run_ibkr_reconciliation(
