@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -91,6 +94,27 @@ def test_lifespan_keeps_healthz_up_for_ibkr_connection_runtime_errors(monkeypatc
     with TestClient(bridge_app.app) as test_client:
         response = test_client.get("/healthz")
     assert response.status_code == 200
+
+
+def test_lifespan_runs_blocking_ibkr_connect_outside_async_loop(monkeypatch) -> None:
+    class BlockingIBClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.connect_thread_name: str | None = None
+
+        def connect(self) -> None:
+            self.connect_thread_name = threading.current_thread().name
+            with pytest.raises(RuntimeError, match="no running event loop"):
+                asyncio.get_running_loop()
+            super().connect()
+
+    fake = BlockingIBClient()
+    monkeypatch.setattr(bridge_app, "client", fake)
+    with TestClient(bridge_app.app) as test_client:
+        response = test_client.get("/readyz")
+
+    assert response.status_code == 200
+    assert fake.connect_thread_name is not None
 
 
 def test_lifespan_fails_closed_for_unauthorized_live_port(monkeypatch) -> None:

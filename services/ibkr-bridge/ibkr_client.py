@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 from dataclasses import dataclass
@@ -57,6 +58,12 @@ class IBKRConfig:
     allow_live_port: bool = False
     account_code: str = ""
 
+
+def _ensure_event_loop_for_sync_ib() -> None:
+    try:
+        asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 def _is_live_gateway_port(port: int) -> bool:
     if port in LIVE_GATEWAY_PORTS:
@@ -116,12 +123,15 @@ class IBKRClient:
             logger.warning("IBKR_AUDIT live_port_authorized port=%s", self._config.port)
         else:
             logger.info("IBKR_AUDIT paper_port port=%s", self._config.port)
+        _ensure_event_loop_for_sync_ib()
         self._ib = IB()
         self._ib.connect(
             self._config.host,
             self._config.port,
             clientId=self._config.client_id,
             timeout=self._config.timeout_sec,
+            readonly=True,
+            account=self._config.account_code,
         )
         try:
             self._subscribe_positions()

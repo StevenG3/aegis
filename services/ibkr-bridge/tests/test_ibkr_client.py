@@ -43,6 +43,8 @@ class FakeIB:
         self.positionEndEvent = FakeEvent()
         self.req_positions_calls = 0
         self.cancel_positions_calls = 0
+        self.connect_readonly: bool | None = None
+        self.connect_account: str | None = None
         self.seed_positions = [
             SimpleNamespace(
                 contract=SimpleNamespace(symbol="NVDA"),
@@ -57,9 +59,17 @@ class FakeIB:
         ]
 
     def connect(
-        self, host: str, port: int, clientId: int, timeout: float
+        self,
+        host: str,
+        port: int,
+        clientId: int,
+        timeout: float,
+        readonly: bool = False,
+        account: str = "",
     ) -> bool:  # noqa: N803
         _ = host, port, clientId, timeout
+        self.connect_readonly = readonly
+        self.connect_account = account
         self.connected = True
         return True
 
@@ -117,6 +127,14 @@ def test_connect_disconnect_and_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client.is_ready() is True
     client.disconnect()
     assert client.is_ready() is False
+
+
+def test_connect_uses_read_only_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    client = IBKRClient(IBKRConfig(account_code="DU123"))
+    client.connect()
+    assert client._ib.connect_readonly is True  # type: ignore[union-attr]
+    assert client._ib.connect_account == "DU123"  # type: ignore[union-attr]
 
 
 def test_place_market_order_normalizes_fills(monkeypatch: pytest.MonkeyPatch) -> None:

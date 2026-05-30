@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -62,7 +63,7 @@ client = IBKRClient(_config_from_env())
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
-        client.connect()
+        await asyncio.to_thread(client.connect)
     except RuntimeError as exc:
         if str(exc).startswith("LIVE_PORT_NOT_AUTHORIZED"):
             logger.error("IBKR bridge startup failed: %s", exc)
@@ -75,7 +76,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        client.disconnect()
+        await asyncio.to_thread(client.disconnect)
 
 
 app = FastAPI(title="ibkr-bridge", version="0.1.0", lifespan=lifespan)
