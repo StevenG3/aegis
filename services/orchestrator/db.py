@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -397,4 +398,35 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.commit()
     except sqlite3.OperationalError:
         pass
+    conn.execute(
+        """
+        create table if not exists reconcile_apply_log (
+            id               integer primary key autoincrement,
+            applied_at       text    not null,
+            reconcile_run_at text    not null,
+            patches_json     text    not null,
+            total_patched    integer not null default 0,
+            status           text    not null,
+            error            text
+        )
+        """
+    )
     conn.commit()
+
+
+def write_apply_log(
+    conn: sqlite3.Connection,
+    applied_at: str,
+    reconcile_run_at: str,
+    patches: list[dict[str, object]],
+    status: str,
+    error: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into reconcile_apply_log
+          (applied_at, reconcile_run_at, patches_json, total_patched, status, error)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (applied_at, reconcile_run_at, json.dumps(patches), len(patches), status, error),
+    )
