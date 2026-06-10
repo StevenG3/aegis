@@ -1,0 +1,18 @@
+{
+  "briefing": "CODEX_OLYMPUS_41B_REAL_UNIVERSE_AND_PAID_PRICE",
+  "status": "A_SEGMENT_IMPLEMENTED_B_SEGMENT_STOP_AND_ASK",
+  "survivorship": "light",
+  "public_artifact": true,
+  "private_results": "redacted; stored outside public aegis repository",
+  "constituent_source": "Wikipedia S&P 500 current constituents plus selected changes table",
+  "price_source": "free survivor-light yfinance/private CSV cache",
+  "warning": "survivor-light free prices may omit delisted securities; factor performance can be systematically optimistic and must not be used as edge evidence",
+  "allowed_verdicts": [
+    "INSUFFICIENT",
+    "NO_EDGE",
+    "SURVIVOR_LIGHT_PIPELINE_VALIDATED"
+  ],
+  "paid_price_source_status": "STOP_AND_ASK_REQUIRED_BEFORE_B_SEGMENT",
+  "live_trading": false,
+  "strategy_plugin_registered": false
+}

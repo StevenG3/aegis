@@ -1,0 +1,539 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from pathlib import Path
+
+
+def db_path() -> Path:
+    data_dir = Path(os.getenv("DATA_DIR", "/tmp/aegis-data"))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    new_path = data_dir / "trading.sqlite"
+    old_path = data_dir / "phase1.sqlite"
+    if not new_path.exists() and old_path.exists():
+        old_path.replace(new_path)
+    return new_path
+
+
+def connect() -> sqlite3.Connection:
+    path = db_path()
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+    return conn
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists intents (
+            intent_id text primary key,
+            payload_json text not null,
+            decision_json text,
+            execution_json text,
+            created_at text not null
+        )
+        """
+    )
+    try:
+        conn.execute("alter table intents add column status text not null default 'pending'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("alter table intents add column idempotency_key text not null default ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        """
+        update intents
+        set idempotency_key = json_extract(payload_json, '$.idempotency_key')
+        where idempotency_key = ''
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists daily_fills (
+            fill_id text primary key,
+            date text not null,
+            symbol text not null,
+            side text not null,
+            notional_usdt text not null,
+            created_at text not null
+        )
+        """
+    )
+    conn.execute("create index if not exists idx_intents_created_at on intents(created_at desc)")
+    conn.execute(
+        "create unique index if not exists idx_intents_idempotency_key on intents(idempotency_key)"
+    )
+    conn.execute(
+        """
+        create table if not exists paper_positions (
+            actor text not null,
+            symbol text not null,
+            qty text not null default '0',
+            avg_cost text not null default '0',
+            total_cost text not null default '0',
+            realized_pnl text not null default '0',
+            last_updated text not null,
+            primary key (actor, symbol)
+        )
+        """
+    )
+    for column, default in (
+        ("paper_qty", "0"),
+        ("paper_avg_cost", "0"),
+        ("live_qty", "0"),
+        ("live_avg_cost", "0"),
+        ("venue", "binance_spot"),
+    ):
+        try:
+            conn.execute(
+                f"alter table paper_positions add column {column} text not null default '{default}'"
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(
+        """
+        update paper_positions
+        set paper_qty = qty
+        where paper_qty = '0' and cast(qty as real) != 0
+        """
+    )
+    conn.execute(
+        """
+        update paper_positions
+        set paper_avg_cost = avg_cost
+        where paper_avg_cost = '0' and cast(qty as real) != 0
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_daily_fills_date_symbol on daily_fills(date, symbol)"
+    )
+    conn.execute(
+        """
+        create table if not exists scorecards (
+            scorecard_id text primary key,
+            actor text not null,
+            symbol text not null,
+            action text not null,
+            source text not null,
+            payload_json text not null,
+            created_at text not null,
+            expires_at text not null,
+            consumed_by_intent_id text
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_scorecards_actor_symbol on scorecards(actor, symbol)"
+    )
+    conn.execute("create index if not exists idx_scorecards_expires_at on scorecards(expires_at)")
+    conn.execute(
+        """
+        create table if not exists daily_pnl (
+            actor text not null,
+            date text not null,
+            realized_delta text not null,
+            symbol text not null,
+            venue text not null default 'binance_spot',
+            created_at text not null
+        )
+        """
+    )
+    try:
+        conn.execute(
+            "alter table daily_pnl add column venue text not null default 'binance_spot'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("create index if not exists idx_daily_pnl_actor_date on daily_pnl(actor, date)")
+    conn.execute(
+        """
+        create table if not exists live_unlock_tokens (
+            token text primary key,
+            actor text not null,
+            created_at text not null,
+            expires_at text not null,
+            consumed_at text
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_live_unlock_expires on live_unlock_tokens(expires_at)"
+    )
+    conn.execute(
+        """
+        create table if not exists watchlist_entries (
+            actor text not null,
+            symbol text not null,
+            asset_type text not null,
+            cadence_minutes integer not null,
+            last_run_at text,
+            next_run_at text not null,
+            enabled integer not null default 1,
+            source_origin text not null default 'standard',
+            gate_conviction text,
+            created_at text not null,
+            primary key (actor, symbol)
+        )
+        """
+    )
+    for statement in (
+        "alter table watchlist_entries add column source_origin text not null default 'standard'",
+        "alter table watchlist_entries add column gate_conviction text",
+    ):
+        try:
+            conn.execute(statement)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(
+        "create index if not exists idx_watchlist_due on watchlist_entries(enabled, next_run_at)"
+    )
+
+    conn.execute(
+        """
+        create table if not exists conviction_calibration (
+            source text not null,
+            asset_type text not null,
+            heuristic_bucket text not null,
+            sample_count integer not null,
+            hit_count integer not null,
+            avg_alpha_return text not null,
+            empirical_hit_rate text not null,
+            calibrated_conviction text not null,
+            updated_at text not null,
+            primary key (source, asset_type, heuristic_bucket)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists autonomy_settings (
+            actor text primary key,
+            enabled integer not null default 0,
+            daily_budget_usdt text not null default '0',
+            min_conviction text not null default '0.65',
+            per_trade_usdt text not null default '50',
+            allowed_sources text not null default 'tradingagents',
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists autonomy_spend (
+            actor text not null,
+            date text not null,
+            spent_usdt text not null default '0',
+            trade_count integer not null default 0,
+            last_updated text not null,
+            primary key (actor, date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists paper_bootstrap_halts (
+            actor text primary key,
+            halted integer not null default 0,
+            reason text,
+            observed_json text not null default '{}',
+            halted_at text,
+            resumed_at text,
+            resumed_by text,
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists paper_bootstrap_guardrail_state (
+            actor text primary key,
+            mark_failure_streak integer not null default 0,
+            decision_error_streak integer not null default 0,
+            last_error_rate text,
+            last_evaluated_at text not null
+        )
+        """
+    )
+
+    try:
+        conn.execute("alter table live_unlock_tokens add column bound_intent_id text")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        """
+        create table if not exists live_autonomy_settings (
+            actor text primary key,
+            enabled integer not null default 0,
+            daily_live_budget_usdt text not null default '0',
+            per_live_trade_max_usdt text not null default '50',
+            max_live_exposure_usdt text not null default '0',
+            max_us_equity_exposure_usd text not null default '0',
+            daily_live_trade_count_max integer not null default 3,
+            min_calibrated_conviction text not null default '0.70',
+            min_closed_outcomes integer not null default 20,
+            allowed_sources text not null default 'tradingagents',
+            created_at text not null,
+            updated_at text not null
+        )
+        """
+    )
+    try:
+        conn.execute(
+            "alter table live_autonomy_settings "
+            "add column max_live_exposure_usdt text not null default '0'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "alter table live_autonomy_settings "
+            "add column max_us_equity_exposure_usd text not null default '0'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        """
+        create table if not exists live_autonomy_spend (
+            actor text not null,
+            date text not null,
+            spent_usdt text not null default '0',
+            trade_count integer not null default 0,
+            last_updated text not null,
+            primary key (actor, date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists live_autonomy_kill (
+            id integer primary key check (id = 1),
+            killed integer not null default 0,
+            killed_at text,
+            killed_by text
+        )
+        """
+    )
+    conn.execute("insert or ignore into live_autonomy_kill (id, killed) values (1, 0)")
+    conn.execute(
+        """
+        create table if not exists notification_subscriptions (
+            actor text primary key,
+            webhook_url text not null,
+            secret text not null,
+            events_json text not null,
+            enabled integer not null default 1,
+            created_at text not null,
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists notification_deliveries (
+            id integer primary key autoincrement,
+            actor text not null,
+            event_type text not null,
+            webhook_url text not null,
+            status_code integer,
+            ok integer not null,
+            error_class text,
+            created_at text not null
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_notification_deliveries_actor_created "
+        "on notification_deliveries(actor, created_at desc)"
+    )
+    conn.execute(
+        """
+        create table if not exists scorecard_outcomes (
+            outcome_id text primary key,
+            scorecard_id text not null,
+            actor text not null,
+            symbol text not null,
+            source text not null,
+            action text not null,
+            opened_intent_id text not null,
+            opened_at text not null,
+            opened_qty text not null,
+            opened_avg_cost text not null,
+            opened_cost_basis text not null,
+            status text not null,
+            closed_at text,
+            closed_realized_pnl text,
+            closed_return_pct text,
+            notes text
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_scorecard_outcomes_actor_symbol "
+        "on scorecard_outcomes(actor, symbol, status)"
+    )
+    conn.execute(
+        "create index if not exists idx_scorecard_outcomes_scorecard "
+        "on scorecard_outcomes(scorecard_id)"
+    )
+    try:
+        conn.execute("alter table scorecard_outcomes add column reflected_at text")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    for column, default in (
+        ("trailing_pct", "0"),
+        ("peak_mark", "0"),
+    ):
+        try:
+            conn.execute(
+                "alter table scorecard_outcomes add column "
+                f"{column} text not null default '{default}'"
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(
+        "create index if not exists idx_scorecard_outcomes_reflection "
+        "on scorecard_outcomes(status, reflected_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_scorecard_outcomes_source "
+        "on scorecard_outcomes(source, status)"
+    )
+    conn.execute(
+        """
+        create table if not exists ev_estimates (
+            scorecard_id text primary key,
+            outcome_id text,
+            actor text not null,
+            symbol text not null,
+            mode text not null,
+            gate_result text not null,
+            reason text,
+            p text,
+            tp_pct text,
+            sl_pct text,
+            fee_bps text not null,
+            slippage_bps text not null,
+            funding_bps text not null,
+            min_ev text not null,
+            ev text,
+            created_at text not null,
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_ev_estimates_actor_created "
+        "on ev_estimates(actor, created_at desc)"
+    )
+    conn.execute(
+        """
+        create table if not exists factor_attribution (
+            actor text not null,
+            factor text not null,
+            direction text not null,
+            support_count integer not null default 0,
+            win_count integer not null default 0,
+            total_pnl text not null default '0',
+            loss_contribution text not null default '0',
+            updated_at text not null,
+            primary key (actor, factor, direction)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_factor_attribution_actor "
+        "on factor_attribution(actor)"
+    )
+    conn.execute(
+        """
+        create table if not exists memory_entries (
+            memory_id text primary key,
+            type text not null,
+            subject text not null,
+            content text not null,
+            source_ref_json text not null,
+            tags_json text not null default '[]',
+            confidence text,
+            superseded_by text,
+            trigger text,
+            created_by text,
+            created_at text not null
+        )
+        """
+    )
+    conn.execute(
+        "create unique index if not exists idx_memory_entries_type_source "
+        "on memory_entries(type, source_ref_json)"
+    )
+    conn.execute(
+        "create index if not exists idx_memory_entries_subject_type "
+        "on memory_entries(subject, type, created_at desc)"
+    )
+    conn.execute(
+        """
+        create table if not exists reconcile_log (
+            id                    integer primary key autoincrement,
+            run_at                text    not null,
+            ibkr_positions_json   text    not null,
+            aegis_positions_json  text    not null,
+            drift_json            text    not null,
+            status                text    not null,
+            error                 text
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_reconcile_log_run_at "
+        "on reconcile_log(run_at desc)"
+    )
+    try:
+        conn.execute("alter table reconcile_log add column bridge_last_update text")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        """
+        create table if not exists reconcile_apply_log (
+            id               integer primary key autoincrement,
+            applied_at       text    not null,
+            reconcile_run_at text    not null,
+            patches_json     text    not null,
+            total_patched    integer not null default 0,
+            status           text    not null,
+            error            text
+        )
+        """
+    )
+    conn.commit()
+
+
+def write_apply_log(
+    conn: sqlite3.Connection,
+    applied_at: str,
+    reconcile_run_at: str,
+    patches: list[dict[str, object]],
+    status: str,
+    error: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into reconcile_apply_log
+          (applied_at, reconcile_run_at, patches_json, total_patched, status, error)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (applied_at, reconcile_run_at, json.dumps(patches), len(patches), status, error),
+    )

@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+secrets/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.sqlite
+*.sqlite-journal
+data/
+/tmp/
+*.egg-info/
+aegis-strategies/

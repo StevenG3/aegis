@@ -1,0 +1,20 @@
+symbol: BTC/USDT
+source: binance
+timeframe: 1d
+instrument_type: spot
+rsi_period: 14
+entry:
+  threshold: 30
+exit:
+  stop_loss_pct: 0.03
+  take_profit_pct: 0.06
+  max_holding_bars: 14
+position:
+  position_size_r: 0.01
+costs:
+  fee_bps: 10
+  slippage_bps: 5
+walk_forward:
+  train_bars: 365
+  test_bars: 90
+  step_bars: 90

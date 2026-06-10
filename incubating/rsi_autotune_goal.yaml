@@ -1,0 +1,18 @@
+target_return_30d: 0.03
+max_drawdown: 0.12
+min_sharpe: 0.8
+failure_below: -0.04
+reflection_every: 5
+one_variable_only: true
+score:
+  return_weight: 0.333333
+  drawdown_weight: 0.333333
+  sharpe_weight: 0.333334
+  min_trades_for_sharpe: 10
+  min_bars_for_sharpe: 30
+autotune:
+  max_reflections: 6
+  threshold_step: 2
+  stop_loss_step: 0.002
+  take_profit_step: 0.005
+  rsi_period_step: 2

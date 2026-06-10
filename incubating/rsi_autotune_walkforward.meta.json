@@ -1,0 +1,16 @@
+{
+  "name": "rsi_autotune_walkforward",
+  "status": "incubating_private_candidate",
+  "mode": "paper_research_only",
+  "olympus_id": 38,
+  "edge_thesis": "在 IS 窗口内用每次只改一个变量的爬山反思调 RSI 多头参数, 冻结后检验 OOS 是否稳定优于静态 RSI 与 BTC buy-and-hold",
+  "null_hypothesis": "单变量爬山只是拟合 IS 噪声, OOS 不优于静态参数, 也不优于 buy-and-hold",
+  "expected_verdict": "NO_ROBUST_EDGE",
+  "safety": {
+    "order_path": "none",
+    "strategy_plugin": false,
+    "live_trading": false,
+    "funding_or_borrow_default": "N/A for spot long-only"
+  },
+  "promotion_policy": "candidate-only; requires walk-forward OOS stability, full costs, and superiority versus both buy-and-hold and static RSI before any further review"
+}

@@ -1,0 +1,82 @@
+{
+  "name": "olympus_value_quality_factor_computability_map",
+  "olympus_id": 40,
+  "status": "public_safe_dependency_map_only",
+  "ic_run": false,
+  "edge_values_included": false,
+  "factors": [
+    {
+      "factor": "earnings_yield_ep",
+      "dependency_category": "requires_delisting_aware_price",
+      "required_edgar_concepts": ["NetIncomeLoss", "CommonStockSharesOutstanding"],
+      "required_price_concepts": ["point_in_time_price"],
+      "notes": "Needs price or market capitalization denominator; blocked until Norgate price store."
+    },
+    {
+      "factor": "book_to_price_bp",
+      "dependency_category": "requires_delisting_aware_price",
+      "required_edgar_concepts": ["StockholdersEquity", "CommonStockSharesOutstanding"],
+      "required_price_concepts": ["point_in_time_price"],
+      "notes": "Book value is EDGAR available; price denominator is blocked until Norgate price store."
+    },
+    {
+      "factor": "sales_to_price_sp",
+      "dependency_category": "requires_delisting_aware_price",
+      "required_edgar_concepts": ["Revenues", "SalesRevenueNet", "CommonStockSharesOutstanding"],
+      "required_price_concepts": ["point_in_time_price"],
+      "notes": "Revenue numerator is EDGAR available; price denominator is blocked until Norgate price store."
+    },
+    {
+      "factor": "ev_to_ebitda_inverse",
+      "dependency_category": "requires_delisting_aware_price_and_net_debt",
+      "required_edgar_concepts": [
+        "OperatingIncomeLoss",
+        "DepreciationDepletionAndAmortization",
+        "DepreciationAndAmortization",
+        "LongTermDebt",
+        "LongTermDebtCurrent",
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        "CommonStockSharesOutstanding"
+      ],
+      "required_price_concepts": ["point_in_time_price"],
+      "notes": "EBITDA and net debt can be derived only when atoms exist; EV still needs delisting-aware market cap."
+    },
+    {
+      "factor": "free_cash_flow_to_price",
+      "dependency_category": "requires_delisting_aware_price",
+      "required_edgar_concepts": [
+        "NetCashProvidedByUsedInOperatingActivities",
+        "PaymentsToAcquirePropertyPlantAndEquipment",
+        "CommonStockSharesOutstanding"
+      ],
+      "required_price_concepts": ["point_in_time_price"],
+      "notes": "FCF numerator can be derived; price denominator is blocked until Norgate price store."
+    },
+    {
+      "factor": "roe",
+      "dependency_category": "edgar_fundamentals_only_survivor_light",
+      "required_edgar_concepts": ["NetIncomeLoss", "StockholdersEquity"],
+      "required_price_concepts": [],
+      "notes": "Can be computed from PIT EDGAR facts, but investable-universe IC still needs Norgate."
+    },
+    {
+      "factor": "gross_profitability",
+      "dependency_category": "edgar_fundamentals_only_survivor_light",
+      "required_edgar_concepts": ["GrossProfit", "Revenues", "SalesRevenueNet"],
+      "required_price_concepts": [],
+      "notes": "Can be computed from PIT EDGAR facts, but investable-universe IC still needs Norgate."
+    },
+    {
+      "factor": "accruals",
+      "dependency_category": "edgar_fundamentals_only_survivor_light",
+      "required_edgar_concepts": [
+        "NetIncomeLoss",
+        "NetCashProvidedByUsedInOperatingActivities",
+        "Assets"
+      ],
+      "required_price_concepts": [],
+      "notes": "Can be computed from PIT EDGAR facts when cash-flow atoms exist; IC still needs Norgate universe."
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "equal_weight_allocation",
+  "description": "Olympus #30 candidate-only paper research: equal-weight 1/N allocation across BTC/SPY/GLD/TLT with predeclared periodic rebalancing.",
+  "status": "incubating",
+  "paper_only": true,
+  "strategy_plugin_registered": false,
+  "olympus30_predeclared_universe": "binance:BTCUSDT:crypto,yfinance:SPY:equity,yfinance:GLD:gold,yfinance:TLT:bond",
+  "olympus30_predeclared_rebalance_grid_bars": [21, 63, 126],
+  "olympus30_only_tunable_parameter": "rebalance_bars",
+  "promotion_policy": "candidate-only; requires positive net-cost results, drawdown reduction versus BTC and SPY single-asset buy-and-hold, Sharpe/Calmar not worse than BTC/SPY and risk-parity baseline, frequency sweep robustness, and walk-forward OOS pass_share >= 0.60 before any further review"
+}

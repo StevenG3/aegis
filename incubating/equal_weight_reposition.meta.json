@@ -1,0 +1,37 @@
+{
+  "name": "equal_weight_reposition_vs_statusquo",
+  "description": "Olympus #32 reference risk allocation: equal-weight 1/N BTC/SPY/GLD/TLT with quarterly rebalance, retained as a paper-only diversified-beta risk reference after failing robust OOS edge gates.",
+  "status": "reference_default",
+  "label": "diversified beta, unvalidated, regime-dependent OOS",
+  "validated_edge": false,
+  "paper_only": true,
+  "paper_monitoring_reference_only": true,
+  "manual_backtest_or_paper_run_only": true,
+  "strategy_plugin_registered": false,
+  "autonomous_decision_path_connected": false,
+  "live_trading_allowed": false,
+  "auto_promotion_allowed": false,
+  "olympus31_reuses": "incubating/equal_weight_allocation.py",
+  "olympus31_status_quo_default": "binance:BTCUSDT",
+  "olympus31_predeclared_rebalance_grid_bars": [21, 63, 126],
+  "olympus31_only_tunable_parameter": "rebalance_bars",
+  "reference_default": {
+    "universe": ["binance:BTCUSDT", "stooq:SPY.US", "stooq:GLD.US", "stooq:TLT.US"],
+    "weights": "1/N equal weight",
+    "rebalance_bars": 63,
+    "rebalance_cadence": "quarterly",
+    "honest_value": "risk-management reference: lower drawdown and better downside-adjusted profile than concentrated BTC in #31 full-sample evidence",
+    "boundary": "not a verified alpha or robust OOS edge; diversification versus concentration is regime-dependent and regime prediction was not validated"
+  },
+  "olympus31_evidence_summary": {
+    "full_sample_status_quo_reposition_pass_share": 0.333333,
+    "oos_status_quo_reposition_pass_share": 0.375,
+    "oos_required_pass_share": 0.6,
+    "same_vol_btc_cash_full_sample_pass_share": 1.0,
+    "same_vol_btc_cash_oos_pass_share": 0.375,
+    "quarterly_sortino": 1.4,
+    "btc_sortino": 0.99,
+    "max_drawdown_reduction_pct_approx": 35
+  },
+  "promotion_policy": "reference-only; any move beyond manual backtest or paper monitoring requires a separate explicit user decision and must not bypass live gates, autonomous decision gates, or promotion gates"
+}

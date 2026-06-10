@@ -1,0 +1,13 @@
+{
+  "name": "trend_vol_risk_config",
+  "status": "incubating_private_candidate",
+  "mode": "paper_research_only",
+  "edge_thesis": "不赌方向预测;靠趋势过滤避开下行、波动率目标控暴露、回撤止损保命,追求风险调整后稳健",
+  "promotion_policy": "candidates-only; requires drawdown reduction, risk-adjusted metrics not worse than buy-and-hold, walk-forward OOS stability, and net-cost validation before any further review",
+  "safety": {
+    "order_path": "none",
+    "strategy_plugin": false,
+    "live_trading": false,
+    "risk_gate_changes": false
+  }
+}

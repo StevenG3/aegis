@@ -1,0 +1,59 @@
+{
+  "name": "value_quality_factor_probe",
+  "olympus_id": 33,
+  "status": "data_blocked",
+  "verdict": "DATA_BLOCKED_VALUE_FACTORS",
+  "edge_thesis": "Cheap plus high-quality stocks may outperform expensive plus low-quality stocks on a risk-adjusted basis, but only if tested with point-in-time fundamentals and survivorship-safe universe membership.",
+  "candidate_only": true,
+  "paper_only": true,
+  "validated_edge": false,
+  "strategy_plugin_registered": false,
+  "autonomous_decision_path_connected": false,
+  "live_trading_allowed": false,
+  "auto_promotion_allowed": false,
+  "data_gate": {
+    "point_in_time_fundamentals_required": true,
+    "filing_date_alignment_required": true,
+    "survivorship_safe_universe_required": true,
+    "snapshot_fundamentals_allowed": false,
+    "current_constituents_only_allowed": false,
+    "ic_evaluation_allowed": false,
+    "reason": "Current repository and execution environment do not provide both filing-date point-in-time fundamentals and delisted/survivorship-safe universe membership. IC evaluation is intentionally not run."
+  },
+  "predeclared_factor_set_if_data_gate_passes": [
+    "earnings_yield_ep",
+    "book_to_price_bp",
+    "sales_to_price_sp",
+    "ev_to_ebitda_inverse",
+    "free_cash_flow_to_price",
+    "roe",
+    "gross_profitability",
+    "accruals"
+  ],
+  "source_probe": [
+    {
+      "source": "SEC EDGAR submissions + XBRL APIs",
+      "point_in_time_fundamentals": "feasible engineering path for filing-date aligned issuer facts",
+      "survivorship_safe_universe": "not sufficient by itself; requires ticker/CIK history, delistings, prices, shares, corporate actions, and universe membership history",
+      "current_execution_result": "network DNS blocked for data.sec.gov in this sandbox"
+    },
+    {
+      "source": "repository yfinance/screener paths",
+      "point_in_time_fundamentals": "not available",
+      "survivorship_safe_universe": "not available",
+      "current_execution_result": "snapshot/current-public-data paths only; rejected for no-lookahead value factor IC"
+    },
+    {
+      "source": "paid curated datasets such as Sharadar or SimFin",
+      "point_in_time_fundamentals": "potential acquisition path, subject to subscription/license verification",
+      "survivorship_safe_universe": "potential acquisition path if delisted coverage and PIT fields are included",
+      "current_execution_result": "not present in local environment"
+    }
+  ],
+  "next_data_paths": [
+    "Build an EDGAR ingestion pipeline keyed by CIK/accession with filingDate acceptance alignment, XBRL tag normalization, restatement policy, ticker/CIK mapping history, delistings, corporate actions, and survivorship-safe price universe.",
+    "Acquire a licensed point-in-time fundamentals plus active/delisted equity prices dataset and verify filing-date fields before running IC.",
+    "Only after one path passes, run the locked factor set through Rank IC, ICIR, t-value, quintile monotonicity, Benjamini-Hochberg FDR, walk-forward OOS, full costs, and dual benchmarks."
+  ],
+  "disclaimer": "Public-safe placeholder only. No factor IC, strategy registration, order path, or live trading change."
+}

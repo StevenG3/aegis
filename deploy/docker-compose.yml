@@ -1,0 +1,281 @@
+name: aegis
+services:
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: services/orchestrator/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      RISK_ENGINE_URL: http://risk-engine:8081
+      EXECUTION_SERVICE_URL: http://execution-service:8082
+      MARKET_DATA_URL: http://market-data:8083
+      PER_SYMBOL_DAILY_LIMIT_USDT: "50000"
+      CLAUDE_API_KEY: ""
+      LIVE_UNLOCK_TTL_MIN: "15"
+      SCORECARD_DEFAULT_TTL_MIN: "60"
+      ANALYSIS_ADAPTER_URL: http://analysis-adapter:8085
+      REFLECT_TIMEOUT_SEC: ${REFLECT_TIMEOUT_SEC:-60}
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
+      SCHEDULER_TICK_SEC: ${SCHEDULER_TICK_SEC:-60}
+      SCHEDULER_BATCH_LIMIT: ${SCHEDULER_BATCH_LIMIT:-5}
+      CALIBRATION_SHRINKAGE_K: ${CALIBRATION_SHRINKAGE_K:-10}
+      LIVE_AUTO_BATCH_LIMIT: ${LIVE_AUTO_BATCH_LIMIT:-1}
+      LIVE_AUTO_TICK_SEC: ${LIVE_AUTO_TICK_SEC:-300}
+      LIVE_AUTONOMY_GLOBAL_ENABLED: ${LIVE_AUTONOMY_GLOBAL_ENABLED:-false}
+      STOP_LOSS_WATCHDOG_ENABLED: ${STOP_LOSS_WATCHDOG_ENABLED:-true}
+      STOP_LOSS_TICK_SEC: ${STOP_LOSS_TICK_SEC:-60}
+      STOP_LOSS_BATCH_LIMIT: ${STOP_LOSS_BATCH_LIMIT:-20}
+      CALIBRATION_MIN_SAMPLES: ${CALIBRATION_MIN_SAMPLES:-5}
+      AUTO_TRADE_BATCH_LIMIT: ${AUTO_TRADE_BATCH_LIMIT:-5}
+      AUTO_TRADE_ENABLED: ${AUTO_TRADE_ENABLED:-true}
+      ORCHESTRATOR_SELF_URL: ${ORCHESTRATOR_SELF_URL:-http://localhost:8080}
+      MEMORY_PNL_THRESHOLD: ${MEMORY_PNL_THRESHOLD:-10}
+      MEMORY_RETURN_THRESHOLD: ${MEMORY_RETURN_THRESHOLD:-0.02}
+      PAPER_FEEDBACK_BOOTSTRAP_ENABLED: ${PAPER_FEEDBACK_BOOTSTRAP_ENABLED:-false}
+      PAPER_FEEDBACK_ACTOR: ${PAPER_FEEDBACK_ACTOR:-}
+      PAPER_FEEDBACK_SYMBOLS: ${PAPER_FEEDBACK_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+      PAPER_FEEDBACK_DEFAULT_ASSET_TYPE: ${PAPER_FEEDBACK_DEFAULT_ASSET_TYPE:-crypto}
+      PAPER_FEEDBACK_CADENCE_MINUTES: ${PAPER_FEEDBACK_CADENCE_MINUTES:-240}
+      PAPER_FEEDBACK_DAILY_BUDGET_USDT: ${PAPER_FEEDBACK_DAILY_BUDGET_USDT:-50}
+      PAPER_FEEDBACK_PER_TRADE_USDT: ${PAPER_FEEDBACK_PER_TRADE_USDT:-10}
+      PAPER_FEEDBACK_MIN_CONVICTION: ${PAPER_FEEDBACK_MIN_CONVICTION:-0.65}
+      PAPER_FEEDBACK_ALLOWED_SOURCES: ${PAPER_FEEDBACK_ALLOWED_SOURCES:-tradingagents}
+      AUTONOMY_DRAWDOWN_HALT_USDT: ${AUTONOMY_DRAWDOWN_HALT_USDT:-25}
+      AUTONOMY_CONSECUTIVE_LOSS_HALT_N: ${AUTONOMY_CONSECUTIVE_LOSS_HALT_N:-3}
+      AUTONOMY_MARK_FAILURE_HALT_N: ${AUTONOMY_MARK_FAILURE_HALT_N:-3}
+      AUTONOMY_DECISION_ERROR_RATE_HALT_PCT: ${AUTONOMY_DECISION_ERROR_RATE_HALT_PCT:-0.50}
+      AUTONOMY_DECISION_ERROR_RATE_MIN_N: ${AUTONOMY_DECISION_ERROR_RATE_MIN_N:-3}
+      AUTONOMY_DECISION_ERROR_LOOKBACK_MINUTES: ${AUTONOMY_DECISION_ERROR_LOOKBACK_MINUTES:-120}
+      FEEDBACK_EV_READY_N: ${FEEDBACK_EV_READY_N:-20}
+      FEEDBACK_CLOSED_OUTCOME_READY_N: ${FEEDBACK_CLOSED_OUTCOME_READY_N:-20}
+      FEEDBACK_CALIBRATION_READY_BUCKETS: ${FEEDBACK_CALIBRATION_READY_BUCKETS:-2}
+      FEEDBACK_MEMORY_AUTOMATIC_READY_N: ${FEEDBACK_MEMORY_AUTOMATIC_READY_N:-5}
+      NOTIFICATION_HOST_ALLOWLIST: ${NOTIFICATION_HOST_ALLOWLIST:-hermes-agent,hermes,localhost,127.0.0.1,172.17.0.1,172.23.0.1}
+      IBKR_MODE: ${IBKR_MODE:-stub}
+      IBKR_BRIDGE_URL: ${IBKR_BRIDGE_URL:-http://ibkr-bridge:8086}
+      EXCHANGE_BRIDGE_URL: ${EXCHANGE_BRIDGE_URL:-http://exchange-bridge:8087}
+      BACKTEST_SERVICE_URL: ${BACKTEST_SERVICE_URL:-http://backtest-service:8088}
+      IBKR_LIVE_TRADING_ENABLED: "false"
+      RECONCILE_AVG_COST_TOLERANCE: "0.01"
+      RECONCILE_APPLY_ENABLED: ${RECONCILE_APPLY_ENABLED:-false}
+      OPS_TOKEN: ${OPS_TOKEN:-}
+      RECONCILE_MAX_AGE_SECONDS: ${RECONCILE_MAX_AGE_SECONDS:-300}
+    ports:
+      - "127.0.0.1:${ORCHESTRATOR_HOST_PORT:-18081}:8080"
+    volumes:
+      - aegis_data:/data
+    depends_on:
+      risk-engine:
+        condition: service_healthy
+      execution-service:
+        condition: service_healthy
+      market-data:
+        condition: service_healthy
+    networks: [aegis_internal_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  risk-engine:
+    build:
+      context: ..
+      dockerfile: services/risk-engine/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      MARKET_DATA_URL: http://market-data:8083
+      MAX_NOTIONAL_USDT: "10000"
+      CONFIRMATION_THRESHOLD_USDT: "500"
+      PER_SYMBOL_DAILY_LIMIT_USDT: "50000"
+      LIVE_TRADING_ENABLED: "false"
+      IBKR_LIVE_TRADING_ENABLED: "false"
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      DAILY_DRAWDOWN_HARD_STOP_USDT: "1000"
+    depends_on:
+      market-data:
+        condition: service_healthy
+    volumes:
+      - aegis_data:/data
+    networks: [aegis_internal_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  execution-service:
+    build:
+      context: ..
+      dockerfile: services/execution-service/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      MARKET_DATA_URL: http://market-data:8083
+      LIVE_TRADING_ENABLED: "false"
+      IBKR_LIVE_TRADING_ENABLED: "false"
+      EXCHANGE_API_KEY: ""
+      EXCHANGE_API_SECRET: ""
+      IBKR_MODE: ${IBKR_MODE:-stub}
+      IBKR_BRIDGE_URL: ${IBKR_BRIDGE_URL:-http://ibkr-bridge:8086}
+      IBKR_POLL_TIMEOUT_SEC: ${IBKR_POLL_TIMEOUT_SEC:-60}
+      IBKR_POLL_INTERVAL_SEC: ${IBKR_POLL_INTERVAL_SEC:-1}
+    volumes:
+      - aegis_data:/data
+    depends_on:
+      market-data:
+        condition: service_healthy
+      ibkr-bridge:
+        condition: service_healthy
+    networks: [aegis_internal_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  market-data:
+    build:
+      context: ..
+      dockerfile: services/market-data/Dockerfile
+    restart: unless-stopped
+    environment:
+      FIXTURES_ONLY: "false"
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      STOCK_QUOTE_CACHE_TTL_SEC: ${STOCK_QUOTE_CACHE_TTL_SEC:-60}
+      STOCK_QUOTE_PROVIDER_CHAIN: ${STOCK_QUOTE_PROVIDER_CHAIN:-ibkr,polygon,yahoo,fixture}
+      IBKR_BRIDGE_URL: ${IBKR_BRIDGE_URL:-http://ibkr-bridge:8086}
+    networks: [aegis_internal_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  analysis-adapter:
+    build:
+      context: ..
+      dockerfile: services/analysis-adapter/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      TA_BRIDGE_URL: ${TA_BRIDGE_URL:-http://tradingagents-bridge:18181}
+      TA_DEFAULT_PROVIDER: ${TA_DEFAULT_PROVIDER:-deepseek}
+      LLM_PROVIDER_CHAIN: ${LLM_PROVIDER_CHAIN:-deepseek,anthropic,openai}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-3-5-sonnet-latest}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      DEEPSEEK_COST_PER_1K_USD: ${DEEPSEEK_COST_PER_1K_USD:-0}
+      ANTHROPIC_COST_PER_1K_USD: ${ANTHROPIC_COST_PER_1K_USD:-0}
+      OPENAI_COST_PER_1K_USD: ${OPENAI_COST_PER_1K_USD:-0}
+      TA_TIMEOUT_SEC: ${TA_TIMEOUT_SEC:-900}
+      ANALYSIS_SCORECARD_TTL_MIN: ${ANALYSIS_SCORECARD_TTL_MIN:-60}
+    ports:
+      - "127.0.0.1:${ANALYSIS_ADAPTER_HOST_PORT:-18085}:8085"
+    volumes:
+      - aegis_data:/data
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    networks: [aegis_internal_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  ibkr-bridge:
+    build:
+      context: ..
+      dockerfile: services/ibkr-bridge/Dockerfile
+    restart: unless-stopped
+    environment:
+      IBKR_GATEWAY_HOST: ${IBKR_GATEWAY_HOST:-ibkr-host}
+      IBKR_GATEWAY_PORT: ${IBKR_GATEWAY_PORT:-4002}
+      IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
+      IBKR_CONNECT_TIMEOUT_SEC: ${IBKR_CONNECT_TIMEOUT_SEC:-10}
+      IBKR_ALLOW_LIVE_PORT: ${IBKR_ALLOW_LIVE_PORT:-false}
+      IBKR_ACCOUNT_CODE: ${IBKR_ACCOUNT_CODE:-}
+    extra_hosts:
+      - "ibkr-host:host-gateway"
+    ports:
+      - "127.0.0.1:${IBKR_BRIDGE_HOST_PORT:-18086}:8086"
+    networks: [aegis_internal_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  exchange-bridge:
+    build:
+      context: ..
+      dockerfile: services/exchange-bridge/Dockerfile
+    restart: unless-stopped
+    environment:
+      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:-}
+      EXCHANGE_API_SECRET: ${EXCHANGE_API_SECRET:-}
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_API_SECRET: ${OKX_API_SECRET:-}
+      OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE:-}
+      BYBIT_API_KEY: ${BYBIT_API_KEY:-}
+      BYBIT_API_SECRET: ${BYBIT_API_SECRET:-}
+      EXCHANGE_TIMEOUT_SEC: ${EXCHANGE_TIMEOUT_SEC:-10}
+    ports:
+      - "127.0.0.1:${EXCHANGE_BRIDGE_HOST_PORT:-18087}:8087"
+    networks: [aegis_internal_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8087/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backtest-service:
+    build:
+      context: ..
+      dockerfile: services/backtest-service/Dockerfile
+    restart: unless-stopped
+    environment:
+      BACKTEST_MAX_BARS: ${BACKTEST_MAX_BARS:-5000}
+      STRATEGY_PLUGINS_DIR: /plugins
+    volumes:
+      - ${STRATEGY_PLUGINS_DIR_HOST:-/dev/null}:/plugins:ro
+    ports:
+      - "127.0.0.1:${BACKTEST_SERVICE_HOST_PORT:-18088}:8088"
+    networks: [aegis_internal_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  screener-service:
+    build:
+      context: ..
+      dockerfile: services/screener-service/Dockerfile
+    restart: unless-stopped
+    environment:
+      SCREENER_CACHE_TTL_SEC: ${SCREENER_CACHE_TTL_SEC:-21600}
+      SCREENER_MAX_SYMBOLS: ${SCREENER_MAX_SYMBOLS:-50}
+      SCREENER_RETRY_COUNT: ${SCREENER_RETRY_COUNT:-2}
+      SCREENER_REQUEST_TIMEOUT_SEC: ${SCREENER_REQUEST_TIMEOUT_SEC:-8}
+    ports:
+      - "127.0.0.1:${SCREENER_SERVICE_HOST_PORT:-18089}:8089"
+    networks: [aegis_internal_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  aegis_data:
+    name: aegis_trading_data
+
+networks:
+  aegis_internal_net:
+    internal: true
+  host_access_net: {}

@@ -1,0 +1,88 @@
+{
+  "olympus_id": 36,
+  "artifact_type": "public_safe_research_metadata",
+  "verdict": "PIT_FUNDAMENTAL_STORE_BUILT_PRICE_SURVIVORSHIP_GAP",
+  "paper_only": true,
+  "live_trading_allowed": false,
+  "auto_promotion_allowed": false,
+  "strategy_registration_allowed": false,
+  "bulk_edgar_data_committed": false,
+  "cache_policy": {
+    "default_cache_dir": "data/edgar-pit",
+    "env_override": "AEGIS_EDGAR_CACHE_DIR",
+    "gitignore_status": "data/ is gitignored; EDGAR JSON cache must remain out of git"
+  },
+  "sec_access_policy": {
+    "base_url": "https://data.sec.gov",
+    "user_agent_env": "AEGIS_SEC_USER_AGENT",
+    "default_user_agent": "AegisOlympusResearch/0.1 (CONTACT_NOT_SET)",
+    "user_agent_policy": "Outbound SEC requests require AEGIS_SEC_USER_AGENT to include a real project contact; cache hits remain offline.",
+    "max_requests_per_second": 10,
+    "retry_attempts": 3
+  },
+  "pilot_universe_predeclared_before_ic": true,
+  "pilot_universe": [
+    {"ticker": "AAPL", "cik": "0000320193", "name": "Apple Inc.", "status": "active", "sector": "technology", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "MSFT", "cik": "0000789019", "name": "Microsoft Corporation", "status": "active", "sector": "technology", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "GOOGL", "cik": "0001652044", "name": "Alphabet Inc.", "status": "active", "sector": "communication_services", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "AMZN", "cik": "0001018724", "name": "Amazon.com Inc.", "status": "active", "sector": "consumer_discretionary", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "META", "cik": "0001326801", "name": "Meta Platforms Inc.", "status": "active", "sector": "communication_services", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "NVDA", "cik": "0001045810", "name": "NVIDIA Corporation", "status": "active", "sector": "technology", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "JPM", "cik": "0000019617", "name": "JPMorgan Chase & Co.", "status": "active", "sector": "financials", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "BAC", "cik": "0000070858", "name": "Bank of America Corporation", "status": "active", "sector": "financials", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "XOM", "cik": "0000034088", "name": "Exxon Mobil Corporation", "status": "active", "sector": "energy", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "CVX", "cik": "0000093410", "name": "Chevron Corporation", "status": "active", "sector": "energy", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "JNJ", "cik": "0000200406", "name": "Johnson & Johnson", "status": "active", "sector": "health_care", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "PFE", "cik": "0000078003", "name": "Pfizer Inc.", "status": "active", "sector": "health_care", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "WMT", "cik": "0000104169", "name": "Walmart Inc.", "status": "active", "sector": "consumer_staples", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "PG", "cik": "0000080424", "name": "Procter & Gamble Co.", "status": "active", "sector": "consumer_staples", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "HD", "cik": "0000354950", "name": "Home Depot Inc.", "status": "active", "sector": "consumer_discretionary", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "MCD", "cik": "0000063908", "name": "McDonald's Corporation", "status": "active", "sector": "consumer_discretionary", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "BA", "cik": "0000012927", "name": "Boeing Company", "status": "active", "sector": "industrials", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "CAT", "cik": "0000018230", "name": "Caterpillar Inc.", "status": "active", "sector": "industrials", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "NEE", "cik": "0000753308", "name": "NextEra Energy Inc.", "status": "active", "sector": "utilities", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "DUK", "cik": "0001326160", "name": "Duke Energy Corporation", "status": "active", "sector": "utilities", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "T", "cik": "0000732717", "name": "AT&T Inc.", "status": "active", "sector": "communication_services", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "DIS", "cik": "0001744489", "name": "The Walt Disney Company", "status": "active", "sector": "communication_services", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "F", "cik": "0000037996", "name": "Ford Motor Company", "status": "active", "sector": "consumer_discretionary", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "GM", "cik": "0001467858", "name": "General Motors Company", "status": "active", "sector": "consumer_discretionary", "price_coverage_expected": "survivor_price_available"},
+    {"ticker": "GE", "cik": "0000040545", "name": "General Electric Company", "status": "active_restructured", "sector": "industrials", "price_coverage_expected": "corporate_action_sensitive"},
+    {"ticker": "DOW", "cik": "0001751788", "name": "Dow Inc.", "status": "active_post_spinoff", "sector": "materials", "price_coverage_expected": "corporate_action_sensitive"},
+    {"ticker": "DD", "cik": "0001666700", "name": "DuPont de Nemours Inc.", "status": "active_post_merger", "sector": "materials", "price_coverage_expected": "corporate_action_sensitive"},
+    {"ticker": "TWTR", "cik": "0001418091", "name": "Twitter Inc.", "status": "acquired_delisted_2022", "sector": "communication_services", "price_coverage_expected": "delisted_price_gap_likely"},
+    {"ticker": "S", "cik": "0000101830", "name": "Sprint Corporation", "status": "acquired_delisted_2020", "sector": "communication_services", "price_coverage_expected": "delisted_price_gap_likely"},
+    {"ticker": "YHOO", "cik": "0001011006", "name": "Yahoo! Inc.", "status": "acquired_delisted_2017", "sector": "communication_services", "price_coverage_expected": "delisted_price_gap_likely"},
+    {"ticker": "LEHMQ", "cik": "0000806085", "name": "Lehman Brothers Holdings Inc.", "status": "bankrupt_delisted", "sector": "financials", "price_coverage_expected": "delisted_price_gap_likely"},
+    {"ticker": "BSC", "cik": "0000773001", "name": "The Bear Stearns Companies Inc.", "status": "acquired_delisted_2008", "sector": "financials", "price_coverage_expected": "delisted_price_gap_likely"}
+  ],
+  "locked_factor_set": [
+    "earnings_yield_ep",
+    "book_to_price_bp",
+    "sales_to_price_sp",
+    "ev_to_ebitda_inverse",
+    "free_cash_flow_to_price",
+    "roe",
+    "gross_profitability",
+    "accruals"
+  ],
+  "pit_policy": {
+    "availability_key": "SEC fact filed date plus next-business-day lag",
+    "period_end_usage": "metadata_only_not_availability",
+    "restatement_policy": "first filed value remains PIT primary; later same-period filings are stored separately as restatements"
+  },
+  "survivorship_assessment": {
+    "edgar_fundamentals": "EDGAR can include historical filings for acquired, bankrupt, and delisted registrants.",
+    "price_side": "Current stooq/yfinance-style symbol coverage is not proven delisting-aware.",
+    "chain_verdict": "not_survivorship_safe_until_delisted_prices_and_universe_membership_are_acquired",
+    "cik_continuity_assessment": {
+      "GM": "Current pilot CIK 0001467858 is the post-2009-restructuring General Motors Company registrant; pre-reorganization history is not continuous under this CIK.",
+      "DD": "Current pilot CIK 0001666700 is the post-Dow/DuPont merger DuPont de Nemours registrant; pre-2017 DuPont history is not continuous under this CIK.",
+      "DOW": "Current pilot CIK 0001751788 is the post-2019 Dow Inc. spinoff registrant; pre-spinoff Dow history is not continuous under this CIK.",
+      "coverage_policy": "Ingest coverage must surface these as CIK continuity gaps instead of treating the pilot panel as complete."
+    }
+  },
+  "ic_status": {
+    "rank_ic_run": false,
+    "reason": "PIT fundamentals store is present, but delisting-aware price coverage and historical universe membership are not proven for pilot delisted names."
+  }
+}

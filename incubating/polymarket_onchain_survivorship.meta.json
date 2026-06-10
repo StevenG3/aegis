@@ -1,0 +1,21 @@
+{
+  "id": "olympus42b_polymarket_onchain_survivorship",
+  "status": "STOP_SURVIVORSHIP_SAMPLE_NOT_FOUND",
+  "asset_class": "prediction_market",
+  "research_only": true,
+  "live_trading": false,
+  "wallet_or_order_access": false,
+  "thesis": "Strictly screened short-duration Polymarket 95-98.5c positions may earn carry only if tail losses remain bounded after costs.",
+  "null_hypothesis": "Net carry is not robust, is consumed by low-frequency tail losses or resolution disputes, or available data cannot characterize the tail.",
+  "risk_classification": "tail_risk_selling_not_arbitrage",
+  "zero_risk_claim": "explicitly_rejected",
+  "public_summary": "Read-only Gamma and Data API access can reconstruct recent trade sequences, but the survivor-bias gate was not satisfied in the private probe because no 0.95-0.99 priced losing settlement sample was found in the checked recent losing-outcome sample. No carry backtest was run.",
+  "private_evidence_path": "~/apps/aegis-strategies/incubating/olympus42/onchain_cache/",
+  "public_data_policy": "No raw market cache, transaction list, edge estimate, PnL, or private result is stored in this public repository.",
+  "verdict_policy": [
+    "Do not run a Polymarket carry backtest unless the candidate set includes losing settlements that previously traded in the 0.95-0.99 range.",
+    "Decision prices must be reconstructed from trades at or before the decision timestamp.",
+    "Settlement outcomes may be used for PnL only, never for sample selection.",
+    "Funding is N/A for unlevered cash prediction-market positions; gas, slippage, binary hold-to-resolution risk, and tail clustering must be disclosed."
+  ]
+}
