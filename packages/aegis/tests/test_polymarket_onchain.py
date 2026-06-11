@@ -9,11 +9,14 @@ from aegis.polymarket_onchain import (
     PolymarketClosedMarket,
     PolymarketDataApiClient,
     PolymarketTrade,
+    SurvivorPowerThreshold,
+    analyze_survivor_power_coverage,
     find_losing_high_price_samples,
     last_trade_at_or_before,
     losing_outcome_indices,
     parse_closed_market,
     parse_trade,
+    survivor_power_coverage_to_dict,
 )
 
 
@@ -137,3 +140,84 @@ def test_find_losing_high_price_samples_requires_settled_loser() -> None:
     assert len(samples) == 1
     assert samples[0].losing_outcome == "Yes"
     assert samples[0].decision_price == Decimal("0.97")
+
+
+def test_survivor_power_coverage_counts_winners_losers_and_verdicts() -> None:
+    raw_markets = [
+        {
+            "conditionId": "0xloser",
+            "slug": "losing-high-price",
+            "question": "Losing high price?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0", "1"]',
+        },
+        {
+            "conditionId": "0xwinner",
+            "slug": "winning-high-price",
+            "question": "Winning high price?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["1", "0"]',
+        },
+    ]
+    trades = {
+        "0xloser": [
+            PolymarketTrade("0xloser", 0, Decimal("0.96"), Decimal("2"), 100, "BUY"),
+            PolymarketTrade("0xloser", 0, Decimal("0.10"), Decimal("2"), 110, "SELL"),
+        ],
+        "0xwinner": [
+            PolymarketTrade("0xwinner", 0, Decimal("0.98"), Decimal("2"), 100, "BUY"),
+        ],
+    }
+
+    coverage = analyze_survivor_power_coverage(
+        raw_markets,
+        trades,
+        threshold=SurvivorPowerThreshold(min_closed_markets=2, min_markets_with_trades=2),
+    )
+    payload = survivor_power_coverage_to_dict(coverage)
+
+    assert coverage.threshold_met is True
+    assert payload["verdict"] == "SURVIVOR_GATE_SATISFIED"
+    assert payload["closed_markets_scanned"] == 2
+    assert payload["markets_with_trades"] == 2
+    assert payload["high_price_markets"] == 2
+    assert payload["high_price_losing_outcomes"] == 1
+    assert payload["high_price_winning_outcomes"] == 1
+    assert payload["losing_samples"][0]["condition_id"] == "0xloser"
+
+
+def test_survivor_power_coverage_can_make_tail_rare_verdict_after_threshold() -> None:
+    raw_markets = [
+        {
+            "conditionId": "0xwinner",
+            "slug": "winning-high-price",
+            "question": "Winning high price?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["1", "0"]',
+        },
+    ]
+    trades = {
+        "0xwinner": [
+            PolymarketTrade("0xwinner", 0, Decimal("0.98"), Decimal("2"), 100, "BUY"),
+        ],
+    }
+
+    coverage = analyze_survivor_power_coverage(
+        raw_markets,
+        trades,
+        threshold=SurvivorPowerThreshold(min_closed_markets=1, min_markets_with_trades=1),
+    )
+
+    assert coverage.verdict == "TAIL_SAMPLE_RARE_OR_UNREACHABLE"
+    assert coverage.high_price_losing_outcomes == 0
+
+
+def test_survivor_power_coverage_stops_when_threshold_not_met() -> None:
+    coverage = analyze_survivor_power_coverage(
+        [],
+        {},
+        threshold=SurvivorPowerThreshold(min_closed_markets=1, min_markets_with_trades=1),
+    )
+
+    assert coverage.verdict == "STOP_INSUFFICIENT_COVERAGE"
+    assert survivor_power_coverage_to_dict(coverage)["threshold"]["met"] is False

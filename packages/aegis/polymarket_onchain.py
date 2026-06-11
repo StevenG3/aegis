@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -47,6 +48,42 @@ class LosingHighPriceSample:
     transaction_hash: str | None
 
 
+@dataclass(frozen=True)
+class SurvivorPowerThreshold:
+    min_closed_markets: int
+    min_markets_with_trades: int
+    target_closed_window_days: int | None = None
+
+
+@dataclass(frozen=True)
+class SurvivorPowerCoverage:
+    closed_markets_scanned: int
+    closed_markets_parsed: int
+    markets_with_trades: int
+    high_price_markets: int
+    high_price_outcomes: int
+    high_price_winning_outcomes: int
+    high_price_losing_outcomes: int
+    high_price_unresolved_outcomes: int
+    losing_samples: tuple[LosingHighPriceSample, ...]
+    threshold: SurvivorPowerThreshold
+
+    @property
+    def threshold_met(self) -> bool:
+        return (
+            self.closed_markets_parsed >= self.threshold.min_closed_markets
+            and self.markets_with_trades >= self.threshold.min_markets_with_trades
+        )
+
+    @property
+    def verdict(self) -> str:
+        if self.losing_samples:
+            return "SURVIVOR_GATE_SATISFIED"
+        if self.threshold_met:
+            return "TAIL_SAMPLE_RARE_OR_UNREACHABLE"
+        return "STOP_INSUFFICIENT_COVERAGE"
+
+
 class PolymarketDataApiClient:
     def __init__(
         self,
@@ -81,6 +118,38 @@ class PolymarketDataApiClient:
             raise ValueError("unexpected Gamma closed markets response")
         return [row for row in data if isinstance(row, dict)]
 
+    def iter_closed_markets(
+        self,
+        *,
+        limit: int = 500,
+        max_markets: int = 5_000,
+        sleep_seconds: float = 0.0,
+        order: str = "closedTime",
+        ascending: bool = False,
+    ) -> Iterable[dict[str, Any]]:
+        offset = 0
+        yielded = 0
+        while yielded < max_markets:
+            page_limit = min(limit, max_markets - yielded)
+            page = self.get_closed_markets(
+                limit=page_limit,
+                offset=offset,
+                order=order,
+                ascending=ascending,
+            )
+            if not page:
+                break
+            for row in page:
+                yield row
+                yielded += 1
+                if yielded >= max_markets:
+                    break
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+
     def get_trades(
         self,
         condition_id: str,
@@ -99,6 +168,38 @@ class PolymarketDataApiClient:
         if not isinstance(data, list):
             raise ValueError("unexpected Data API trades response")
         return [row for row in data if isinstance(row, dict)]
+
+    def iter_trades(
+        self,
+        condition_id: str,
+        *,
+        limit: int = 500,
+        max_trades: int = 10_000,
+        sleep_seconds: float = 0.0,
+        taker_only: bool = False,
+    ) -> Iterable[dict[str, Any]]:
+        offset = 0
+        yielded = 0
+        while yielded < max_trades:
+            page_limit = min(limit, max_trades - yielded)
+            page = self.get_trades(
+                condition_id,
+                limit=page_limit,
+                offset=offset,
+                taker_only=taker_only,
+            )
+            if not page:
+                break
+            for row in page:
+                yield row
+                yielded += 1
+                if yielded >= max_trades:
+                    break
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
 
     def _get_json(self, url: str) -> Any:
         request = Request(url, headers={"User-Agent": self.user_agent})
@@ -201,6 +302,102 @@ def find_losing_high_price_samples(
                         )
                     )
     return samples
+
+
+def analyze_survivor_power_coverage(
+    raw_markets: Iterable[Mapping[str, Any]],
+    trades_by_condition: Mapping[str, Iterable[PolymarketTrade]],
+    *,
+    threshold: SurvivorPowerThreshold,
+    lower: Decimal = Decimal("0.95"),
+    upper: Decimal = Decimal("0.99"),
+    losing_price_threshold: Decimal = Decimal("0.001"),
+    winning_price_threshold: Decimal = Decimal("0.999"),
+) -> SurvivorPowerCoverage:
+    scanned = 0
+    parsed_markets: list[PolymarketClosedMarket] = []
+    markets_with_trades = 0
+    high_price_market_ids: set[str] = set()
+    high_price_outcomes: set[tuple[str, int]] = set()
+    winning_outcomes: set[tuple[str, int]] = set()
+    losing_outcomes: set[tuple[str, int]] = set()
+    unresolved_outcomes: set[tuple[str, int]] = set()
+    for raw_market in raw_markets:
+        scanned += 1
+        market = parse_closed_market(raw_market)
+        if market is None:
+            continue
+        parsed_markets.append(market)
+        trades = list(trades_by_condition.get(market.condition_id, ()))
+        if trades:
+            markets_with_trades += 1
+        for trade in trades:
+            if trade.outcome_index < 0 or trade.outcome_index >= len(market.outcome_prices):
+                continue
+            if lower <= trade.price <= upper:
+                key = (market.condition_id, trade.outcome_index)
+                high_price_market_ids.add(market.condition_id)
+                high_price_outcomes.add(key)
+                final_price = market.outcome_prices[trade.outcome_index]
+                if final_price <= losing_price_threshold:
+                    losing_outcomes.add(key)
+                elif final_price >= winning_price_threshold:
+                    winning_outcomes.add(key)
+                else:
+                    unresolved_outcomes.add(key)
+    losing_samples = find_losing_high_price_samples(
+        parsed_markets,
+        trades_by_condition,
+        lower=lower,
+        upper=upper,
+    )
+    return SurvivorPowerCoverage(
+        closed_markets_scanned=scanned,
+        closed_markets_parsed=len(parsed_markets),
+        markets_with_trades=markets_with_trades,
+        high_price_markets=len(high_price_market_ids),
+        high_price_outcomes=len(high_price_outcomes),
+        high_price_winning_outcomes=len(winning_outcomes),
+        high_price_losing_outcomes=len(losing_outcomes),
+        high_price_unresolved_outcomes=len(unresolved_outcomes),
+        losing_samples=tuple(losing_samples),
+        threshold=threshold,
+    )
+
+
+def survivor_power_coverage_to_dict(coverage: SurvivorPowerCoverage) -> dict[str, Any]:
+    return {
+        "closed_markets_scanned": coverage.closed_markets_scanned,
+        "closed_markets_parsed": coverage.closed_markets_parsed,
+        "markets_with_trades": coverage.markets_with_trades,
+        "high_price_markets": coverage.high_price_markets,
+        "high_price_outcomes": coverage.high_price_outcomes,
+        "high_price_winning_outcomes": coverage.high_price_winning_outcomes,
+        "high_price_losing_outcomes": coverage.high_price_losing_outcomes,
+        "high_price_unresolved_outcomes": coverage.high_price_unresolved_outcomes,
+        "losing_samples": [
+            {
+                "condition_id": sample.condition_id,
+                "slug": sample.slug,
+                "title": sample.title,
+                "losing_outcome": sample.losing_outcome,
+                "losing_outcome_index": sample.losing_outcome_index,
+                "decision_timestamp": sample.decision_timestamp,
+                "decision_price": str(sample.decision_price),
+                "transaction_hash": sample.transaction_hash,
+            }
+            for sample in coverage.losing_samples
+        ],
+        "threshold": {
+            "min_closed_markets": coverage.threshold.min_closed_markets,
+            "min_markets_with_trades": coverage.threshold.min_markets_with_trades,
+            "target_closed_window_days": coverage.threshold.target_closed_window_days,
+            "met": coverage.threshold_met,
+        },
+        "verdict": coverage.verdict,
+        "zero_risk_claim": "explicitly_rejected",
+        "risk_classification": "tail_risk_selling_not_arbitrage",
+    }
 
 
 def _json_list(value: Any) -> list[Any]:
