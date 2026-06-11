@@ -20,6 +20,15 @@ router.add_api_route(
     "/paper/autonomy/alerts", core.post_paper_autonomy_alerts, methods=["POST"], response_model=None
 )
 router.add_api_route(
+    "/paper/autonomy/digest", core.post_paper_autonomy_digest, methods=["POST"], response_model=None
+)
+router.add_api_route(
+    "/paper/autonomy/readiness",
+    core.get_paper_autonomy_readiness,
+    methods=["GET"],
+    response_model=None,
+)
+router.add_api_route(
     "/paper/bootstrap/status", core.get_paper_bootstrap_status, methods=["GET"], response_model=None
 )
 router.add_api_route(

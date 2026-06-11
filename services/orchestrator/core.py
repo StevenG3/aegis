@@ -69,7 +69,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
 logger = logging.getLogger(__name__)
 PER_SYMBOL_DAILY_LIMIT_USDT = Decimal(os.getenv("PER_SYMBOL_DAILY_LIMIT_USDT", "50000"))
 DECIMAL_8 = Decimal("0.00000001")
-SUPPORTED_NOTIFICATION_EVENTS = frozenset({"fill", "alert"})
+SUPPORTED_NOTIFICATION_EVENTS = frozenset({"fill", "alert", "digest"})
 CALIBRATION_BUCKETS = [
     (Decimal("0.30"), Decimal("0.40")),
     (Decimal("0.40"), Decimal("0.50")),
@@ -138,6 +138,11 @@ NOTIFICATION_HOST_ALLOWLIST = frozenset(
 )
 NOTIFICATION_TIMEOUT_SEC = float(os.getenv("NOTIFICATION_TIMEOUT_SEC", "5"))
 NOTIFICATION_HISTORY_LIMIT = int(os.getenv("NOTIFICATION_HISTORY_LIMIT", "100"))
+AEGIS_NOTIFICATION_WEBHOOK_URL = os.getenv("AEGIS_NOTIFICATION_WEBHOOK_URL", "").strip()
+AEGIS_NOTIFICATION_WEBHOOK_SECRET = os.getenv("AEGIS_NOTIFICATION_WEBHOOK_SECRET", "")
+AEGIS_NOTIFICATION_WEBHOOK_EVENTS = os.getenv(
+    "AEGIS_NOTIFICATION_WEBHOOK_EVENTS", "fill,alert,digest"
+)
 EV_GATE_MODE = os.getenv("EV_GATE_MODE", "shadow").strip().lower()
 MIN_EV = Decimal(os.getenv("MIN_EV", "0"))
 EV_SHADOW_MIN_SAMPLES = int(os.getenv("EV_SHADOW_MIN_SAMPLES", "20"))
@@ -173,6 +178,7 @@ FEEDBACK_CLOSED_OUTCOME_READY_N = int(os.getenv("FEEDBACK_CLOSED_OUTCOME_READY_N
 FEEDBACK_CALIBRATION_READY_BUCKETS = int(os.getenv("FEEDBACK_CALIBRATION_READY_BUCKETS", "2"))
 FEEDBACK_MEMORY_AUTOMATIC_READY_N = int(os.getenv("FEEDBACK_MEMORY_AUTOMATIC_READY_N", "5"))
 _scheduler_task: asyncio.Task[None] | None = None
+_scheduler_last_tick_at: str | None = None
 
 _HERMES_SYSTEM_PROMPT = """\
 You are an order intent parser for a cryptocurrency spot trading platform (Binance Spot only).
@@ -892,7 +898,7 @@ def evaluate_paper_bootstrap_guardrails(
         evaluated_at=current,
     )
     triggers: list[str] = []
-    if max_drawdown > AUTONOMY_DRAWDOWN_HALT_USDT:
+    if max_drawdown >= AUTONOMY_DRAWDOWN_HALT_USDT:
         triggers.append("drawdown")
     if consecutive_losses >= AUTONOMY_CONSECUTIVE_LOSS_HALT_N:
         triggers.append("consecutive_losses")
@@ -1435,7 +1441,9 @@ def _fire_scheduled_analysis(
 
 
 def scheduler_tick(now: datetime | None = None) -> dict[str, int]:
+    global _scheduler_last_tick_at
     now = now or _now()
+    _scheduler_last_tick_at = now.isoformat()
     evaluate_all_paper_bootstrap_guardrails(now=now)
     now_iso = now.isoformat()
     with connect() as conn:
@@ -1779,9 +1787,32 @@ def _record_notification_delivery(
         conn.commit()
 
 
+def _record_notification_skip(actor: str, event_type: str, error_class: str) -> None:
+    _record_notification_delivery(
+        actor,
+        event_type,
+        "unconfigured://notification-webhook",
+        None,
+        False,
+        error_class,
+    )
+
+
+def _env_notification_events() -> set[str]:
+    return {
+        item.strip()
+        for item in AEGIS_NOTIFICATION_WEBHOOK_EVENTS.split(",")
+        if item.strip() in SUPPORTED_NOTIFICATION_EVENTS
+    }
+
+
+def _env_notification_configured_for(event_type: str) -> bool:
+    return bool(AEGIS_NOTIFICATION_WEBHOOK_URL) and event_type in _env_notification_events()
+
+
 def _deliver_webhook(
     actor: str, webhook_url: str, secret: str, event_type: str, payload: dict[str, object]
-) -> None:
+) -> bool:
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     signature = hmac_lib.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
     try:
@@ -1798,35 +1829,22 @@ def _deliver_webhook(
             timeout=NOTIFICATION_TIMEOUT_SEC,
         )
         status_code = int(getattr(response, "status_code", 0) or 0)
+        ok = 200 <= status_code < 300
         _record_notification_delivery(
-            actor, event_type, webhook_url, status_code, 200 <= status_code < 300, None
+            actor, event_type, webhook_url, status_code, ok, None
         )
+        return ok
     except Exception as exc:  # noqa: BLE001
         _record_notification_delivery(
             actor, event_type, webhook_url, None, False, exc.__class__.__name__
         )
+        return False
 
 
 def _notify_fill(intent: OrderIntent, execution: ExecutionResult) -> None:
     if execution.avg_price is None or execution.filled_qty == Decimal("0"):
         return
-    with connect() as conn:
-        row = conn.execute(
-            "select webhook_url, secret, events_json from notification_subscriptions "
-            "where actor = ? and enabled = 1",
-            (intent.actor,),
-        ).fetchone()
-    if row is None:
-        return
-    try:
-        events = json.loads(str(row["events_json"]))
-    except json.JSONDecodeError:
-        return
-    if "fill" not in events:
-        return
     payload: dict[str, object] = {
-        "event_type": "fill",
-        "actor": intent.actor,
         "symbol": intent.symbol,
         "side": intent.side,
         "qty_str": _q8s(execution.filled_qty),
@@ -1835,7 +1853,7 @@ def _notify_fill(intent: OrderIntent, execution: ExecutionResult) -> None:
         "status": execution.status,
         "intent_id": str(intent.intent_id),
     }
-    _deliver_webhook(intent.actor, str(row["webhook_url"]), str(row["secret"]), "fill", payload)
+    _notify_actor_event(intent.actor, "fill", payload)
 
 
 def _notify_actor_event(actor: str, event_type: str, payload: dict[str, object]) -> bool:
@@ -1848,18 +1866,32 @@ def _notify_actor_event(actor: str, event_type: str, payload: dict[str, object])
             (actor,),
         ).fetchone()
     if row is None:
-        return False
+        if not _env_notification_configured_for(event_type):
+            _record_notification_skip(actor, event_type, "NO_NOTIFICATION_WEBHOOK_CONFIGURED")
+            return False
+        if not _is_allowed_webhook_host(AEGIS_NOTIFICATION_WEBHOOK_URL):
+            _record_notification_skip(actor, event_type, "WEBHOOK_HOST_NOT_ALLOWED")
+            return False
+        private_payload = {"event_type": event_type, "actor": actor, **payload}
+        return _deliver_webhook(
+            actor,
+            AEGIS_NOTIFICATION_WEBHOOK_URL,
+            AEGIS_NOTIFICATION_WEBHOOK_SECRET,
+            event_type,
+            private_payload,
+        )
     try:
         events = json.loads(str(row["events_json"]))
     except json.JSONDecodeError:
+        _record_notification_skip(actor, event_type, "INVALID_NOTIFICATION_EVENTS_JSON")
         return False
     if event_type not in events:
+        _record_notification_skip(actor, event_type, "EVENT_NOT_SUBSCRIBED")
         return False
     private_payload = {"event_type": event_type, "actor": actor, **payload}
-    _deliver_webhook(
+    return _deliver_webhook(
         actor, str(row["webhook_url"]), str(row["secret"]), event_type, private_payload
     )
-    return True
 
 
 def _after_fill_side_effects(execution: ExecutionResult, intent: OrderIntent) -> None:
@@ -2792,6 +2824,103 @@ def notify_paper_autonomy_alerts(actor: str) -> dict[str, object]:
                 sent += 1
     alert_count = len(alerts) if isinstance(alerts, list) else 0
     return {"actor": actor, "alert_count": alert_count, "sent": sent}
+
+
+def build_paper_autonomy_digest(actor: str) -> dict[str, object]:
+    overview = build_paper_autonomy_observability(actor)
+    bootstrap = overview["bootstrap"] if isinstance(overview["bootstrap"], dict) else {}
+    halt = bootstrap.get("halt") if isinstance(bootstrap.get("halt"), dict) else {}
+    return {
+        "type": "paper_autonomy_daily_digest",
+        "actor": actor,
+        "date": overview["date"],
+        "paper_only": True,
+        "position_count": (
+            len(overview["positions"]) if isinstance(overview["positions"], list) else 0
+        ),
+        "today_decision_count": overview["today_decision_count"],
+        "today_realized_pnl": overview["today_realized_pnl"],
+        "current_unrealized_pnl": overview["current_unrealized_pnl"],
+        "current_total_pnl": overview["current_total_pnl"],
+        "max_drawdown_today_usdt": overview["max_drawdown_today_usdt"],
+        "consecutive_closed_losses": overview["consecutive_closed_losses"],
+        "alerts": overview["alerts"],
+        "halt": halt,
+        "guardrail_thresholds": bootstrap.get("guardrail_thresholds"),
+        "feedback_loop_next_action": (
+            overview["feedback_loop_progress"].get("next_action")
+            if isinstance(overview["feedback_loop_progress"], dict)
+            else None
+        ),
+        "live_trading_enabled": False,
+    }
+
+
+def notify_paper_autonomy_digest(actor: str) -> dict[str, object]:
+    digest = build_paper_autonomy_digest(actor)
+    sent = _notify_actor_event(actor, "digest", {"digest": digest})
+    return {"actor": actor, "digest": digest, "sent": sent}
+
+
+def build_paper_autonomy_readiness(actor: str) -> dict[str, object]:
+    with connect() as conn:
+        subscription = conn.execute(
+            "select events_json, enabled from notification_subscriptions "
+            "where actor = ? and enabled = 1",
+            (actor,),
+        ).fetchone()
+        autonomy = conn.execute(
+            "select enabled from autonomy_settings where actor = ?",
+            (actor,),
+        ).fetchone()
+        latest_watchlist = conn.execute(
+            "select max(last_run_at) from watchlist_entries where actor = ? and source_origin = ?",
+            (actor, PAPER_FEEDBACK_BOOTSTRAP_ORIGIN),
+        ).fetchone()
+    db_events: set[str] = set()
+    if subscription is not None:
+        try:
+            raw_events = json.loads(str(subscription["events_json"]))
+        except json.JSONDecodeError:
+            raw_events = []
+        if isinstance(raw_events, list):
+            db_events = {str(item) for item in raw_events}
+    notify_configured = bool({"alert", "fill", "digest"} & db_events) or any(
+        _env_notification_configured_for(event) for event in ("alert", "fill", "digest")
+    )
+    bootstrap = _paper_bootstrap_runtime_status(actor)
+    scheduler_running = bool(
+        SCHEDULER_ENABLED and _scheduler_task is not None and not _scheduler_task.done()
+    )
+    paper_strategy_registered = bool(bootstrap["watchlist_enabled_count"]) and bool(
+        autonomy is not None and int(autonomy["enabled"]) == 1
+    )
+    last_run_at = latest_watchlist[0] if latest_watchlist is not None else None
+    return {
+        "actor": actor,
+        "paper_only": True,
+        "scheduler_enabled": SCHEDULER_ENABLED,
+        "scheduler_running": scheduler_running,
+        "notify_webhook_configured": notify_configured,
+        "paper_strategy_registered": paper_strategy_registered,
+        "last_tick_at": _scheduler_last_tick_at,
+        "last_paper_strategy_run_at": last_run_at,
+        "halt_state": bootstrap["halt"],
+        "bootstrap": {
+            "env_enabled": bootstrap["env_enabled"],
+            "env_actor_matches": bootstrap["env_actor_matches"],
+            "watchlist_enabled_count": bootstrap["watchlist_enabled_count"],
+            "origin": bootstrap["origin"],
+            "manual_resume_required": bootstrap["manual_resume_required"],
+            "guardrail_thresholds": bootstrap["guardrail_thresholds"],
+        },
+        "live_trading_enabled": False,
+        "ready": bool(
+            scheduler_running and notify_configured and paper_strategy_registered and not bool(
+                cast(dict[str, object], bootstrap["halt"])["halted"]
+            )
+        ),
+    }
 
 
 def _scorecard_metadata(scorecard_id: str) -> dict[str, str]:
@@ -4660,6 +4789,22 @@ def post_paper_autonomy_alerts(
         result["notified"] = True
         result["sent"] = delivered["sent"]
     return result
+
+
+def post_paper_autonomy_digest(
+    actor: str | None = None, notify: bool = Query(default=False)
+) -> JSONResponse | dict[str, object]:
+    if not actor:
+        return JSONResponse(status_code=400, content={"code": "ACTOR_REQUIRED"})
+    if notify:
+        return notify_paper_autonomy_digest(actor)
+    return {"actor": actor, "digest": build_paper_autonomy_digest(actor), "sent": False}
+
+
+def get_paper_autonomy_readiness(actor: str | None = None) -> JSONResponse | dict[str, object]:
+    if not actor:
+        return JSONResponse(status_code=400, content={"code": "ACTOR_REQUIRED"})
+    return build_paper_autonomy_readiness(actor)
 
 
 def get_paper_bootstrap_status(actor: str | None = None) -> JSONResponse | dict[str, object]:
