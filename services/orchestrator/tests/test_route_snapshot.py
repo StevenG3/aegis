@@ -24,6 +24,8 @@ EXPECTED_ROUTES = [
     (["GET"], "/live-autonomy/today", "get_live_autonomy_today", None),
     (["GET"], "/paper/autonomy/observability", "get_paper_autonomy_observability", None),
     (["POST"], "/paper/autonomy/alerts", "post_paper_autonomy_alerts", None),
+    (["POST"], "/paper/autonomy/digest", "post_paper_autonomy_digest", None),
+    (["GET"], "/paper/autonomy/readiness", "get_paper_autonomy_readiness", None),
     (["GET"], "/paper/bootstrap/status", "get_paper_bootstrap_status", None),
     (
         ["POST"],
@@ -71,7 +73,7 @@ def test_orchestrator_package_import_and_route_snapshot_are_stable() -> None:
     snapshot = snapshot_module.application_route_snapshot(app_module.app)
 
     assert app_module.app.title == "orchestrator"
-    assert len(snapshot) == 51
+    assert len(snapshot) == 53
     assert [
         (
             route["methods"],

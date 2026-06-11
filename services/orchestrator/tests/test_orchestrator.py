@@ -3170,6 +3170,64 @@ def test_paper_bootstrap_guardrail_halts_on_mark_failure_streak(
     assert second["triggers"] == ["mark_price_unavailable"]
 
 
+def test_paper_bootstrap_guardrail_halts_on_consecutive_losses_and_alerts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PAPER_FEEDBACK_BOOTSTRAP_ENABLED", "true")
+    monkeypatch.setenv("PAPER_FEEDBACK_ACTOR", "tg_1")
+    monkeypatch.setenv("PAPER_FEEDBACK_SYMBOLS", "BTCUSDT")
+    monkeypatch.setattr(orchestrator_app, "AUTONOMY_CONSECUTIVE_LOSS_HALT_N", 3)
+    alert_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_notify(actor: str, event_type: str, payload: dict[str, object]) -> bool:
+        alert_calls.append((actor, event_type, payload))
+        return True
+
+    monkeypatch.setattr(orchestrator_app, "_notify_actor_event", fake_notify)
+    now = datetime(2026, 5, 25, 0, 0, tzinfo=UTC)
+    orchestrator_app.bootstrap_paper_feedback_loop(now=now)
+    with orchestrator_app.connect() as conn:
+        for idx, pnl in enumerate(("-1", "-2", "-3")):
+            conn.execute(
+                """
+                insert into scorecard_outcomes
+                  (outcome_id, scorecard_id, actor, symbol, source, action,
+                   opened_intent_id, opened_at, opened_qty, opened_avg_cost,
+                   opened_cost_basis, status, closed_at, closed_realized_pnl,
+                   closed_return_pct, notes)
+                values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    f"loss-{idx}",
+                    f"score-{idx}",
+                    "tg_1",
+                    "BTCUSDT",
+                    "tradingagents",
+                    "buy",
+                    f"intent-{idx}",
+                    now.isoformat(),
+                    "1",
+                    "100",
+                    "100",
+                    "closed",
+                    (now + timedelta(minutes=idx)).isoformat(),
+                    pnl,
+                    "-0.01",
+                    "test loss",
+                ),
+            )
+        conn.commit()
+
+    result = orchestrator_app.evaluate_paper_bootstrap_guardrails(actor="tg_1", now=now)
+
+    assert result["halted"] is True
+    assert result["triggers"] == ["consecutive_losses"]
+    assert result["alert_sent"] == 1
+    assert alert_calls[0][0] == "tg_1"
+    assert alert_calls[0][1] == "alert"
+
+
 def test_paper_bootstrap_guardrail_halts_on_decision_error_rate(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -3180,7 +3238,12 @@ def test_paper_bootstrap_guardrail_halts_on_decision_error_rate(
     monkeypatch.setenv("PAPER_FEEDBACK_SYMBOLS", "BTCUSDT")
     monkeypatch.setattr(orchestrator_app, "AUTONOMY_DECISION_ERROR_RATE_MIN_N", 3)
     monkeypatch.setattr(orchestrator_app, "AUTONOMY_DECISION_ERROR_RATE_HALT_PCT", Decimal("0.50"))
-    monkeypatch.setattr(orchestrator_app, "_notify_actor_event", lambda *args, **kwargs: False)
+    alert_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_notify_actor_event",
+        lambda *args, **kwargs: bool(alert_calls.append(args)) or True,
+    )
     now = datetime(2026, 5, 25, 0, 0, tzinfo=UTC)
     orchestrator_app.bootstrap_paper_feedback_loop(now=now)
     adapter_conn = sqlite3.connect(tmp_path / "analysis_adapter.sqlite")
@@ -3197,6 +3260,8 @@ def test_paper_bootstrap_guardrail_halts_on_decision_error_rate(
 
     assert result["halted"] is True
     assert result["triggers"] == ["decision_error_rate"]
+    assert result["alert_sent"] == 1
+    assert alert_calls[0][1] == "alert"
     observed = result["observed"]["analysis_error_rate"]
     assert observed["total"] == 3
     assert observed["failed"] == 2
@@ -3224,6 +3289,35 @@ def test_paper_bootstrap_status_exposes_progress_and_human_gate(
     assert progress["next_action"] == "keep_accumulating_paper_feedback"
     assert progress["human_gate_required"] is True
     assert progress["auto_enforce"] is False
+
+
+def test_paper_autonomy_readiness_reports_operational_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PAPER_FEEDBACK_BOOTSTRAP_ENABLED", "true")
+    monkeypatch.setenv("PAPER_FEEDBACK_ACTOR", "tg_1")
+    monkeypatch.setenv("PAPER_FEEDBACK_SYMBOLS", "BTCUSDT")
+    monkeypatch.setattr(
+        orchestrator_app,
+        "AEGIS_NOTIFICATION_WEBHOOK_URL",
+        "http://hermes-agent:8644/aegis",
+    )
+    monkeypatch.setattr(orchestrator_app, "AEGIS_NOTIFICATION_WEBHOOK_EVENTS", "alert,digest")
+    now = datetime(2026, 5, 25, 0, 0, tzinfo=UTC)
+    orchestrator_app.bootstrap_paper_feedback_loop(now=now)
+    orchestrator_app.scheduler_tick(now=now)
+
+    readiness = TestClient(orchestrator_app.app).get(
+        "/paper/autonomy/readiness", params={"actor": "tg_1"}
+    ).json()
+
+    assert readiness["paper_only"] is True
+    assert readiness["notify_webhook_configured"] is True
+    assert readiness["paper_strategy_registered"] is True
+    assert readiness["last_tick_at"] == now.isoformat()
+    assert readiness["halt_state"]["halted"] is False
+    assert readiness["bootstrap"]["watchlist_enabled_count"] == 1
 
 
 def _seed_calibration_outcome(
@@ -4403,6 +4497,73 @@ def test_paper_autonomy_observability_and_alert_notification(monkeypatch, tmp_pa
     payload = json.loads(str(calls[0]["content"]))
     assert payload["event_type"] == "alert"
     assert payload["actor"] == "tg_1"
+
+
+def test_paper_autonomy_digest_uses_env_webhook_and_records_missing_trace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_mark_for_symbol",
+        lambda symbol: (Decimal("110"), "test"),
+    )
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            """
+            insert into paper_positions
+              (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+               paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue, last_updated)
+            values (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "tg_1",
+                "BTCUSDT",
+                "1",
+                "100",
+                "100",
+                "0",
+                "1",
+                "100",
+                "0",
+                "0",
+                "binance_spot",
+                "2026-05-25T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    client = TestClient(orchestrator_app.app)
+
+    missing = client.post("/paper/autonomy/digest", params={"actor": "tg_1", "notify": True})
+    assert missing.json()["sent"] is False
+    missing_trace = client.get("/notifications/deliveries", params={"actor": "tg_1"}).json()
+    assert missing_trace["deliveries"][0]["error_class"] == "NO_NOTIFICATION_WEBHOOK_CONFIGURED"
+
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        assert url == "http://hermes-agent:8644/aegis"
+        calls.append(kwargs)
+        return FakeResponse({"ok": True}, status_code=204)
+
+    monkeypatch.setattr(
+        orchestrator_app,
+        "AEGIS_NOTIFICATION_WEBHOOK_URL",
+        "http://hermes-agent:8644/aegis",
+    )
+    monkeypatch.setattr(orchestrator_app, "AEGIS_NOTIFICATION_WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(orchestrator_app, "AEGIS_NOTIFICATION_WEBHOOK_EVENTS", "digest")
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+
+    sent = client.post("/paper/autonomy/digest", params={"actor": "tg_1", "notify": True}).json()
+
+    assert sent["sent"] is True
+    assert sent["digest"]["paper_only"] is True
+    assert sent["digest"]["position_count"] == 1
+    assert calls
+    payload = json.loads(str(calls[0]["content"]))
+    assert payload["event_type"] == "digest"
+    assert payload["digest"]["current_unrealized_pnl"] == "10.00000000"
 
 
 def test_position_updates_keep_paper_and_live_buckets_separate(monkeypatch, tmp_path: Path) -> None:
