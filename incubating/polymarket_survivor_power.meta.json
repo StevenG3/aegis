@@ -1,0 +1,25 @@
+{
+  "id": "olympus42c_polymarket_survivor_power",
+  "status": "SURVIVOR_GATE_SATISFIED_PRIVATE_SAMPLE_READY",
+  "asset_class": "prediction_market",
+  "research_only": true,
+  "live_trading": false,
+  "wallet_or_order_access": false,
+  "funds_access": false,
+  "risk_classification": "tail_risk_selling_not_arbitrage",
+  "zero_risk_claim": "explicitly_rejected",
+  "predeclared_power_threshold": {
+    "min_closed_markets": 1000,
+    "min_markets_with_trades": 650,
+    "rationale": "Far above #42B's 80 recent-market probe; enough for data-reachability judgment, not for a no-tail or edge claim."
+  },
+  "verdict_states": [
+    "SURVIVOR_GATE_SATISFIED",
+    "TAIL_SAMPLE_RARE_OR_UNREACHABLE",
+    "STOP_INSUFFICIENT_COVERAGE"
+  ],
+  "public_data_policy": "No raw market cache, transaction list, edge estimate, PnL, or private result is stored in this public repository.",
+  "private_evidence_path": "~/apps/aegis-strategies/incubating/olympus42/survivor_power/",
+  "latest_private_probe": "polymarket-survivor-power-20260611T012610Z.json",
+  "no_backtest_policy": "This task only powers the survivor gate. Backtest remains blocked until unbiased losing high-price samples are present and is deferred to #42D."
+}
