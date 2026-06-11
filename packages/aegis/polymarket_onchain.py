@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 DATA_API_BASE_URL = "https://data-api.polymarket.com"
 GAMMA_API_BASE_URL = "https://gamma-api.polymarket.com"
+CLOB_API_BASE_URL = "https://clob.polymarket.com"
 DEFAULT_USER_AGENT = "aegis-polymarket-research/0.1 read-only"
 
 
@@ -90,11 +91,13 @@ class PolymarketDataApiClient:
         *,
         data_api_base_url: str = DATA_API_BASE_URL,
         gamma_api_base_url: str = GAMMA_API_BASE_URL,
+        clob_api_base_url: str = CLOB_API_BASE_URL,
         user_agent: str = DEFAULT_USER_AGENT,
         timeout_seconds: float = 20.0,
     ) -> None:
         self.data_api_base_url = data_api_base_url.rstrip("/")
         self.gamma_api_base_url = gamma_api_base_url.rstrip("/")
+        self.clob_api_base_url = clob_api_base_url.rstrip("/")
         self.user_agent = user_agent
         self.timeout_seconds = timeout_seconds
 
@@ -105,9 +108,10 @@ class PolymarketDataApiClient:
         offset: int = 0,
         order: str = "closedTime",
         ascending: bool = False,
+        closed: bool = True,
     ) -> list[dict[str, Any]]:
         params = {
-            "closed": "true",
+            "closed": str(closed).lower(),
             "limit": str(limit),
             "offset": str(offset),
             "order": order,
@@ -126,6 +130,7 @@ class PolymarketDataApiClient:
         sleep_seconds: float = 0.0,
         order: str = "closedTime",
         ascending: bool = False,
+        closed: bool = True,
     ) -> Iterable[dict[str, Any]]:
         offset = 0
         yielded = 0
@@ -136,6 +141,7 @@ class PolymarketDataApiClient:
                 offset=offset,
                 order=order,
                 ascending=ascending,
+                closed=closed,
             )
             if not page:
                 break
@@ -168,6 +174,13 @@ class PolymarketDataApiClient:
         if not isinstance(data, list):
             raise ValueError("unexpected Data API trades response")
         return [row for row in data if isinstance(row, dict)]
+
+    def get_order_book(self, token_id: str) -> dict[str, Any]:
+        params = {"token_id": token_id}
+        data = self._get_json(f"{self.clob_api_base_url}/book?{urlencode(params)}")
+        if not isinstance(data, dict):
+            raise ValueError("unexpected CLOB order book response")
+        return data
 
     def iter_trades(
         self,
