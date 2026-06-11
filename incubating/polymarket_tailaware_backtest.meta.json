@@ -1,0 +1,17 @@
+{
+  "briefing": "CODEX_OLYMPUS_42D_POLYMARKET_TAILAWARE_BACKTEST",
+  "artifact_class": "sanitized_public_meta",
+  "private_results_directory": "/home/gggqqy/apps/aegis-strategies/incubating/olympus42/tailaware_backtest",
+  "public_repo_contains_private_rows": false,
+  "wallet_or_order_access": false,
+  "funds_access": false,
+  "live_trading": false,
+  "zero_risk_claim": "explicitly_rejected",
+  "allowed_verdicts": [
+    "CARRY_POSITIVE_TAIL_UNDER_SAMPLED",
+    "NO_ROBUST_EDGE",
+    "INSUFFICIENT"
+  ],
+  "robust_edge_allowed": false,
+  "review_note": "Public code supports a survivor-safe, tail-aware Polymarket backtest. Raw markets, trades, PnL rows, and private verdict evidence are written outside this public repository."
+}
