@@ -1,0 +1,35 @@
+{
+  "name": "polymarket_structural_scan",
+  "status": "read_only_research",
+  "mode": "private_evidence_public_sanitized",
+  "verdict": "NO_STRUCTURAL_EDGE",
+  "thesis": "Scan Polymarket for mechanically verifiable structural inefficiencies, including negRisk package pricing and cross-market logical subset inconsistencies.",
+  "null_hypothesis": "After executable orderbook depth, fees, gas, spread, and assumption verification, structural inefficiencies are absent, rare, or not safely executable.",
+  "cost_model": {
+    "uses_midpoint": false,
+    "uses_top_of_book_only": false,
+    "uses_executable_ask_depth": true,
+    "includes_gas": true,
+    "includes_fee_parameter": true,
+    "requires_assumptions_verified": true
+  },
+  "sanitized_coverage": {
+    "active_markets_scanned": 250,
+    "token_orderbooks_loaded": 500,
+    "neg_risk_groups_scanned": 6,
+    "logic_pairs_evaluated": 22,
+    "executable_positive_candidates": 0,
+    "positive_unverified_candidates": 14,
+    "orderbook_errors": 0
+  },
+  "safety": {
+    "read_only": true,
+    "wallet_connected": false,
+    "orders_connected": false,
+    "funds_connected": false,
+    "live_trading": false,
+    "strategy_plugin_registered": false,
+    "zero_risk_claim": "explicitly_rejected"
+  },
+  "private_evidence_policy": "Raw market, token, orderbook, and candidate details stay outside public aegis under aegis-strategies/incubating/olympus43."
+}
