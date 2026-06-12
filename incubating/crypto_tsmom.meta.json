@@ -1,0 +1,35 @@
+{
+  "briefing": "CODEX_OLYMPUS_44_CRYPTO_TSMOM",
+  "public_artifact": true,
+  "private_evidence_dir": "~/apps/aegis-strategies/incubating/olympus44",
+  "thesis": "Predeclared crypto spot time-series momentum is evaluated against buy-and-hold with frozen OOS windows and full spot trading costs.",
+  "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+  "lookbacks": [30, 60, 90, 120],
+  "walk_forward": {
+    "train_bars": 730,
+    "test_bars": 180,
+    "step_bars": 180,
+    "annualization_periods": 365,
+    "execution": "signal at prior close, execute at next open"
+  },
+  "costs": {
+    "fee_bps": 10,
+    "slippage_bps": 5,
+    "funding": "N/A for spot long-only; perp funding not used"
+  },
+  "safety": {
+    "paper_only": true,
+    "live_trading": false,
+    "wallet_or_order_api_used": false,
+    "strategy_plugin_registered": false
+  },
+  "result": {
+    "status": "OK",
+    "verdict": "NO_ROBUST_EDGE",
+    "reason": "OOS full-cost trend did not clear buy-and-hold robustness gates",
+    "bars_per_symbol": 1989,
+    "oos_windows": 6,
+    "multiple_testing_discoveries": 0,
+    "private_artifact": "~/apps/aegis-strategies/incubating/olympus44/crypto-tsmom-20260612T004536Z.json"
+  }
+}
