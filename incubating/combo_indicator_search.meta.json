@@ -1,0 +1,19 @@
+{
+  "olympus": 45,
+  "name": "combo_indicator_search",
+  "status": "research_candidate",
+  "verdict": "NO_ROBUST_EDGE",
+  "public_artifact_policy": "sanitized only; raw OHLCV and result metrics stay in private aegis-strategies/incubating/olympus45",
+  "thesis": "Predeclared technical indicator combinations should beat buy-and-hold only if they survive locked OOS, full costs, and multiple-testing correction.",
+  "null_hypothesis": "All tested combinations are data-mined noise after fees, slippage, and FDR correction.",
+  "data_source": "free ccxt OHLCV, spot daily bars",
+  "safety": {
+    "paper_only": true,
+    "live_trading": false,
+    "strategy_plugin_registered": false,
+    "order_path_added": false,
+    "wallet_or_order_api_used": false
+  },
+  "search_space_n": 11964,
+  "private_result_path": "/home/gggqqy/apps/aegis-strategies/incubating/olympus45/combo-indicator-search-20260618T012635Z.json"
+}
