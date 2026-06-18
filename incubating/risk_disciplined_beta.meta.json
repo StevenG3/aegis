@@ -1,0 +1,25 @@
+{
+  "olympus": 47,
+  "name": "risk_disciplined_beta",
+  "status": "research_candidate",
+  "verdict": "NO_IMPROVEMENT",
+  "public_artifact_policy": "sanitized only; full weights, equity, drawdowns, and result details stay in private aegis-strategies/incubating/olympus47",
+  "thesis": "Risk-managed crypto beta may reduce drawdown and improve Calmar/Sortino after turnover costs; this is not an alpha claim.",
+  "decision_gate": {
+    "drawdown_reduction": ">= 20% versus buy-and-hold",
+    "calmar_and_sortino": "both greater than buy-and-hold",
+    "realized_volatility": "within 35% of target volatility",
+    "costs": "fee and slippage charged on turnover",
+    "oos_stability": ">= 2/3 locked-OOS fold pass rate",
+    "multiple_testing": "Benjamini-Hochberg FDR over predeclared risk configurations"
+  },
+  "safety": {
+    "paper_only": true,
+    "live_trading": false,
+    "strategy_plugin_registered": false,
+    "order_path_added": false,
+    "wallet_or_order_api_used": false
+  },
+  "candidate_count_n": 62,
+  "private_result_path": "/home/gggqqy/apps/aegis-strategies/incubating/olympus47/risk-disciplined-beta-20260618T123415Z.json"
+}
