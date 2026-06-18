@@ -1,0 +1,23 @@
+{
+  "olympus": 46,
+  "name": "combo_scorecard",
+  "status": "research_candidate",
+  "verdict": "NO_GO",
+  "public_artifact_policy": "sanitized only; full scorecards, raw OHLCV, equity, and result details stay in private aegis-strategies/incubating/olympus46",
+  "decision_gate": {
+    "expectancy_per_trade": "> 0 after costs",
+    "profit_factor": "> 1.3",
+    "oos_vs_buy_hold": "total return and Sharpe both beat buy-and-hold",
+    "multiple_testing": "Benjamini-Hochberg FDR over all predeclared symbol-combo trials",
+    "minimum_trades": 5
+  },
+  "safety": {
+    "paper_only": true,
+    "live_trading": false,
+    "strategy_plugin_registered": false,
+    "order_path_added": false,
+    "wallet_or_order_api_used": false
+  },
+  "candidate_count_n": 48,
+  "private_result_path": "/home/gggqqy/apps/aegis-strategies/incubating/olympus46/combo-scorecard-20260618T022923Z.json"
+}
