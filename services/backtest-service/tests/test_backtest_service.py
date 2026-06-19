@@ -267,6 +267,7 @@ def test_funding_arb_endpoint_uses_funding_history_and_costs(monkeypatch) -> Non
             "slippage_bps": 0.5,
             "basis_cost_bps": 0.25,
             "settlement_hours": 8,
+            "cash_rate_annual": 0,
         },
     )
 

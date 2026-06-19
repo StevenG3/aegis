@@ -1,0 +1,28 @@
+{
+  "briefing": "CODEX_OLYMPUS_50_FUNDING_ARB",
+  "status": "research_harness_public_only",
+  "strategy": "spot long plus equal-notional perpetual short funding carry",
+  "verdict_values": [
+    "ROBUST_CARRY",
+    "NO_ROBUST_EDGE",
+    "INSUFFICIENT"
+  ],
+  "discipline": {
+    "benchmark": "risk-free cash, not buy-and-hold",
+    "execution": "funding signal at event t; fill at next aligned event t+1",
+    "costs": "spot and perpetual legs both pay fee and slippage on entry and exit",
+    "funding": "settled on each held funding event by short-perpetual direction",
+    "multiple_testing": "predeclared parameter grid included in Benjamini-Hochberg FDR",
+    "oos": "last 30% locked out-of-sample after in-sample walk-forward",
+    "safety": "read-only; no live trading, orders, wallet, or account path"
+  },
+  "public_boundary": {
+    "raw_data": "excluded",
+    "private_results": "~/aegis-strategies/incubating/olympus50/",
+    "credentials": "excluded"
+  },
+  "commands": {
+    "unit": "pytest -q services/backtest-service/tests/test_funding_arb_research.py services/backtest-service/tests/test_funding_arb_evidence_script.py",
+    "private_evidence": "python scripts/funding_arb_evidence.py"
+  }
+}
