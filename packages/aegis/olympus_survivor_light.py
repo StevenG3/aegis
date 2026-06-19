@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import csv
+import importlib
+import importlib.util
 import json
 import math
 import os
 import statistics
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from html import unescape
@@ -29,6 +31,8 @@ SURVIVORSHIP_WARNING = (
     "systematically optimistic and must not be used as edge evidence"
 )
 SURVIVORSHIP_LIGHT = "light"
+SURVIVORSHIP_LEVEL_SURVIVOR_LIGHT = "survivor_light"
+SURVIVOR_LIGHT_VERDICT_CEILING = "SURVIVOR_LIGHT_ONLY_NO_ROBUST_VERDICT"
 ALLOWED_SURVIVOR_LIGHT_VERDICTS = {
     "SURVIVOR_LIGHT_PIPELINE_VALIDATED",
     "NO_EDGE",
@@ -206,6 +210,415 @@ class FreePriceSource:
         return bars
 
 
+FreeFetcher = Callable[[str, date, date, str], list[PriceBar]]
+ModuleLoader = Callable[[str], Any]
+
+
+class EquityFreePriceSource:
+    """Base for read-only free equity adapters with survivor-light metadata."""
+
+    module_name: str | None = None
+    requires_key = False
+
+    def __init__(
+        self,
+        *,
+        source_name: str,
+        market: str,
+        adjustment: str = "auto",
+        as_of: date | None = None,
+        timezone: str = "exchange_local",
+        delisted_tickers: Iterable[str] = (),
+        fetcher: FreeFetcher | None = None,
+        module_loader: ModuleLoader | None = None,
+    ) -> None:
+        self.source_name = source_name
+        self.market = market.lower()
+        self.adjustment = adjustment
+        self.as_of = as_of
+        self.timezone = timezone
+        self.delisted_tickers = {ticker.upper() for ticker in delisted_tickers}
+        self._fetcher = fetcher
+        self._module_loader = module_loader
+
+    @property
+    def available(self) -> bool:
+        if self._fetcher is not None:
+            return True
+        if self.module_name is None:
+            return True
+        return importlib.util.find_spec(self.module_name) is not None
+
+    def get_prices(self, ticker: str, start: date, end: date) -> dict[str, Any]:
+        ticker_upper = ticker.upper()
+        status = self.survivorship_status(ticker_upper)
+        effective_end = min(end, self.as_of) if self.as_of is not None else end
+        if effective_end < start:
+            return self._payload(
+                ticker_upper,
+                start,
+                end,
+                [],
+                status=status,
+                fetch_status="as_of_before_start",
+            )
+        if status["status"] == "delisted_price_missing_free_source":
+            return self._payload(
+                ticker_upper,
+                start,
+                end,
+                [],
+                status=status,
+                fetch_status="delisted_price_missing_free_source",
+            )
+        try:
+            bars = self._load_bars(ticker_upper, start, effective_end)
+        except ImportError:
+            return self._payload(
+                ticker_upper,
+                start,
+                end,
+                [],
+                status=status,
+                fetch_status="source_not_installed",
+            )
+        except Exception as exc:  # pragma: no cover - defensive for flaky vendor clients
+            return self._payload(
+                ticker_upper,
+                start,
+                end,
+                [],
+                status=status,
+                fetch_status="source_fetch_error",
+                reason=str(exc),
+            )
+        filtered = [bar for bar in bars if start <= bar.date <= effective_end]
+        return self._payload(
+            ticker_upper,
+            start,
+            end,
+            sorted(filtered, key=lambda bar: bar.date),
+            status=status,
+            fetch_status="OK",
+        )
+
+    def survivorship_status(self, ticker: str) -> dict[str, Any]:
+        ticker_upper = ticker.upper()
+        if ticker_upper in self.delisted_tickers:
+            return {
+                "ticker": ticker_upper,
+                "status": "delisted_price_missing_free_source",
+                "source": self.source_name,
+                "reason": "free equity source does not guarantee delisted price history",
+            }
+        return {
+            "ticker": ticker_upper,
+            "status": "active_or_unknown_free_source",
+            "source": self.source_name,
+            "reason": "free equity source coverage is survivor-light and not delisting complete",
+        }
+
+    def _load_bars(self, ticker: str, start: date, end: date) -> list[PriceBar]:
+        if self._fetcher is not None:
+            return self._fetcher(ticker, start, end, self.adjustment)
+        raise ImportError(self.module_name or self.source_name)
+
+    def _module(self) -> Any:
+        if self.module_name is None:
+            raise ImportError(self.source_name)
+        if self._module_loader is not None:
+            return self._module_loader(self.module_name)
+        return importlib.import_module(self.module_name)
+
+    def _payload(
+        self,
+        ticker: str,
+        start: date,
+        end: date,
+        bars: list[PriceBar],
+        *,
+        status: dict[str, Any],
+        fetch_status: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "ticker": ticker,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "source": self.source_name,
+            "market": self.market,
+            "adjustment": self.adjustment,
+            "timezone": self.timezone,
+            "as_of": self.as_of.isoformat() if self.as_of is not None else None,
+            "as_of_filter_applied": self.as_of is not None,
+            "read_only": True,
+            "survivorship": SURVIVORSHIP_LIGHT,
+            "survivorship_level": SURVIVORSHIP_LEVEL_SURVIVOR_LIGHT,
+            "verdict_ceiling": SURVIVOR_LIGHT_VERDICT_CEILING,
+            "point_in_time_safe": False,
+            "pit_adjustment_limit": (
+                "free vendors may expose latest-adjusted histories; as_of filters row dates "
+                "but cannot reconstruct historical adjustment knowledge"
+            ),
+            "warning": SURVIVORSHIP_WARNING,
+            "survivorship_status": status,
+            "status": fetch_status,
+            "bars": [bar_to_dict(bar) for bar in bars],
+        }
+        if reason is not None:
+            payload["reason"] = reason
+        return payload
+
+
+class YFinancePriceSource(EquityFreePriceSource):
+    """Read-only yfinance adapter for US/global survivor-light OHLCV."""
+
+    module_name = "yfinance"
+
+    def __init__(
+        self,
+        *,
+        market: str = "us",
+        adjustment: str = "raw_with_adj_close",
+        as_of: date | None = None,
+        delisted_tickers: Iterable[str] = (),
+        fetcher: FreeFetcher | None = None,
+        module_loader: ModuleLoader | None = None,
+    ) -> None:
+        super().__init__(
+            source_name="yfinance",
+            market=market,
+            adjustment=adjustment,
+            as_of=as_of,
+            timezone="exchange_local",
+            delisted_tickers=delisted_tickers,
+            fetcher=fetcher,
+            module_loader=module_loader,
+        )
+
+    def _load_bars(self, ticker: str, start: date, end: date) -> list[PriceBar]:
+        if self._fetcher is not None:
+            return self._fetcher(ticker, start, end, self.adjustment)
+        yf = self._module()
+        frame = yf.download(
+            ticker,
+            start=start.isoformat(),
+            end=(end + timedelta(days=1)).isoformat(),
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        return _bars_from_dataframe(frame)
+
+
+class AkSharePriceSource(EquityFreePriceSource):
+    """Read-only AkShare adapter for A/H/US free survivor-light OHLCV."""
+
+    module_name = "akshare"
+
+    def __init__(
+        self,
+        *,
+        market: str = "cn",
+        adjustment: str = "qfq",
+        as_of: date | None = None,
+        delisted_tickers: Iterable[str] = (),
+        fetcher: FreeFetcher | None = None,
+        module_loader: ModuleLoader | None = None,
+    ) -> None:
+        super().__init__(
+            source_name="akshare",
+            market=market,
+            adjustment=adjustment,
+            as_of=as_of,
+            timezone="Asia/Shanghai",
+            delisted_tickers=delisted_tickers,
+            fetcher=fetcher,
+            module_loader=module_loader,
+        )
+
+    def _load_bars(self, ticker: str, start: date, end: date) -> list[PriceBar]:
+        if self._fetcher is not None:
+            return self._fetcher(ticker, start, end, self.adjustment)
+        ak = self._module()
+        start_raw = start.strftime("%Y%m%d")
+        end_raw = end.strftime("%Y%m%d")
+        adjust = _akshare_adjustment(self.adjustment)
+        symbol = _strip_exchange_suffix(ticker)
+        if self.market in {"cn", "a", "ashare", "china"}:
+            frame = ak.stock_zh_a_hist(
+                symbol=symbol,
+                period="daily",
+                start_date=start_raw,
+                end_date=end_raw,
+                adjust=adjust,
+            )
+        elif self.market in {"hk", "hong_kong"}:
+            frame = ak.stock_hk_hist(
+                symbol=symbol,
+                period="daily",
+                start_date=start_raw,
+                end_date=end_raw,
+                adjust=adjust,
+            )
+        else:
+            frame = ak.stock_us_daily(symbol=ticker)
+        return _bars_from_dataframe(frame)
+
+
+class BaostockPriceSource(EquityFreePriceSource):
+    """Read-only Baostock adapter for A-share survivor-light OHLCV."""
+
+    module_name = "baostock"
+
+    def __init__(
+        self,
+        *,
+        adjustment: str = "qfq",
+        as_of: date | None = None,
+        delisted_tickers: Iterable[str] = (),
+        fetcher: FreeFetcher | None = None,
+        module_loader: ModuleLoader | None = None,
+    ) -> None:
+        super().__init__(
+            source_name="baostock",
+            market="cn",
+            adjustment=adjustment,
+            as_of=as_of,
+            timezone="Asia/Shanghai",
+            delisted_tickers=delisted_tickers,
+            fetcher=fetcher,
+            module_loader=module_loader,
+        )
+
+    def _load_bars(self, ticker: str, start: date, end: date) -> list[PriceBar]:
+        if self._fetcher is not None:
+            return self._fetcher(ticker, start, end, self.adjustment)
+        bs = self._module()
+        bs.login()
+        try:
+            result = bs.query_history_k_data_plus(
+                _baostock_code(ticker),
+                "date,open,high,low,close,preclose,volume,amount,adjustflag",
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                frequency="d",
+                adjustflag=_baostock_adjustflag(self.adjustment),
+            )
+            rows: list[dict[str, Any]] = []
+            while result.next():
+                rows.append(dict(zip(result.fields, result.get_row_data(), strict=True)))
+        finally:
+            bs.logout()
+        bars: list[PriceBar] = []
+        for row in rows:
+            parsed = _bar_from_any_row(row)
+            if parsed is not None:
+                bars.append(parsed)
+        return bars
+
+
+class TusharePriceSource(EquityFreePriceSource):
+    """Read-only Tushare adapter for A-share survivor-light OHLCV; requires TUSHARE_TOKEN."""
+
+    module_name = "tushare"
+    requires_key = True
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        adjustment: str = "qfq",
+        as_of: date | None = None,
+        delisted_tickers: Iterable[str] = (),
+        fetcher: FreeFetcher | None = None,
+        module_loader: ModuleLoader | None = None,
+    ) -> None:
+        super().__init__(
+            source_name="tushare",
+            market="cn",
+            adjustment=adjustment,
+            as_of=as_of,
+            timezone="Asia/Shanghai",
+            delisted_tickers=delisted_tickers,
+            fetcher=fetcher,
+            module_loader=module_loader,
+        )
+        self.token = token if token is not None else os.getenv("TUSHARE_TOKEN", "").strip()
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.token)
+
+    @property
+    def available(self) -> bool:
+        return self.configured and super().available
+
+    def get_prices(self, ticker: str, start: date, end: date) -> dict[str, Any]:
+        if not self.configured:
+            return self._payload(
+                ticker.upper(),
+                start,
+                end,
+                [],
+                status=self.survivorship_status(ticker),
+                fetch_status="token_not_configured",
+                reason="set TUSHARE_TOKEN to enable Tushare",
+            )
+        return super().get_prices(ticker, start, end)
+
+    def survivorship_status(self, ticker: str) -> dict[str, Any]:
+        status = super().survivorship_status(ticker)
+        if not self.configured:
+            status["status"] = "token_not_configured"
+            status["reason"] = "TUSHARE_TOKEN not set; Tushare disabled"
+        return status
+
+    def _load_bars(self, ticker: str, start: date, end: date) -> list[PriceBar]:
+        if self._fetcher is not None:
+            return self._fetcher(ticker, start, end, self.adjustment)
+        ts = self._module()
+        ts.set_token(self.token)
+        frame = ts.pro_bar(
+            ts_code=_tushare_code(ticker),
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            adj=_tushare_adjustment(self.adjustment),
+        )
+        return _bars_from_dataframe(frame)
+
+
+class UnavailablePriceSource:
+    """Protocol implementation for explicit no-source cases; returns no dirty data."""
+
+    def __init__(self, *, market: str, reason: str) -> None:
+        self.market = market
+        self.reason = reason
+
+    def get_prices(self, ticker: str, start: date, end: date) -> dict[str, Any]:
+        return {
+            "ticker": ticker.upper(),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "source": "unavailable",
+            "market": self.market,
+            "read_only": True,
+            "survivorship": "unknown",
+            "survivorship_level": "unknown",
+            "status": "source_unavailable",
+            "reason": self.reason,
+            "bars": [],
+        }
+
+    def survivorship_status(self, ticker: str) -> dict[str, Any]:
+        return {
+            "ticker": ticker.upper(),
+            "status": "source_unavailable",
+            "source": "unavailable",
+            "reason": self.reason,
+        }
+
+
 SHARADAR_BASE_URL = "https://data.nasdaq.com/api/v3/datatables/SHARADAR"
 SHARADAR_API_KEY_ENVS = (
     "NASDAQ_DATA_LINK_API_KEY",
@@ -353,15 +766,100 @@ def select_price_source(
     *,
     delisted_tickers: Iterable[str] = (),
     prefer_paid: bool = True,
+    source: str | None = None,
+    market: str = "us",
+    adjustment: str = "auto",
+    as_of: date | None = None,
 ) -> DelistingAwarePriceSource:
-    """Return Sharadar when a paid key is configured, else the free survivor-light source.
+    """Select a read-only price source by market, key state, and explicit source.
 
-    Lets the pipeline transparently upgrade to delisting-aware prices once a key is
-    set, without code changes; until then it stays free/survivor-light.
+    Sharadar remains the only full-survivorship adapter here and is selected only
+    when configured. Free equity sources are survivor-light and carry a verdict
+    ceiling in payload metadata. Missing optional libraries or keys degrade to an
+    explicit unavailable/token status instead of silently fabricating coverage.
     """
-    if prefer_paid and sharadar_api_key():
+    source_key = (source or "auto").lower()
+    market_key = market.lower()
+    if source_key in {"sharadar", "paid"}:
         return SharadarPriceSource()
-    return FreePriceSource(delisted_tickers=delisted_tickers)
+    if source_key in {"free", "free_csv_or_yfinance", "legacy_free"}:
+        return FreePriceSource(delisted_tickers=delisted_tickers)
+    if source_key in {"yfinance", "yf"}:
+        return YFinancePriceSource(
+            market=market_key,
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+    if source_key in {"akshare", "ak"}:
+        return AkSharePriceSource(
+            market=market_key,
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+    if source_key in {"baostock", "bs"}:
+        return BaostockPriceSource(
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+    if source_key in {"tushare", "ts"}:
+        return TusharePriceSource(
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+    if source_key != "auto":
+        return UnavailablePriceSource(market=market_key, reason=f"unsupported source: {source}")
+
+    if prefer_paid and sharadar_api_key() and market_key in {"us", "usa", "global"}:
+        return SharadarPriceSource()
+    if market_key in {"us", "usa", "global"}:
+        return YFinancePriceSource(
+            market=market_key,
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+    if market_key in {"cn", "a", "ashare", "china"}:
+        tushare = TusharePriceSource(
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+        if tushare.available:
+            return tushare
+        akshare = AkSharePriceSource(
+            market=market_key,
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+        if akshare.available:
+            return akshare
+        baostock = BaostockPriceSource(
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+        if baostock.available:
+            return baostock
+        return UnavailablePriceSource(
+            market=market_key,
+            reason="no configured/installed A-share free source (Tushare/AkShare/Baostock)",
+        )
+    if market_key in {"hk", "hong_kong"}:
+        akshare = AkSharePriceSource(
+            market=market_key,
+            adjustment=adjustment,
+            as_of=as_of,
+            delisted_tickers=delisted_tickers,
+        )
+        if akshare.available:
+            return akshare
+        return UnavailablePriceSource(market=market_key, reason="AkShare not installed for HK")
+    return UnavailablePriceSource(market=market_key, reason=f"unsupported market: {market}")
 
 
 class NorgatePriceSource:
@@ -669,6 +1167,140 @@ def latest_price_on_or_before(bars: list[PriceBar], query_date: date) -> PriceBa
 def first_price_after(bars: list[PriceBar], query_date: date) -> PriceBar | None:
     eligible = [bar for bar in bars if bar.date > query_date]
     return min(eligible, key=lambda bar: bar.date) if eligible else None
+
+
+def _bars_from_dataframe(frame: Any) -> list[PriceBar]:
+    if frame is None:
+        return []
+    empty = getattr(frame, "empty", False)
+    if bool(empty):
+        return []
+    records = getattr(frame, "to_dict", None)
+    if callable(records):
+        raw_records = records("records")
+        if isinstance(raw_records, list):
+            bars = [_bar_from_any_row(row) for row in raw_records if isinstance(row, dict)]
+            parsed_records = [bar for bar in bars if bar is not None]
+            if parsed_records:
+                return parsed_records
+    iterrows = getattr(frame, "iterrows", None)
+    if callable(iterrows):
+        iterrow_bars: list[PriceBar] = []
+        for index, row in iterrows():
+            item: dict[str, Any] = dict(row)
+            item.setdefault("date", index)
+            parsed = _bar_from_any_row(item)
+            if parsed is not None:
+                iterrow_bars.append(parsed)
+        return iterrow_bars
+    if isinstance(frame, list):
+        bars = [_bar_from_any_row(row) for row in frame if isinstance(row, dict)]
+        return [bar for bar in bars if bar is not None]
+    return []
+
+
+def _bar_from_any_row(row: dict[str, Any]) -> PriceBar | None:
+    raw_date = _first_present(
+        row,
+        "date",
+        "Date",
+        "trade_date",
+        "日期",
+        "时间",
+    )
+    if raw_date is None:
+        return None
+    return PriceBar(
+        date=_parse_date(str(raw_date)),
+        open=_numeric_or_zero(_first_present(row, "open", "Open", "开盘")),
+        high=_numeric_or_zero(_first_present(row, "high", "High", "最高")),
+        low=_numeric_or_zero(_first_present(row, "low", "Low", "最低")),
+        close=_numeric_or_zero(_first_present(row, "close", "Close", "收盘")),
+        adj_close=_optional_numeric_cell(
+            _first_present(row, "adj_close", "Adj Close", "closeadj", "复权收盘")
+        ),
+        volume=_numeric_or_zero(_first_present(row, "volume", "Volume", "vol", "成交量")),
+    )
+
+
+def _first_present(row: dict[str, Any], *keys: str) -> Any | None:
+    for key in keys:
+        if key in row and row[key] not in (None, ""):
+            return row[key]
+    return None
+
+
+def _optional_numeric_cell(value: Any | None) -> float | None:
+    if value in (None, ""):
+        return None
+    return _numeric_cell(value)
+
+
+def _numeric_or_zero(value: Any | None) -> float:
+    if value in (None, ""):
+        return 0.0
+    return _numeric_cell(value)
+
+
+def _strip_exchange_suffix(ticker: str) -> str:
+    return ticker.upper().replace(".SH", "").replace(".SZ", "").replace(".BJ", "")
+
+
+def _akshare_adjustment(adjustment: str) -> str:
+    mapping = {
+        "auto": "qfq",
+        "qfq": "qfq",
+        "forward": "qfq",
+        "hfq": "hfq",
+        "backward": "hfq",
+        "raw": "",
+        "none": "",
+    }
+    return mapping.get(adjustment.lower(), adjustment)
+
+
+def _baostock_adjustflag(adjustment: str) -> str:
+    mapping = {
+        "auto": "2",
+        "qfq": "2",
+        "forward": "2",
+        "hfq": "1",
+        "backward": "1",
+        "raw": "3",
+        "none": "3",
+    }
+    return mapping.get(adjustment.lower(), "2")
+
+
+def _baostock_code(ticker: str) -> str:
+    ticker_lower = ticker.lower()
+    if ticker_lower.startswith(("sh.", "sz.", "bj.")):
+        return ticker_lower
+    symbol = _strip_exchange_suffix(ticker)
+    prefix = "sh" if symbol.startswith(("5", "6", "9")) else "sz"
+    return f"{prefix}.{symbol}"
+
+
+def _tushare_adjustment(adjustment: str) -> str | None:
+    mapping = {
+        "auto": "qfq",
+        "qfq": "qfq",
+        "forward": "qfq",
+        "hfq": "hfq",
+        "backward": "hfq",
+        "raw": None,
+        "none": None,
+    }
+    return mapping.get(adjustment.lower(), adjustment)
+
+
+def _tushare_code(ticker: str) -> str:
+    ticker_upper = ticker.upper()
+    if ticker_upper.endswith((".SH", ".SZ", ".BJ")):
+        return ticker_upper
+    symbol = _strip_exchange_suffix(ticker_upper)
+    suffix = "SH" if symbol.startswith(("5", "6", "9")) else "SZ"
+    return f"{symbol}.{suffix}"
 
 
 def with_forward_returns(observations: list[FactorObservation]) -> list[FactorObservation]:
