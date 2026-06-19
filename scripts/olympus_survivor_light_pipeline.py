@@ -21,6 +21,7 @@ from aegis.olympus_survivor_light import (
     parse_wikipedia_sp500_snapshot,
     timestamp_slug,
 )
+from aegis.private_paths import private_dir_from_cli
 
 
 def main() -> int:
@@ -29,7 +30,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--private-dir",
-        default="/home/gggqqy/apps/aegis-strategies/incubating/olympus41",
+        default=None,
         help="Private output directory; do not point inside public aegis.",
     )
     parser.add_argument(
@@ -47,7 +48,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    private_dir = Path(args.private_dir)
+    private_dir = private_dir_from_cli(args.private_dir, default_task="olympus41")
     cache_dir = private_dir / "cache"
     price_cache_dir = cache_dir / "prices"
     edgar_cache_dir = cache_dir / "edgar"

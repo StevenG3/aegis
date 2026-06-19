@@ -7,10 +7,10 @@ import importlib
 import json
 import time
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
 from aegis.combo_indicator_search import ComboBar, ComboCostModel
+from aegis.private_paths import private_dir_from_cli
 from aegis.risk_disciplined_beta import RiskBetaConfig, report_to_dict, run_risk_disciplined_beta
 
 
@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the read-only Olympus #47 risk-disciplined beta study."
     )
-    parser.add_argument("--private-dir", required=True)
+    parser.add_argument("--private-dir", default=None)
     parser.add_argument("--exchange", default="binance")
     parser.add_argument(
         "--symbols",
@@ -124,7 +124,7 @@ def main() -> int:
         "wallet_or_order_api_used": False,
         "report": report_to_dict(report),
     }
-    output_dir = Path(args.private_dir)
+    output_dir = private_dir_from_cli(args.private_dir, default_task="olympus47")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = (
         output_dir / f"risk-disciplined-beta-{dt.datetime.now(dt.UTC):%Y%m%dT%H%M%SZ}.json"

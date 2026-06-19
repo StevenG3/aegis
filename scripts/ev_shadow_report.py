@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
+
+from aegis.private_paths import private_dir_from_cli
 
 
 def _load_orchestrator_app() -> ModuleType:
@@ -25,10 +28,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate an EV shadow replay report.")
     parser.add_argument("--actor", default=None)
     parser.add_argument("--min-ev", default=None)
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--text", action="store_true")
     parser.add_argument("--no-write", action="store_true")
     args = parser.parse_args()
 
+    if not args.no_write:
+        os.environ["EV_SHADOW_REPORT_DIR"] = str(
+            private_dir_from_cli(args.output_dir, default_task="ev-shadow")
+        )
     app = _load_orchestrator_app()
     min_ev = Decimal(args.min_ev) if args.min_ev is not None else None
     report = app.build_ev_shadow_report(actor=args.actor, min_ev=min_ev)

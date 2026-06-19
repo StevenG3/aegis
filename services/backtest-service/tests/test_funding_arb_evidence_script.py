@@ -18,17 +18,21 @@ def load_evidence_script():
 
 def test_run_from_env_accepts_explicit_symbols_and_private_dir(monkeypatch, tmp_path: Path) -> None:
     module = load_evidence_script()
+    private_root = tmp_path / "aegis-strategies"
+    private_root.mkdir()
+    output_dir = private_root / "incubating" / "olympus50"
+    monkeypatch.setenv("AEGIS_STRATEGIES_ROOT", str(private_root))
     monkeypatch.setenv("FUNDING_ARB_EVIDENCE_SYMBOLS", "btcusdt, ethusdt")
     monkeypatch.setenv("FUNDING_ARB_EVIDENCE_START", "2024-01-01")
     monkeypatch.setenv("FUNDING_ARB_EVIDENCE_END", "2024-06-01")
-    monkeypatch.setenv("FUNDING_ARB_EVIDENCE_OUTPUT_DIR", str(tmp_path / "olympus50"))
+    monkeypatch.setenv("FUNDING_ARB_EVIDENCE_OUTPUT_DIR", str(output_dir))
 
     run = module._run_from_env()
 
     assert run.symbols == ("BTCUSDT", "ETHUSDT")
     assert run.start == "2024-01-01"
     assert run.end == "2024-06-01"
-    assert run.output_dir == tmp_path / "olympus50"
+    assert run.output_dir == output_dir
 
 
 def test_markdown_reports_tristate_verdict(tmp_path: Path) -> None:

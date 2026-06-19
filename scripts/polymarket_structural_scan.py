@@ -5,7 +5,6 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 from aegis.polymarket_onchain import PolymarketDataApiClient
@@ -17,11 +16,12 @@ from aegis.polymarket_structural_scan import (
     scan_neg_risk_groups,
     structural_scan_to_dict,
 )
+from aegis.private_paths import private_dir_from_cli
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read-only Polymarket structural scan")
-    parser.add_argument("--private-dir", required=True)
+    parser.add_argument("--private-dir", default=None)
     parser.add_argument("--max-markets", type=int, default=300)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout-seconds", type=float, default=12)
@@ -100,7 +100,7 @@ def main() -> None:
         "read_only": True,
         "wallet_order_funds_connected": False,
     }
-    out_dir = Path(args.private_dir) / "structural_scan"
+    out_dir = private_dir_from_cli(args.private_dir, default_task="olympus43") / "structural_scan"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"polymarket-structural-scan-{datetime.now(UTC):%Y%m%dT%H%M%SZ}.json"
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

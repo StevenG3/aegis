@@ -11,16 +11,9 @@ from aegis.edgar_pit import (
     build_coverage_matrix,
     extract_submission_metadata,
 )
+from aegis.private_paths import private_path_from_cli
 
 META_PATH = Path("incubating") / "edgar_pit_fundamentals.meta.json"
-DEFAULT_MATRIX_OUT = (
-    Path.home()
-    / "apps"
-    / "aegis-strategies"
-    / "incubating"
-    / "olympus37"
-    / "matrix.json"
-)
 
 
 def main() -> int:
@@ -38,6 +31,15 @@ def main() -> int:
         help="Write ticker x concept x fiscal_year coverage matrix.",
     )
     args = parser.parse_args()
+    coverage_out = (
+        private_path_from_cli(
+            args.coverage_out,
+            default_task="olympus37",
+            default_name="coverage.json",
+        )
+        if args.coverage_out is not None
+        else None
+    )
 
     companies = _load_pilot_universe(args.meta)
     if args.limit is not None:
@@ -96,9 +98,9 @@ def main() -> int:
             encoding="utf-8",
         )
 
-    if args.coverage_out is not None:
-        args.coverage_out.parent.mkdir(parents=True, exist_ok=True)
-        args.coverage_out.write_text(
+    if coverage_out is not None:
+        coverage_out.parent.mkdir(parents=True, exist_ok=True)
+        coverage_out.write_text(
             json.dumps({"companies": coverage}, indent=2, sort_keys=True),
             encoding="utf-8",
         )
@@ -114,8 +116,12 @@ def _default_matrix_out() -> Path | None:
     if configured is not None:
         if configured == "":
             return None
-        return Path(configured)
-    return DEFAULT_MATRIX_OUT
+        return private_path_from_cli(
+            configured,
+            default_task="olympus37",
+            default_name="matrix.json",
+        )
+    return private_path_from_cli(None, default_task="olympus37", default_name="matrix.json")
 
 
 def _load_pilot_universe(meta_path: Path) -> list[dict[str, Any]]:
