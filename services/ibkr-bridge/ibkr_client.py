@@ -319,6 +319,7 @@ class IBKRClient:
 
     def snapshot(self) -> dict[str, object]:
         """Return a read-only account, position, and quote snapshot."""
+        _ensure_event_loop_for_sync_ib()
         ib = self._require_ready()
         positions = self.positions()
         account_summary = self._account_summary(ib)
