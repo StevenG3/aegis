@@ -207,6 +207,26 @@ def get_positions() -> dict[str, object]:
         ) from exc
 
 
+@app.get("/snapshot", response_model=None)
+def get_snapshot() -> dict[str, object]:
+    _ensure_ready()
+    if not client.positions_ready():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "IBKR_POSITIONS_NOT_READY",
+                "message": "position subscription not primed yet",
+            },
+        )
+    try:
+        return client.snapshot()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "IBKR_SNAPSHOT_FAILED", "error": str(exc)},
+        ) from exc
+
+
 @app.get("/tickers/{symbol}", response_model=TickerResponse)
 def ticker(symbol: str = Path(min_length=1)) -> dict[str, str]:
     _ensure_ready()
