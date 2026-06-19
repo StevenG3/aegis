@@ -40,6 +40,7 @@ class FakeIB:
         self.connected = False
         self.qualified: list[object] = []
         self.placed: list[tuple[object, object]] = []
+        self._tickers: list[object] = []
         self.disconnected = False
         self.positionEvent = FakeEvent()
         self.positionEndEvent = FakeEvent()
@@ -50,17 +51,18 @@ class FakeIB:
         self.current_market_data_type = 1
         self.market_data_type_requests: list[int] = []
         self.cancel_mkt_data_contracts: list[object] = []
+        self.req_mkt_data_contracts: list[object] = []
         self.market_prices_by_type: dict[int, dict[str, Decimal | None]] = {
             1: {"NVDA": Decimal("452.50"), "MSFT": Decimal("430.00")}
         }
         self.seed_positions = [
             SimpleNamespace(
-                contract=SimpleNamespace(symbol="NVDA"),
+                contract=SimpleNamespace(symbol="NVDA", conId=1001, currency="USD"),
                 position=10.0,
                 avgCost=450.25,
             ),
             SimpleNamespace(
-                contract=SimpleNamespace(symbol="MSFT"),
+                contract=SimpleNamespace(symbol="MSFT", conId=1002, currency="USD"),
                 position=5.0,
                 avgCost=420.00,
             ),
@@ -78,6 +80,19 @@ class FakeIB:
         _ = host, port, clientId, timeout
         self.connect_readonly = readonly
         self.connect_account = account
+        self.connected = True
+        return True
+
+    async def connectAsync(
+        self,
+        host: str,
+        port: int,
+        clientId: int,
+        timeout: float,
+        readonly: bool = False,
+    ) -> bool:  # noqa: N803
+        _ = host, port, clientId, timeout
+        self.connect_readonly = readonly
         self.connected = True
         return True
 
@@ -111,11 +126,12 @@ class FakeIB:
 
     def reqMktData(self, contract: object, *args: object, **kwargs: object) -> object:  # noqa: N802
         _ = args, kwargs
+        self.req_mkt_data_contracts.append(contract)
         symbol = str(getattr(contract, "symbol", "")).upper()
         price = self.market_prices_by_type.get(self.current_market_data_type, {}).get(
             symbol, Decimal("452.50")
         )
-        return SimpleNamespace(
+        ticker = SimpleNamespace(
             contract=contract,
             last=price,
             close=None,
@@ -123,6 +139,11 @@ class FakeIB:
             ask=None,
             marketPrice=lambda: price if price is not None else Decimal("-1"),
         )
+        self._tickers.append(ticker)
+        return ticker
+
+    def tickers(self) -> list[object]:
+        return list(self._tickers)
 
     def sleep(self, seconds: float) -> None:
         assert seconds in {1.0, 3.0}
@@ -477,7 +498,14 @@ def test_positions_returns_copy_on_read(monkeypatch: pytest.MonkeyPatch) -> None
 def test_snapshot_returns_account_summary_positions_and_market_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    instances: list[FakeIB] = []
+
+    class TrackingIB(FakeIB):
+        def __init__(self) -> None:
+            super().__init__()
+            instances.append(self)
+
+    monkeypatch.setattr("ibkr_client.IB", TrackingIB)
     monkeypatch.setattr(
         "ibkr_client.Stock",
         lambda symbol, exchange, currency: SimpleNamespace(
@@ -506,11 +534,15 @@ def test_snapshot_returns_account_summary_positions_and_market_data(
     market_data = snapshot["market_data"]
     assert isinstance(market_data, list)
     assert {row["symbol"] for row in market_data} == {"NVDA", "MSFT"}
-    fake_ib = client._ib
-    assert fake_ib is not None
-    assert fake_ib.market_data_type_requests == [1]
-    assert len(fake_ib.cancel_mkt_data_contracts) == 2
-    assert fake_ib.placed == []
+    market_data_ib = instances[-1]
+    assert market_data_ib.market_data_type_requests == [1]
+    assert [getattr(c, "conId", None) for c in market_data_ib.req_mkt_data_contracts] == [
+        1001,
+        1002,
+    ]
+    assert len(market_data_ib.cancel_mkt_data_contracts) == 2
+    assert client._ib is not None
+    assert client._ib.placed == []
 
 
 def test_snapshot_creates_event_loop_inside_worker_thread(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -539,9 +571,12 @@ def test_snapshot_creates_event_loop_inside_worker_thread(monkeypatch: pytest.Mo
 def test_snapshot_falls_back_from_realtime_to_delayed_market_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    instances: list[FakeIB] = []
+
     class DelayedOnlyIB(FakeIB):
         def __init__(self) -> None:
             super().__init__()
+            instances.append(self)
             self.market_prices_by_type = {
                 1: {"NVDA": None, "MSFT": None},
                 3: {"NVDA": Decimal("453.00"), "MSFT": Decimal("431.00")},
@@ -566,10 +601,8 @@ def test_snapshot_falls_back_from_realtime_to_delayed_market_data(
     nvda = next(p for p in positions if p["symbol"] == "NVDA")
     assert nvda["market_price"] == "453.00"
     assert nvda["market_value"] == "4530.0000000000"
-    fake_ib = client._ib
-    assert fake_ib is not None
-    assert fake_ib.market_data_type_requests == [1, 3]
-    assert len(fake_ib.cancel_mkt_data_contracts) == 4
+    assert [ib.market_data_type_requests for ib in instances[1:]] == [[1], [3]]
+    assert sum(len(ib.cancel_mkt_data_contracts) for ib in instances[1:]) == 4
 
 
 def test_snapshot_returns_fallback_metadata_when_market_data_unavailable(

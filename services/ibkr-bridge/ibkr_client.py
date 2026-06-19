@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -122,6 +123,7 @@ class IBKRClient:
         self._orders: dict[str, dict[str, object]] = {}
         self._idempotency: dict[str, str] = {}
         self._position_cache: dict[str, dict[str, str]] = {}
+        self._position_contract_cache: dict[str, Any] = {}
         self._positions_primed: bool = False
         self._positions_last_update: str | None = None
         self._position_cache_lock = RLock()
@@ -158,6 +160,7 @@ class IBKRClient:
             finally:
                 with self._position_cache_lock:
                     self._position_cache.clear()
+                    self._position_contract_cache.clear()
                     self._positions_primed = False
                     self._positions_last_update = None
                 if self._ib is not None and self._ib.isConnected():
@@ -172,6 +175,7 @@ class IBKRClient:
             finally:
                 with self._position_cache_lock:
                     self._position_cache.clear()
+                    self._position_contract_cache.clear()
                     self._positions_primed = False
                     self._positions_last_update = None
                 if self._ib.isConnected():
@@ -237,12 +241,14 @@ class IBKRClient:
         with self._position_cache_lock:
             if qty == Decimal("0"):
                 self._position_cache.pop(symbol, None)
+                self._position_contract_cache.pop(symbol, None)
             else:
                 self._position_cache[symbol] = {
                     "symbol": symbol,
                     "qty": str(qty),
                     "avg_cost": str(avg_cost),
                 }
+                self._position_contract_cache[symbol] = contract
             self._positions_last_update = _now_iso()
             self._positions_primed = True
 
@@ -421,31 +427,84 @@ class IBKRClient:
         positions: list[dict[str, str]],
         market_data_type: int,
     ) -> list[dict[str, str | None]]:
+        _ = ib
+        if IB is None:
+            raise RuntimeError("ib_async is not available")
         if Stock is None:
             raise RuntimeError("ib_async contract classes are not available")
-        if hasattr(ib, "reqMarketDataType"):
-            ib.reqMarketDataType(market_data_type)
-        tickers: list[Any] = []
+        with self._position_cache_lock:
+            contract_by_symbol = dict(self._position_contract_cache)
+        contracts: list[Any] = []
         failed_rows: list[dict[str, str | None]] = []
         for pos in positions:
             symbol = str(pos.get("symbol", "")).upper().strip()
             if not symbol:
                 continue
-            contract = Stock(symbol, "SMART", "USD")
-            try:
-                tickers.append(ib.reqMktData(contract, "", False, False))
-            except Exception:
-                logger.warning("IBKR market data request failed symbol=%s", symbol, exc_info=True)
+            contract = contract_by_symbol.get(symbol)
+            if contract is None:
+                contract = Stock(symbol, "SMART", "USD")
                 failed_rows.append(self._empty_market_data_row(symbol))
-        ib.sleep(3.0)
-        rows = [self._ticker_to_snapshot_row(ticker) for ticker in tickers] + failed_rows
-        for ticker in tickers:
-            try:
-                if hasattr(ib, "cancelMktData"):
-                    ib.cancelMktData(getattr(ticker, "contract", None))
-            except Exception:
-                logger.debug("IBKR cancelMktData failed", exc_info=True)
+            contracts.append(contract)
+        rows = self._run_market_data_snapshot(contracts, market_data_type)
+        if failed_rows and self._valid_price_count(rows) == 0:
+            return rows + failed_rows
         return rows
+
+    def _run_market_data_snapshot(
+        self,
+        contracts: list[Any],
+        market_data_type: int,
+    ) -> list[dict[str, str | None]]:
+        async def request_once() -> list[dict[str, str | None]]:
+            snapshot_ib = IB()
+            try:
+                client_id = int(
+                    os.getenv(
+                        "IBKR_SNAPSHOT_CLIENT_ID",
+                        str(8300 + (os.getpid() % 1000)),
+                    )
+                )
+                await asyncio.wait_for(
+                    snapshot_ib.connectAsync(
+                        self._config.host,
+                        self._config.port,
+                        clientId=client_id,
+                        timeout=self._config.timeout_sec,
+                        readonly=True,
+                    ),
+                    timeout=self._config.timeout_sec,
+                )
+                snapshot_ib.reqMarketDataType(market_data_type)
+                for contract in contracts:
+                    try:
+                        snapshot_ib.reqMktData(contract, "", False, False)
+                    except Exception:
+                        logger.warning(
+                            "IBKR market data request failed symbol=%s",
+                            getattr(contract, "symbol", ""),
+                            exc_info=True,
+                        )
+                await asyncio.sleep(float(os.getenv("IBKR_MARKETDATA_WAIT", "3")))
+                return [
+                    self._ticker_to_snapshot_row(ticker)
+                    for ticker in snapshot_ib.tickers()
+                ]
+            except Exception:
+                logger.warning("IBKR market data snapshot failed", exc_info=True)
+                return [
+                    self._empty_market_data_row(str(getattr(contract, "symbol", "")))
+                    for contract in contracts
+                ]
+            finally:
+                for ticker in list(snapshot_ib.tickers()):
+                    try:
+                        snapshot_ib.cancelMktData(ticker.contract)
+                    except Exception:
+                        logger.debug("IBKR cancelMktData failed", exc_info=True)
+                if snapshot_ib.isConnected():
+                    snapshot_ib.disconnect()
+
+        return asyncio.run(request_once())
 
     @staticmethod
     def _empty_market_data_row(symbol: str) -> dict[str, str | None]:
