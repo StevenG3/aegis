@@ -3,15 +3,17 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
+import random
 import sqlite3
 import statistics
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ORCHESTRATOR_DIR = REPO_ROOT / "services" / "orchestrator"
@@ -22,80 +24,127 @@ from db import connect  # noqa: E402
 DEFAULT_OUTPUT_DIR = Path(
     os.getenv(
         "OLYMPUS_EVIDENCE_DIR",
-        str(Path(__file__).resolve().parents[2] / "aegis-strategies" / "incubating"),
+        str(Path.home() / "aegis-strategies" / "incubating" / "olympus51"),
     )
 )
 DEFAULT_SOURCE = "tradingagents"
-DEFAULT_BENCHMARK = "BTC/USDT"
 DEFAULT_BENCHMARK_SOURCE = "binance"
+DEFAULT_HORIZON_HOURS = 24
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 2.0
-DEFAULT_FUNDING_BPS = 0.0
+DEFAULT_FUNDING_BPS_PER_8H = 0.0
+DEFAULT_CASH_RATE_ANNUAL = 0.04
 DEFAULT_MIN_N = 30
 DEFAULT_BUCKET_MIN_N = 10
 DEFAULT_ANALYST_MIN_N = 10
+DEFAULT_FDR_ALPHA = 0.10
+
+AgentVerdict = Literal["AGENT_EDGE", "NO_EDGE", "INSUFFICIENT"]
+Action = Literal["buy", "sell", "hold"]
 
 
 @dataclass(frozen=True)
 class CostModel:
     fee_bps: float
     slippage_bps: float
-    funding_bps: float
+    funding_bps_per_8h: float
+    cash_rate_annual: float
 
     @property
-    def round_trip_cost_pct(self) -> float:
-        return ((self.fee_bps + self.slippage_bps) * 2 + self.funding_bps) / 10_000
+    def round_trip_cost(self) -> float:
+        return 2.0 * (self.fee_bps + self.slippage_bps) / 10_000.0
+
+    def funding_cost(self, action: str, horizon_hours: int) -> float:
+        if action.lower() != "sell":
+            return 0.0
+        periods = max(horizon_hours / 8.0, 0.0)
+        return periods * self.funding_bps_per_8h / 10_000.0
+
+    def cash_return(self, horizon_hours: int) -> float:
+        years = max(horizon_hours, 0) / (365.0 * 24.0)
+        return float((1.0 + self.cash_rate_annual) ** years - 1.0)
 
 
 @dataclass(frozen=True)
-class OutcomeSample:
-    outcome_id: str
+class ForwardPrices:
+    entry_time: datetime
+    exit_time: datetime
+    entry_price: float
+    exit_price: float
+
+
+@dataclass(frozen=True)
+class Recommendation:
     scorecard_id: str
     actor: str
     symbol: str
-    action: str
-    opened_at: datetime
-    closed_at: datetime
-    gross_return_pct: float
-    net_return_pct: float
-    btc_hold_return_pct: float | None
-    alpha_vs_btc_pct: float | None
+    action: Action
+    source: str
+    created_at: datetime
     conviction: float | None
-    heuristic_conviction: float | None
-    calibrated_conviction: float | None
-    factors: list[dict[str, object]]
-    data_origin: str
-    gate_conviction: str | None
+    factors: tuple[dict[str, object], ...]
+    metadata: dict[str, object]
 
 
-PriceFetcher = Callable[[datetime, datetime], tuple[float, float]]
+@dataclass(frozen=True)
+class ForwardSample:
+    scorecard_id: str
+    actor: str
+    symbol: str
+    action: Action
+    created_at: datetime
+    entry_time: datetime
+    exit_time: datetime
+    conviction: float | None
+    confidence_bucket: str
+    analyst_names: tuple[str, ...]
+    strategy_return: float
+    buy_hold_return: float
+    cash_return: float
+    excess_vs_buy_hold: float
+    excess_vs_cash: float
+    gross_directional_return: float
+    total_cost: float
+
+
+PriceFetcher = Callable[[str, datetime, int], ForwardPrices]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate TradingAgents closed-outcome edge.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate TradingAgents forward recommendation edge."
+    )
     parser.add_argument("--actor", default=None)
     parser.add_argument("--source", default=DEFAULT_SOURCE)
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--benchmark", default=DEFAULT_BENCHMARK)
     parser.add_argument("--benchmark-source", default=DEFAULT_BENCHMARK_SOURCE)
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--horizon-hours", type=int, default=DEFAULT_HORIZON_HOURS)
     parser.add_argument("--fee-bps", type=float, default=DEFAULT_FEE_BPS)
     parser.add_argument("--slippage-bps", type=float, default=DEFAULT_SLIPPAGE_BPS)
-    parser.add_argument("--funding-bps", type=float, default=DEFAULT_FUNDING_BPS)
+    parser.add_argument("--funding-bps-per-8h", type=float, default=DEFAULT_FUNDING_BPS_PER_8H)
+    parser.add_argument("--cash-rate-annual", type=float, default=DEFAULT_CASH_RATE_ANNUAL)
     parser.add_argument("--min-n", type=int, default=DEFAULT_MIN_N)
     parser.add_argument("--bucket-min-n", type=int, default=DEFAULT_BUCKET_MIN_N)
     parser.add_argument("--analyst-min-n", type=int, default=DEFAULT_ANALYST_MIN_N)
+    parser.add_argument("--fdr-alpha", type=float, default=DEFAULT_FDR_ALPHA)
     parser.add_argument("--no-write", action="store_true")
     args = parser.parse_args()
 
     report = build_report(
         actor=args.actor,
         source=args.source,
-        benchmark=args.benchmark,
         benchmark_source=args.benchmark_source,
-        costs=CostModel(args.fee_bps, args.slippage_bps, args.funding_bps),
+        horizon_hours=args.horizon_hours,
+        costs=CostModel(
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
+            funding_bps_per_8h=args.funding_bps_per_8h,
+            cash_rate_annual=args.cash_rate_annual,
+        ),
         min_n=args.min_n,
         bucket_min_n=args.bucket_min_n,
         analyst_min_n=args.analyst_min_n,
+        fdr_alpha=args.fdr_alpha,
     )
     if not args.no_write:
         report["written_files"] = write_report(report, Path(args.output_dir))
@@ -107,68 +156,76 @@ def build_report(
     *,
     actor: str | None,
     source: str,
-    benchmark: str,
     benchmark_source: str,
+    horizon_hours: int,
     costs: CostModel,
     min_n: int = DEFAULT_MIN_N,
     bucket_min_n: int = DEFAULT_BUCKET_MIN_N,
     analyst_min_n: int = DEFAULT_ANALYST_MIN_N,
+    fdr_alpha: float = DEFAULT_FDR_ALPHA,
     price_fetcher: PriceFetcher | None = None,
 ) -> dict[str, Any]:
     generated_at = datetime.now(UTC)
-    raw_rows = _load_closed_rows(actor=actor, source=source)
-    benchmark_errors: list[dict[str, str]] = []
-    samples: list[OutcomeSample] = []
-    fetcher = price_fetcher or _benchmark_price_fetcher(benchmark, benchmark_source)
-    for row in raw_rows:
-        sample = _sample_from_row(row, costs, fetcher, benchmark_errors)
+    recommendations = _load_recommendations(actor=actor, source=source)
+    fetcher = price_fetcher or _ccxt_forward_price_fetcher(benchmark_source)
+    samples: list[ForwardSample] = []
+    skipped: list[dict[str, str]] = []
+    for recommendation in recommendations:
+        sample = _evaluate_recommendation(recommendation, horizon_hours, costs, fetcher, skipped)
         if sample is not None:
             samples.append(sample)
 
-    rows = [_sample_to_row(sample) for sample in samples]
-    summary = _summary(samples, min_n=min_n)
-    calibration = _conviction_calibration(samples, bucket_min_n=bucket_min_n)
-    analysts = _analyst_attribution(samples, analyst_min_n=analyst_min_n)
-    accumulation = _accumulation_plan(samples, min_n=min_n, bucket_min_n=bucket_min_n)
-    recommendation = _recommendation(summary, calibration, analysts)
-    payload = {
+    overall = _group_stats(samples, min_n=min_n)
+    buckets = _bucket_stats(samples, min_n=bucket_min_n, fdr_alpha=fdr_alpha)
+    analysts = _analyst_stats(samples, min_n=analyst_min_n, fdr_alpha=fdr_alpha)
+    verdict, reason = _verdict(overall, min_n)
+    report = {
         "generated_at": generated_at.isoformat(),
+        "briefing": "CODEX_OLYMPUS_51_TRADINGAGENTS_EDGE",
+        "verdict": verdict,
+        "reason": reason,
         "scope": {
             "source": source,
-            "actor": actor,
-            "benchmark": benchmark,
+            "actor_filter_applied": actor is not None,
+            "horizon_hours": horizon_hours,
             "benchmark_source": benchmark_source,
+        },
+        "predeclared": {
+            "entry": "first 1h bar strictly after scorecard.created_at (t+1)",
+            "exit": "first 1h bar at or after entry_time + horizon_hours",
+            "benchmarks": ["same-symbol buy&hold", "cash"],
+            "min_n": min_n,
+            "bucket_min_n": bucket_min_n,
+            "analyst_min_n": analyst_min_n,
+            "fdr_alpha": fdr_alpha,
         },
         "cost_model": {
             "fee_bps": costs.fee_bps,
             "slippage_bps": costs.slippage_bps,
-            "funding_bps": costs.funding_bps,
-            "round_trip_cost_pct": _round(costs.round_trip_cost_pct),
-            "net_return_formula": "closed_return_pct - round_trip_cost_pct",
-            "alpha_formula": "net_return_pct - btc_hold_return_pct",
+            "funding_bps_per_8h": costs.funding_bps_per_8h,
+            "cash_rate_annual": costs.cash_rate_annual,
+            "round_trip_cost": costs.round_trip_cost,
         },
-        "sample_sufficiency": {
-            "closed_outcomes_n": len(samples),
-            "min_n_for_edge_claim": min_n,
-            "bucket_min_n_for_calibration": bucket_min_n,
-            "analyst_min_n": analyst_min_n,
-            "verdict": "INSUFFICIENT_DATA" if len(samples) < min_n else "ENOUGH_FOR_FIRST_PASS",
-            "honesty_rule": "do not claim TradingAgents edge below min_n",
+        "sample_counts": {
+            "recommendations_loaded": len(recommendations),
+            "evaluated_n": len(samples),
+            "skipped_n": len(skipped),
         },
-        "summary": summary,
-        "conviction_calibration": calibration,
-        "analyst_attribution": analysts,
-        "accumulation_plan": accumulation,
-        "recommendation": recommendation,
-        "rows": rows,
-        "benchmark_errors": benchmark_errors,
-        "disclaimer": (
-            "read-only paper evaluation; no TradingAgents, risk, execution, "
-            "or analyst gating changes"
-        ),
+        "overall": overall,
+        "buckets": buckets,
+        "analysts": analysts,
+        "private_rows": [_sample_to_private_row(sample) for sample in samples],
+        "skipped": skipped,
+        "sanitized_public_summary": _sanitized_summary(verdict, overall, buckets, analysts),
+        "safety": {
+            "mode": "read-only evaluation",
+            "orders": "disabled",
+            "wallet_or_account_access": "none",
+            "live_trading": "disabled",
+        },
     }
-    payload["human_readable"] = _markdown(payload)
-    return payload
+    report["human_readable"] = _markdown(report)
+    return report
 
 
 def write_report(report: dict[str, Any], output_dir: Path) -> dict[str, str]:
@@ -185,398 +242,416 @@ def write_report(report: dict[str, Any], output_dir: Path) -> dict[str, str]:
     return {"json": str(json_path), "markdown": str(md_path)}
 
 
-def _load_closed_rows(*, actor: str | None, source: str) -> list[sqlite3.Row]:
-    clauses = ["o.status = 'closed'", "o.source = ?"]
+def _load_recommendations(*, actor: str | None, source: str) -> list[Recommendation]:
+    clauses = ["source = ?"]
     params: list[object] = [source]
     if actor:
-        clauses.append("o.actor = ?")
+        clauses.append("actor = ?")
         params.append(actor)
     where = " where " + " and ".join(clauses)
     with connect() as conn:
-        return conn.execute(
+        rows = conn.execute(
             f"""
-            select o.outcome_id, o.scorecard_id, o.actor, o.symbol, o.source, o.action,
-                   o.opened_at, o.opened_avg_cost, o.opened_cost_basis,
-                   o.closed_at, o.closed_realized_pnl, o.closed_return_pct,
-                   s.payload_json
-            from scorecard_outcomes o
-            join scorecards s on s.scorecard_id = o.scorecard_id
+            select scorecard_id, actor, symbol, action, source, payload_json, created_at
+            from scorecards
             {where}
-            order by o.closed_at asc
+            order by created_at asc
             """,
             params,
         ).fetchall()
+    recommendations: list[Recommendation] = []
+    for row in rows:
+        recommendation = _recommendation_from_row(row)
+        if recommendation is not None:
+            recommendations.append(recommendation)
+    return recommendations
 
 
-def _sample_from_row(
-    row: sqlite3.Row,
-    costs: CostModel,
-    price_fetcher: PriceFetcher,
-    benchmark_errors: list[dict[str, str]],
-) -> OutcomeSample | None:
-    opened_at = _parse_dt(row["opened_at"])
-    closed_at = _parse_dt(row["closed_at"])
-    gross_return = _float_or_none(row["closed_return_pct"])
-    if opened_at is None or closed_at is None or gross_return is None:
+def _recommendation_from_row(row: sqlite3.Row) -> Recommendation | None:
+    created_at = _parse_dt(row["created_at"])
+    if created_at is None:
+        return None
+    action_raw = str(row["action"]).lower()
+    if action_raw not in {"buy", "sell", "hold"}:
         return None
     payload = _json_dict(row["payload_json"])
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    net_return = gross_return - costs.round_trip_cost_pct
-    btc_hold: float | None = None
-    alpha: float | None = None
-    try:
-        btc_open, btc_close = price_fetcher(opened_at, closed_at)
-        if btc_open > 0:
-            btc_hold = btc_close / btc_open - 1
-            alpha = net_return - btc_hold
-    except Exception as exc:  # noqa: BLE001
-        benchmark_errors.append({"outcome_id": str(row["outcome_id"]), "error": str(exc)})
-    return OutcomeSample(
-        outcome_id=str(row["outcome_id"]),
+    metadata = cast_dict(payload.get("metadata"))
+    conviction = (
+        _float_or_none(metadata.get("calibrated_conviction"))
+        or _float_or_none(metadata.get("heuristic_conviction"))
+        or _float_or_none(payload.get("conviction"))
+    )
+    return Recommendation(
         scorecard_id=str(row["scorecard_id"]),
         actor=str(row["actor"]),
         symbol=str(row["symbol"]),
-        action=str(row["action"]),
-        opened_at=opened_at,
-        closed_at=closed_at,
-        gross_return_pct=gross_return,
-        net_return_pct=net_return,
-        btc_hold_return_pct=btc_hold,
-        alpha_vs_btc_pct=alpha,
-        conviction=_float_or_none(payload.get("conviction")),
-        heuristic_conviction=_float_or_none(cast_dict(metadata).get("heuristic_conviction")),
-        calibrated_conviction=_float_or_none(cast_dict(metadata).get("calibrated_conviction")),
-        factors=_factors(payload),
-        data_origin=str(
-            cast_dict(metadata).get("data_origin")
-            or cast_dict(metadata).get("origin")
-            or "unknown"
-        ),
-        gate_conviction=_str_or_none(cast_dict(metadata).get("gate_conviction")),
+        action=cast(Action, action_raw),
+        source=str(row["source"]),
+        created_at=created_at,
+        conviction=conviction,
+        factors=tuple(_factors(payload)),
+        metadata=metadata,
     )
 
 
-def _benchmark_price_fetcher(benchmark: str, source: str) -> PriceFetcher:
-    cache: dict[tuple[str, str], tuple[float, float]] = {}
+def _evaluate_recommendation(
+    recommendation: Recommendation,
+    horizon_hours: int,
+    costs: CostModel,
+    price_fetcher: PriceFetcher,
+    skipped: list[dict[str, str]],
+) -> ForwardSample | None:
+    try:
+        prices = price_fetcher(recommendation.symbol, recommendation.created_at, horizon_hours)
+    except Exception as exc:  # noqa: BLE001
+        skipped.append({"scorecard_id": recommendation.scorecard_id, "reason": str(exc)})
+        return None
+    if prices.entry_price <= 0 or prices.exit_price <= 0:
+        skipped.append(
+            {"scorecard_id": recommendation.scorecard_id, "reason": "non-positive price"}
+        )
+        return None
+    gross_directional = _directional_return(
+        recommendation.action, prices.entry_price, prices.exit_price
+    )
+    total_cost = 0.0 if recommendation.action == "hold" else costs.round_trip_cost
+    total_cost += costs.funding_cost(recommendation.action, horizon_hours)
+    strategy_return = gross_directional - total_cost
+    buy_hold_return = prices.exit_price / prices.entry_price - 1.0 - costs.round_trip_cost
+    cash_return = costs.cash_return(horizon_hours)
+    return ForwardSample(
+        scorecard_id=recommendation.scorecard_id,
+        actor=recommendation.actor,
+        symbol=recommendation.symbol,
+        action=recommendation.action,
+        created_at=recommendation.created_at,
+        entry_time=prices.entry_time,
+        exit_time=prices.exit_time,
+        conviction=recommendation.conviction,
+        confidence_bucket=_confidence_bucket(recommendation.conviction),
+        analyst_names=tuple(
+            sorted(
+                {
+                    str(factor["name"])
+                    for factor in recommendation.factors
+                    if isinstance(factor.get("name"), str)
+                }
+            )
+        ),
+        strategy_return=strategy_return,
+        buy_hold_return=buy_hold_return,
+        cash_return=cash_return,
+        excess_vs_buy_hold=strategy_return - buy_hold_return,
+        excess_vs_cash=strategy_return - cash_return,
+        gross_directional_return=gross_directional,
+        total_cost=total_cost,
+    )
 
-    def fetch(opened_at: datetime, closed_at: datetime) -> tuple[float, float]:
-        start = opened_at.replace(minute=0, second=0, microsecond=0)
-        end = closed_at.replace(minute=0, second=0, microsecond=0)
-        key = (start.isoformat(), end.isoformat())
+
+def _directional_return(action: str, entry: float, exit_: float) -> float:
+    if action == "buy":
+        return exit_ / entry - 1.0
+    if action == "sell":
+        return entry / exit_ - 1.0
+    return 0.0
+
+
+def _ccxt_forward_price_fetcher(source: str) -> PriceFetcher:
+    cache: dict[tuple[str, str, int], ForwardPrices] = {}
+
+    def fetch(symbol: str, created_at: datetime, horizon_hours: int) -> ForwardPrices:
+        key = (symbol, created_at.isoformat(), horizon_hours)
         if key in cache:
             return cache[key]
         ccxt = importlib.import_module("ccxt")
         exchange = getattr(ccxt, source)({"enableRateLimit": True, "timeout": 10_000})
-        symbol = _ccxt_symbol(benchmark)
-        open_price = _ohlcv_close_at_or_before(exchange, symbol, start)
-        close_price = _ohlcv_close_at_or_before(exchange, symbol, end)
-        cache[key] = (open_price, close_price)
-        return cache[key]
+        market_symbol = _ccxt_symbol(symbol)
+        start_ms = int((created_at - timedelta(hours=1)).timestamp() * 1000)
+        limit = max(horizon_hours + 8, 30)
+        rows = exchange.fetch_ohlcv(market_symbol, "1h", since=start_ms, limit=limit)
+        prices = _forward_prices_from_ohlcv(rows, created_at, horizon_hours, market_symbol)
+        cache[key] = prices
+        return prices
 
     return fetch
 
 
-def _ohlcv_close_at_or_before(exchange: object, symbol: str, target: datetime) -> float:
-    since = int((target.timestamp() - 3 * 86_400) * 1000)
-    rows = exchange.fetch_ohlcv(symbol, "1h", since=since, limit=100)  # type: ignore[attr-defined]
+def _forward_prices_from_ohlcv(
+    rows: object,
+    created_at: datetime,
+    horizon_hours: int,
+    symbol: str,
+) -> ForwardPrices:
     if not isinstance(rows, list) or not rows:
-        raise RuntimeError(f"no benchmark OHLCV returned for {symbol}")
-    target_ms = int(target.timestamp() * 1000)
-    eligible = [
-        row
-        for row in rows
-        if isinstance(row, list) and len(row) >= 5 and int(row[0]) <= target_ms
-    ]
-    if not eligible:
-        raise RuntimeError(f"no benchmark bar at or before {target.isoformat()}")
-    return float(eligible[-1][4])
+        raise RuntimeError(f"no OHLCV returned for {symbol}")
+    parsed: list[tuple[datetime, float]] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        timestamp = _int_or_none(row[0])
+        close = _float_or_none(row[4])
+        if timestamp is None or close is None:
+            continue
+        parsed.append((datetime.fromtimestamp(timestamp / 1000, tz=UTC), close))
+    parsed.sort(key=lambda item: item[0])
+    entry = next((item for item in parsed if item[0] > created_at), None)
+    if entry is None:
+        raise RuntimeError(f"no t+1 entry bar after {created_at.isoformat()} for {symbol}")
+    target_exit = entry[0] + timedelta(hours=horizon_hours)
+    exit_row = next((item for item in parsed if item[0] >= target_exit), None)
+    if exit_row is None:
+        raise RuntimeError(f"no exit bar after {target_exit.isoformat()} for {symbol}")
+    return ForwardPrices(
+        entry_time=entry[0],
+        exit_time=exit_row[0],
+        entry_price=entry[1],
+        exit_price=exit_row[1],
+    )
 
 
-def _ccxt_symbol(symbol: str) -> str:
-    normalized = symbol.strip().upper().replace("-", "/")
-    if "/" in normalized:
-        return normalized
-    if normalized.endswith("USDT"):
-        return f"{normalized[:-4]}/USDT"
-    return normalized
-
-
-def _summary(samples: list[OutcomeSample], *, min_n: int) -> dict[str, Any]:
-    net_returns = [sample.net_return_pct for sample in samples]
-    alpha_returns = [
-        sample.alpha_vs_btc_pct for sample in samples if sample.alpha_vs_btc_pct is not None
-    ]
+def _group_stats(samples: list[ForwardSample], *, min_n: int) -> dict[str, Any]:
+    strategy = [sample.strategy_return for sample in samples]
+    buy_hold = [sample.buy_hold_return for sample in samples]
+    cash = [sample.cash_return for sample in samples]
+    excess_bh = [sample.excess_vs_buy_hold for sample in samples]
+    excess_cash = [sample.excess_vs_cash for sample in samples]
+    enough = len(samples) >= min_n
+    p_bh = _positive_sign_test_p_value(excess_bh)
+    p_cash = _positive_sign_test_p_value(excess_cash)
+    ci_bh = _bootstrap_mean_ci(excess_bh)
+    ci_cash = _bootstrap_mean_ci(excess_cash)
     return {
         "n": len(samples),
-        "benchmark_available_n": len(alpha_returns),
-        "total_gross_return_pct": _round(sum(sample.gross_return_pct for sample in samples)),
-        "total_net_return_pct": _round(sum(net_returns)),
-        "total_alpha_vs_btc_pct": _round(sum(alpha_returns)) if alpha_returns else None,
-        "avg_net_return_pct": _mean(net_returns),
-        "median_net_return_pct": _median(net_returns),
-        "net_win_rate": _share(value > 0 for value in net_returns),
-        "avg_alpha_vs_btc_pct": _mean(alpha_returns),
-        "median_alpha_vs_btc_pct": _median(alpha_returns),
-        "alpha_win_rate": _share(value > 0 for value in alpha_returns),
-        "edge_claim": (
-            "NO_CLAIM_INSUFFICIENT_DATA" if len(samples) < min_n else "FIRST_PASS_ALLOWED"
-        ),
-        "preliminary_signal": _preliminary_signal(len(samples), alpha_returns),
+        "min_n": min_n,
+        "status": "TESTED" if enough else "INSUFFICIENT",
+        "strategy": _return_stats(strategy),
+        "buy_hold": _return_stats(buy_hold),
+        "cash": _return_stats(cash),
+        "excess_vs_buy_hold": _return_stats(excess_bh),
+        "excess_vs_cash": _return_stats(excess_cash),
+        "sign_test": {
+            "method": "one-sided positive sign test",
+            "p_value_vs_buy_hold": p_bh,
+            "p_value_vs_cash": p_cash,
+        },
+        "bootstrap": {
+            "method": "iid bootstrap mean CI",
+            "mean_excess_vs_buy_hold_ci": ci_bh,
+            "mean_excess_vs_cash_ci": ci_cash,
+        },
+        "risk_adjusted": {
+            "strategy_sharpe": _sharpe(strategy),
+            "buy_hold_sharpe": _sharpe(buy_hold),
+            "cash_sharpe": _sharpe(cash),
+        },
     }
 
 
-def _conviction_calibration(
-    samples: list[OutcomeSample], *, bucket_min_n: int
-) -> dict[str, Any]:
-    buckets: dict[str, list[OutcomeSample]] = {}
+def _bucket_stats(
+    samples: list[ForwardSample], *, min_n: int, fdr_alpha: float
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], list[ForwardSample]] = {}
     for sample in samples:
-        conviction = (
-            sample.calibrated_conviction or sample.heuristic_conviction or sample.conviction
-        )
-        bucket = _conviction_bucket(conviction)
-        buckets.setdefault(bucket, []).append(sample)
-    items = []
-    for bucket in ("unknown", "0.00-0.50", "0.50-0.65", "0.65-0.80", "0.80-1.01"):
-        rows = buckets.get(bucket, [])
-        alpha = [sample.alpha_vs_btc_pct for sample in rows if sample.alpha_vs_btc_pct is not None]
-        net = [sample.net_return_pct for sample in rows]
-        items.append(
-            {
-                "bucket": bucket,
-                "n": len(rows),
-                "alpha_available_n": len(alpha),
-                "net_win_rate": _share(value > 0 for value in net),
-                "alpha_win_rate": _share(value > 0 for value in alpha),
-                "avg_alpha_vs_btc_pct": _mean(alpha),
-                "median_alpha_vs_btc_pct": _median(alpha),
-                "reliable": len(rows) >= bucket_min_n,
-            }
-        )
-    non_empty = [item for item in items if item["bucket"] != "unknown" and int(item["n"]) > 0]
-    alpha_rates = [
-        item["alpha_win_rate"] for item in non_empty if item["alpha_win_rate"] is not None
-    ]
-    monotonic = _non_decreasing(alpha_rates) if len(alpha_rates) >= 2 else None
-    return {
-        "bucket_min_n": bucket_min_n,
-        "items": items,
-        "monotonic_alpha_win_rate": monotonic,
-        "verdict": _calibration_verdict(non_empty, monotonic, bucket_min_n),
-    }
+        groups.setdefault(("symbol", sample.symbol), []).append(sample)
+        groups.setdefault(("action", sample.action), []).append(sample)
+        groups.setdefault(("confidence", sample.confidence_bucket), []).append(sample)
+    return _stats_with_fdr(groups, min_n=min_n, fdr_alpha=fdr_alpha)
 
 
-def _analyst_attribution(
-    samples: list[OutcomeSample], *, analyst_min_n: int
-) -> dict[str, Any]:
-    grouped: dict[tuple[str, str], list[OutcomeSample]] = {}
+def _analyst_stats(
+    samples: list[ForwardSample], *, min_n: int, fdr_alpha: float
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], list[ForwardSample]] = {}
     for sample in samples:
-        for factor in sample.factors:
-            name = str(factor.get("name") or "")
-            direction = str(factor.get("direction") or "")
-            if not name or direction not in {"support", "oppose", "neutral"}:
-                continue
-            grouped.setdefault((name, direction), []).append(sample)
-    items = []
-    for (name, direction), rows in sorted(grouped.items()):
-        alpha = [sample.alpha_vs_btc_pct for sample in rows if sample.alpha_vs_btc_pct is not None]
-        correct = [_factor_correct(direction, value) for value in alpha]
-        hit_rate = _share(value for value in correct if value is not None)
-        items.append(
-            {
-                "analyst": name,
-                "direction": direction,
-                "n": len(rows),
-                "alpha_available_n": len(alpha),
-                "directional_hit_rate_vs_btc": hit_rate,
-                "avg_alpha_vs_btc_pct": _mean(alpha),
-                "median_alpha_vs_btc_pct": _median(alpha),
-                "reliable": len(rows) >= analyst_min_n,
-                "preliminary_label": _analyst_label(len(rows), hit_rate, analyst_min_n),
-            }
-        )
-    return {
-        "analyst_min_n": analyst_min_n,
-        "items": items,
-        "noise_candidates": [
-            item for item in items if item["preliminary_label"] in {"possible_noise", "wrong_way"}
-        ],
-        "guardrail": "human gate only; do not auto-remove analysts from TradingAgents",
-    }
+        for analyst in sample.analyst_names:
+            groups.setdefault(("analyst", analyst), []).append(sample)
+    return _stats_with_fdr(groups, min_n=min_n, fdr_alpha=fdr_alpha)
 
 
-def _accumulation_plan(
-    samples: list[OutcomeSample], *, min_n: int, bucket_min_n: int
-) -> dict[str, Any]:
-    n = len(samples)
-    closed_dates = sorted(sample.closed_at for sample in samples)
-    rate_per_day: float | None = None
-    days_to_min: float | None = None
-    if len(closed_dates) >= 2:
-        span_days = max((closed_dates[-1] - closed_dates[0]).total_seconds() / 86_400, 1 / 24)
-        rate_per_day = len(closed_dates) / span_days
-        if rate_per_day > 0 and n < min_n:
-            days_to_min = (min_n - n) / rate_per_day
-    return {
-        "current_closed_outcomes": n,
-        "min_n_for_first_edge_claim": min_n,
-        "remaining_to_min_n": max(min_n - n, 0),
-        "bucket_min_n": bucket_min_n,
-        "observed_closed_outcomes_per_day": (
-            _round(rate_per_day) if rate_per_day is not None else None
-        ),
-        "estimated_days_to_min_n": _round(days_to_min) if days_to_min is not None else None,
-        "primary_path": (
-            "continue paper feedback bootstrap; do not lower safety gates just to create samples"
-        ),
-        "optional_shadow_replay": (
-            "small bounded historical replay only; each replay may require one "
-            "TradingAgents/LLM call, "
-            "so do not run large batches without explicit cost approval"
-        ),
-    }
+def _stats_with_fdr(
+    groups: dict[tuple[str, str], list[ForwardSample]], *, min_n: int, fdr_alpha: float
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    p_values: list[float] = []
+    tested_indices: list[int] = []
+    for (kind, name), group_samples in sorted(groups.items()):
+        stats = _group_stats(group_samples, min_n=min_n)
+        row = {
+            "kind": kind,
+            "name": name,
+            "n": len(group_samples),
+            "min_n": min_n,
+            "status": stats["status"],
+            "median_excess_vs_buy_hold": stats["excess_vs_buy_hold"]["median"],
+            "median_excess_vs_cash": stats["excess_vs_cash"]["median"],
+            "win_rate_vs_buy_hold": stats["excess_vs_buy_hold"]["win_rate"],
+            "win_rate_vs_cash": stats["excess_vs_cash"]["win_rate"],
+            "p_value_vs_buy_hold": stats["sign_test"]["p_value_vs_buy_hold"],
+            "p_value_vs_cash": stats["sign_test"]["p_value_vs_cash"],
+            "bh_fdr_discovery": False,
+        }
+        if stats["status"] == "TESTED":
+            tested_indices.append(len(rows))
+            p_values.append(max(float(row["p_value_vs_buy_hold"]), float(row["p_value_vs_cash"])))
+        rows.append(row)
+    discoveries = _benjamini_hochberg(p_values, alpha=fdr_alpha)
+    for passed, row_index in zip(discoveries, tested_indices, strict=True):
+        rows[row_index]["bh_fdr_discovery"] = passed
+    return rows
 
 
-def _recommendation(
-    summary: dict[str, Any],
-    calibration: dict[str, Any],
-    analysts: dict[str, Any],
-) -> dict[str, str]:
-    if summary["edge_claim"] == "NO_CLAIM_INSUFFICIENT_DATA":
-        status = "insufficient_data_continue_bootstrap"
-        reason = "closed-outcome sample is below the minimum required for an edge claim"
-    elif (
-        summary.get("median_alpha_vs_btc_pct") is not None
-        and summary["median_alpha_vs_btc_pct"] > 0
+def _verdict(overall: dict[str, Any], min_n: int) -> tuple[AgentVerdict, str]:
+    if int(overall["n"]) < min_n:
+        return "INSUFFICIENT", "recommendation sample is below the predeclared minimum N"
+    median_bh = float(overall["excess_vs_buy_hold"]["median"] or 0.0)
+    median_cash = float(overall["excess_vs_cash"]["median"] or 0.0)
+    p_bh = float(overall["sign_test"]["p_value_vs_buy_hold"])
+    p_cash = float(overall["sign_test"]["p_value_vs_cash"])
+    ci_bh = cast(dict[str, float | None], overall["bootstrap"]["mean_excess_vs_buy_hold_ci"])
+    ci_cash = cast(dict[str, float | None], overall["bootstrap"]["mean_excess_vs_cash_ci"])
+    strategy_sharpe = float(overall["risk_adjusted"]["strategy_sharpe"])
+    buy_hold_sharpe = float(overall["risk_adjusted"]["buy_hold_sharpe"])
+    if (
+        median_bh > 0.0
+        and median_cash > 0.0
+        and p_bh <= 0.05
+        and p_cash <= 0.05
+        and (ci_bh["p05"] or 0.0) > 0.0
+        and (ci_cash["p05"] or 0.0) > 0.0
+        and strategy_sharpe > buy_hold_sharpe
     ):
-        status = "first_pass_positive_but_human_review_required"
-        reason = "median alpha is positive after costs, but promotion still requires human review"
-    else:
-        status = "no_edge_detected"
-        reason = "net alpha versus BTC hold is not positive after costs"
-    if calibration["verdict"] == "NOT_MONOTONIC":
-        reason += "; conviction is not monotonically calibrated"
-    if analysts["noise_candidates"]:
-        reason += "; some analyst signals look like possible noise but require human gate"
+        return "AGENT_EDGE", "forward recommendations beat buy&hold and cash after costs"
+    return "NO_EDGE", "recommendations did not pass the full-cost benchmark and significance gates"
+
+
+def _return_stats(values: list[float]) -> dict[str, float | int | None]:
     return {
-        "status": status,
-        "reason": reason,
-        "decision_policy": "report only; no TradingAgents, risk, execution, or analyst changes",
+        "n": len(values),
+        "mean": _round(statistics.fmean(values)) if values else None,
+        "median": _round(statistics.median(values)) if values else None,
+        "total": _round(sum(values)) if values else None,
+        "win_rate": _share([value > 0.0 for value in values]),
+        "stdev": _round(statistics.stdev(values)) if len(values) >= 2 else None,
+    }
+
+
+def _positive_sign_test_p_value(values: list[float]) -> float:
+    non_zero = [value for value in values if value != 0.0]
+    n = len(non_zero)
+    if n == 0:
+        return 1.0
+    wins = sum(1 for value in non_zero if value > 0.0)
+    return min(1.0, float(sum(math.comb(n, k) for k in range(wins, n + 1)) / (2**n)))
+
+
+def _bootstrap_mean_ci(
+    values: list[float], *, iterations: int = 1000, seed: int = 51
+) -> dict[str, float | None]:
+    if not values:
+        return {"p05": None, "p50": None, "p95": None}
+    rng = random.Random(seed)
+    means = sorted(statistics.fmean(rng.choice(values) for _ in values) for _ in range(iterations))
+    return {
+        "p05": _round(means[int(iterations * 0.05)]),
+        "p50": _round(means[int(iterations * 0.50)]),
+        "p95": _round(means[int(iterations * 0.95)]),
+    }
+
+
+def _benjamini_hochberg(p_values: list[float], *, alpha: float) -> list[bool]:
+    indexed = sorted(enumerate(p_values), key=lambda item: item[1])
+    passed = [False for _ in p_values]
+    max_rank = -1
+    tests = len(indexed)
+    for rank, (_index, p_value) in enumerate(indexed, start=1):
+        if p_value <= alpha * rank / tests:
+            max_rank = rank
+    if max_rank >= 1:
+        for rank, (index, _p_value) in enumerate(indexed, start=1):
+            if rank <= max_rank:
+                passed[index] = True
+    return passed
+
+
+def _sharpe(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    stdev = statistics.stdev(values)
+    if stdev == 0.0:
+        return 0.0
+    return _round(statistics.fmean(values) / stdev * math.sqrt(len(values))) or 0.0
+
+
+def _sanitized_summary(
+    verdict: AgentVerdict,
+    overall: dict[str, Any],
+    buckets: list[dict[str, Any]],
+    analysts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "verdict": verdict,
+        "overall_n": overall["n"],
+        "overall_status": overall["status"],
+        "bucket_groups": len(buckets),
+        "analyst_groups": len(analysts),
+        "contains_actor_or_recommendation_rows": False,
     }
 
 
 def _markdown(report: dict[str, Any]) -> str:
-    summary = report["summary"]
-    suff = report["sample_sufficiency"]
-    rec = report["recommendation"]
+    overall = cast(dict[str, Any], report["overall"])
     lines = [
         "# TradingAgents Edge Report",
         "",
         f"Generated: `{report['generated_at']}`",
-        f"Source: `{report['scope']['source']}`",
-        f"Benchmark: `{report['scope']['benchmark']}` via `{report['scope']['benchmark_source']}`",
+        f"Verdict: `{report['verdict']}`",
+        f"Reason: {report['reason']}",
         "",
-        "## Recommendation",
+        "## Discipline",
         "",
-        f"- Status: `{rec['status']}`",
-        f"- Reason: {rec['reason']}",
-        f"- Policy: {rec['decision_policy']}",
+        "- Inputs are recorded scorecards only; no LLM calls and no order path.",
+        "- Entry is the first 1h bar strictly after recommendation creation.",
+        "- Benchmarks are same-symbol buy&hold and cash.",
+        "- Costs include fee, slippage, and short funding when configured.",
+        "- Bucket and analyst tests are BH-FDR adjusted.",
         "",
-        "## Sample Sufficiency",
+        "## Overall",
         "",
-        f"- Closed outcomes: `{suff['closed_outcomes_n']}`",
-        f"- Minimum for edge claim: `{suff['min_n_for_edge_claim']}`",
-        f"- Verdict: `{suff['verdict']}`",
+        f"- N: `{overall['n']}` / min `{overall['min_n']}`",
+        f"- Status: `{overall['status']}`",
+        f"- Median excess vs buy&hold: `{overall['excess_vs_buy_hold']['median']}`",
+        f"- Median excess vs cash: `{overall['excess_vs_cash']['median']}`",
+        f"- p vs buy&hold: `{overall['sign_test']['p_value_vs_buy_hold']}`",
+        f"- p vs cash: `{overall['sign_test']['p_value_vs_cash']}`",
         "",
-        "## Net Cost vs BTC Hold",
+        "## Limits",
         "",
-        "| Metric | Value |",
-        "| --- | ---: |",
+        "- Full recommendation rows and actors are private-only.",
+        "- Public summary is sanitized and excludes actor/recommendation rows.",
+        "- Evaluation quality depends on historical OHLCV coverage after each recommendation.",
     ]
-    for key in (
-        "n",
-        "benchmark_available_n",
-        "total_gross_return_pct",
-        "total_net_return_pct",
-        "total_alpha_vs_btc_pct",
-        "median_net_return_pct",
-        "median_alpha_vs_btc_pct",
-        "net_win_rate",
-        "alpha_win_rate",
-    ):
-        lines.append(f"| {key} | {summary.get(key)} |")
-    lines.extend(["", "## Conviction Calibration", ""])
-    lines.extend(
-        [
-            "| Bucket | N | Alpha N | Net win | Alpha win | Median alpha | Reliable |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
-        ]
-    )
-    for item in report["conviction_calibration"]["items"]:
-        lines.append(
-            "| {bucket} | {n} | {alpha_available_n} | {net_win_rate} | {alpha_win_rate} | "
-            "{median_alpha_vs_btc_pct} | {reliable} |".format(**item)
-        )
-    lines.extend(["", "## Analyst Attribution", ""])
-    lines.extend(
-        [
-            "| Analyst | Direction | N | Alpha N | Hit vs BTC | Median alpha | Label | Reliable |",
-            "| --- | --- | ---: | ---: | ---: | ---: | --- | --- |",
-        ]
-    )
-    for item in report["analyst_attribution"]["items"]:
-        lines.append(
-            "| {analyst} | {direction} | {n} | {alpha_available_n} | "
-            "{directional_hit_rate_vs_btc} | {median_alpha_vs_btc_pct} | "
-            "{preliminary_label} | {reliable} |".format(**item)
-        )
-    lines.extend(
-        [
-            "",
-            "## Accumulation Plan",
-            "",
-        ]
-    )
-    for key, value in report["accumulation_plan"].items():
-        lines.append(f"- {key}: `{value}`")
-    lines.extend(
-        [
-            "",
-            "## Cost Assumptions",
-            "",
-            f"- Fee bps: `{report['cost_model']['fee_bps']}`",
-            f"- Slippage bps: `{report['cost_model']['slippage_bps']}`",
-            f"- Funding bps: `{report['cost_model']['funding_bps']}`",
-            f"- Round-trip cost pct: `{report['cost_model']['round_trip_cost_pct']}`",
-            "",
-            "## Limits",
-            "",
-            "- Read-only paper evaluation; no decision path changed.",
-            "- BTC benchmark depends on public OHLCV availability.",
-            "- Small n must be treated as directional only, not statistical proof.",
-        ]
-    )
     return "\n".join(lines) + "\n"
 
 
-def _sample_to_row(sample: OutcomeSample) -> dict[str, Any]:
+def _sample_to_private_row(sample: ForwardSample) -> dict[str, Any]:
     return {
-        "outcome_id": sample.outcome_id,
         "scorecard_id": sample.scorecard_id,
         "actor": sample.actor,
         "symbol": sample.symbol,
         "action": sample.action,
-        "opened_at": sample.opened_at.isoformat(),
-        "closed_at": sample.closed_at.isoformat(),
-        "gross_return_pct": _round(sample.gross_return_pct),
-        "net_return_pct": _round(sample.net_return_pct),
-        "btc_hold_return_pct": _round(sample.btc_hold_return_pct),
-        "alpha_vs_btc_pct": _round(sample.alpha_vs_btc_pct),
+        "created_at": sample.created_at.isoformat(),
+        "entry_time": sample.entry_time.isoformat(),
+        "exit_time": sample.exit_time.isoformat(),
         "conviction": sample.conviction,
-        "heuristic_conviction": sample.heuristic_conviction,
-        "calibrated_conviction": sample.calibrated_conviction,
-        "factors": sample.factors,
-        "data_origin": sample.data_origin,
-        "gate_conviction": sample.gate_conviction,
+        "confidence_bucket": sample.confidence_bucket,
+        "analyst_names": list(sample.analyst_names),
+        "strategy_return": _round(sample.strategy_return),
+        "buy_hold_return": _round(sample.buy_hold_return),
+        "cash_return": _round(sample.cash_return),
+        "excess_vs_buy_hold": _round(sample.excess_vs_buy_hold),
+        "excess_vs_cash": _round(sample.excess_vs_cash),
+        "gross_directional_return": _round(sample.gross_directional_return),
+        "total_cost": _round(sample.total_cost),
     }
 
 
@@ -614,25 +689,12 @@ def _factors(payload: dict[str, object]) -> list[dict[str, object]]:
             continue
         name = item.get("name")
         direction = item.get("direction")
-        if isinstance(name, str) and direction in {"support", "oppose", "neutral"}:
+        if isinstance(name, str):
             factors.append({"name": name, "direction": direction, "score": item.get("score")})
     return factors
 
 
-def _float_or_none(value: object) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _str_or_none(value: object) -> str | None:
-    return str(value) if value is not None else None
-
-
-def _conviction_bucket(value: float | None) -> str:
+def _confidence_bucket(value: float | None) -> str:
     if value is None:
         return "unknown"
     if value < 0.5:
@@ -644,73 +706,40 @@ def _conviction_bucket(value: float | None) -> str:
     return "0.80-1.01"
 
 
-def _factor_correct(direction: str, alpha: float) -> bool | None:
-    if direction == "support":
-        return alpha > 0
-    if direction == "oppose":
-        return alpha <= 0
+def _ccxt_symbol(symbol: str) -> str:
+    normalized = symbol.strip().upper().replace("-", "/")
+    if "/" in normalized:
+        return normalized
+    for quote in ("USDT", "USDC", "USD"):
+        if normalized.endswith(quote) and len(normalized) > len(quote):
+            return f"{normalized[:-len(quote)]}/{quote}"
+    return normalized
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float | str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
     return None
 
 
-def _analyst_label(n: int, hit_rate: float | None, analyst_min_n: int) -> str:
-    if n < analyst_min_n:
-        return "insufficient_data"
-    if hit_rate is None:
-        return "not_directional"
-    if hit_rate >= 0.6:
-        return "possible_signal"
-    if hit_rate <= 0.4:
-        return "wrong_way"
-    return "possible_noise"
-
-
-def _calibration_verdict(
-    items: list[dict[str, Any]], monotonic: bool | None, bucket_min_n: int
-) -> str:
-    if sum(int(item["n"]) for item in items) == 0:
-        return "NO_DATA"
-    if any(int(item["n"]) < bucket_min_n for item in items):
-        return "INSUFFICIENT_BUCKET_DATA"
-    if monotonic is False:
-        return "NOT_MONOTONIC"
-    if monotonic is True:
-        return "MONOTONIC"
-    return "INSUFFICIENT_BUCKET_SPREAD"
-
-
-def _preliminary_signal(n: int, alpha_returns: list[float]) -> str:
-    if n == 0:
-        return "no_closed_outcomes"
-    if not alpha_returns:
-        return "benchmark_unavailable"
-    median = statistics.median(alpha_returns)
-    if median > 0:
-        return "positive_but_unreliable" if n < DEFAULT_MIN_N else "positive_first_pass"
-    if median < 0:
-        return "negative_but_unreliable" if n < DEFAULT_MIN_N else "negative_first_pass"
-    return "flat_or_inconclusive"
-
-
-def _non_decreasing(values: list[float | None]) -> bool | None:
-    concrete = [value for value in values if value is not None]
-    if len(concrete) < 2:
+def _share(values: list[bool]) -> float | None:
+    if not values:
         return None
-    return all(right >= left for left, right in zip(concrete, concrete[1:], strict=False))
-
-
-def _mean(values: list[float]) -> float | None:
-    return _round(statistics.fmean(values)) if values else None
-
-
-def _median(values: list[float]) -> float | None:
-    return _round(statistics.median(values)) if values else None
-
-
-def _share(values: Iterable[bool]) -> float | None:
-    concrete = list(values)
-    if not concrete:
-        return None
-    return _round(sum(1 for value in concrete if value) / len(concrete))
+    return _round(sum(1 for value in values if value) / len(values))
 
 
 def _round(value: float | None) -> float | None:

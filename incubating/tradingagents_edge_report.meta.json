@@ -1,0 +1,31 @@
+{
+  "briefing": "CODEX_OLYMPUS_51_TRADINGAGENTS_EDGE",
+  "status": "research_harness_public_only",
+  "verdict_values": [
+    "AGENT_EDGE",
+    "NO_EDGE",
+    "INSUFFICIENT"
+  ],
+  "discipline": {
+    "input": "recorded TradingAgents scorecards from orchestrator db",
+    "execution": "first 1h bar strictly after scorecard.created_at, then predeclared horizon",
+    "benchmarks": [
+      "same-symbol buy-and-hold",
+      "cash"
+    ],
+    "costs": "fee, slippage, and short funding when configured",
+    "statistics": "one-sided positive sign test, bootstrap mean CI, BH-FDR for bucket and analyst groups",
+    "minimum_samples": "overall min N plus separate bucket/analyst min N gates",
+    "safety": "read-only; no LLM calls, live trading, orders, wallet, or account path"
+  },
+  "public_boundary": {
+    "recommendation_rows": "excluded",
+    "actors": "excluded",
+    "private_results": "~/aegis-strategies/incubating/olympus51/",
+    "credentials": "excluded"
+  },
+  "commands": {
+    "unit": "pytest -q services/orchestrator/tests/test_tradingagents_edge_report.py",
+    "private_evidence": "python scripts/tradingagents_edge_report.py"
+  }
+}
