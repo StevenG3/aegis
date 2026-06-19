@@ -426,34 +426,19 @@ class IBKRClient:
         if hasattr(ib, "reqMarketDataType"):
             ib.reqMarketDataType(market_data_type)
         tickers: list[Any] = []
+        failed_rows: list[dict[str, str | None]] = []
         for pos in positions:
             symbol = str(pos.get("symbol", "")).upper().strip()
             if not symbol:
                 continue
             contract = Stock(symbol, "SMART", "USD")
-            old_timeout = getattr(ib, "RequestTimeout", None)
-            if hasattr(ib, "RequestTimeout") and not old_timeout:
-                ib.RequestTimeout = self._config.timeout_sec
             try:
-                qualified = ib.qualifyContracts(contract)
-            except Exception:
-                logger.warning(
-                    "IBKR contract qualification failed symbol=%s",
-                    symbol,
-                    exc_info=True,
-                )
-                continue
-            finally:
-                if hasattr(ib, "RequestTimeout"):
-                    ib.RequestTimeout = old_timeout
-            if not qualified:
-                continue
-            try:
-                tickers.append(ib.reqMktData(qualified[0], "", False, False))
+                tickers.append(ib.reqMktData(contract, "", False, False))
             except Exception:
                 logger.warning("IBKR market data request failed symbol=%s", symbol, exc_info=True)
+                failed_rows.append(self._empty_market_data_row(symbol))
         ib.sleep(3.0)
-        rows = [self._ticker_to_snapshot_row(ticker) for ticker in tickers]
+        rows = [self._ticker_to_snapshot_row(ticker) for ticker in tickers] + failed_rows
         for ticker in tickers:
             try:
                 if hasattr(ib, "cancelMktData"):
@@ -461,6 +446,20 @@ class IBKRClient:
             except Exception:
                 logger.debug("IBKR cancelMktData failed", exc_info=True)
         return rows
+
+    @staticmethod
+    def _empty_market_data_row(symbol: str) -> dict[str, str | None]:
+        return {
+            "symbol": symbol,
+            "con_id": "",
+            "currency": "USD",
+            "last": None,
+            "close": None,
+            "bid": None,
+            "ask": None,
+            "market_price": None,
+            "price_source": None,
+        }
 
     def _ticker_to_snapshot_row(self, ticker: Any) -> dict[str, str | None]:
         contract = getattr(ticker, "contract", object())
