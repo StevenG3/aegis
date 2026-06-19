@@ -6,7 +6,6 @@ import datetime as dt
 import importlib
 import json
 import time
-from pathlib import Path
 from typing import Any
 
 from aegis.btc_price_action_reeval import (
@@ -17,13 +16,14 @@ from aegis.btc_price_action_reeval import (
     run_price_action_definitive,
 )
 from aegis.combo_indicator_search import ComboBar, ComboCostModel
+from aegis.private_paths import private_dir_from_cli
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run Olympus #49B definitive pooled 4H price-action evaluation."
     )
-    parser.add_argument("--private-dir", required=True)
+    parser.add_argument("--private-dir", default=None)
     parser.add_argument("--exchange", default="okx")
     parser.add_argument("--symbols", default="BTC/USDT,ETH/USDT,SOL/USDT")
     parser.add_argument("--funding-symbols", default="BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT")
@@ -200,7 +200,7 @@ def main() -> int:
         "wallet_or_order_api_used": False,
         "report": definitive_report_to_dict(report),
     }
-    output_dir = Path(args.private_dir)
+    output_dir = private_dir_from_cli(args.private_dir, default_task="olympus49b")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / (
         f"price-action-definitive-"

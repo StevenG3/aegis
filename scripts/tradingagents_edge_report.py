@@ -4,7 +4,6 @@ import argparse
 import importlib
 import json
 import math
-import os
 import random
 import sqlite3
 import statistics
@@ -15,18 +14,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from aegis.private_paths import private_dir_from_cli
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ORCHESTRATOR_DIR = REPO_ROOT / "services" / "orchestrator"
 sys.path.insert(0, str(ORCHESTRATOR_DIR))
 
 from db import connect  # noqa: E402
 
-DEFAULT_OUTPUT_DIR = Path(
-    os.getenv(
-        "OLYMPUS_EVIDENCE_DIR",
-        str(Path.home() / "aegis-strategies" / "incubating" / "olympus51"),
-    )
-)
 DEFAULT_SOURCE = "tradingagents"
 DEFAULT_BENCHMARK_SOURCE = "binance"
 DEFAULT_HORIZON_HOURS = 24
@@ -108,6 +103,11 @@ class ForwardSample:
 
 
 PriceFetcher = Callable[[str, datetime, int], ForwardPrices]
+RecommendationLoader = Callable[..., list[Recommendation]]
+
+
+class EmptyDataSourceError(RuntimeError):
+    pass
 
 
 def main() -> int:
@@ -117,7 +117,7 @@ def main() -> int:
     parser.add_argument("--actor", default=None)
     parser.add_argument("--source", default=DEFAULT_SOURCE)
     parser.add_argument("--benchmark-source", default=DEFAULT_BENCHMARK_SOURCE)
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--horizon-hours", type=int, default=DEFAULT_HORIZON_HOURS)
     parser.add_argument("--fee-bps", type=float, default=DEFAULT_FEE_BPS)
     parser.add_argument("--slippage-bps", type=float, default=DEFAULT_SLIPPAGE_BPS)
@@ -130,24 +130,40 @@ def main() -> int:
     parser.add_argument("--no-write", action="store_true")
     args = parser.parse_args()
 
-    report = build_report(
-        actor=args.actor,
-        source=args.source,
-        benchmark_source=args.benchmark_source,
-        horizon_hours=args.horizon_hours,
-        costs=CostModel(
-            fee_bps=args.fee_bps,
-            slippage_bps=args.slippage_bps,
-            funding_bps_per_8h=args.funding_bps_per_8h,
-            cash_rate_annual=args.cash_rate_annual,
-        ),
-        min_n=args.min_n,
-        bucket_min_n=args.bucket_min_n,
-        analyst_min_n=args.analyst_min_n,
-        fdr_alpha=args.fdr_alpha,
-    )
+    try:
+        report = build_report(
+            actor=args.actor,
+            source=args.source,
+            benchmark_source=args.benchmark_source,
+            horizon_hours=args.horizon_hours,
+            costs=CostModel(
+                fee_bps=args.fee_bps,
+                slippage_bps=args.slippage_bps,
+                funding_bps_per_8h=args.funding_bps_per_8h,
+                cash_rate_annual=args.cash_rate_annual,
+            ),
+            min_n=args.min_n,
+            bucket_min_n=args.bucket_min_n,
+            analyst_min_n=args.analyst_min_n,
+            fdr_alpha=args.fdr_alpha,
+        )
+    except EmptyDataSourceError as exc:
+        print(
+            json.dumps(
+                {
+                    "error": "EMPTY_DATA_SOURCE",
+                    "reason": str(exc),
+                    "hint": "Connect the real orchestrator database before rerunning.",
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     if not args.no_write:
-        report["written_files"] = write_report(report, Path(args.output_dir))
+        output_dir = private_dir_from_cli(args.output_dir, default_task="olympus51")
+        report["written_files"] = write_report(report, output_dir)
     print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
     return 0
 
@@ -164,9 +180,16 @@ def build_report(
     analyst_min_n: int = DEFAULT_ANALYST_MIN_N,
     fdr_alpha: float = DEFAULT_FDR_ALPHA,
     price_fetcher: PriceFetcher | None = None,
+    recommendation_loader: RecommendationLoader | None = None,
 ) -> dict[str, Any]:
     generated_at = datetime.now(UTC)
-    recommendations = _load_recommendations(actor=actor, source=source)
+    loader = recommendation_loader or _load_recommendations
+    recommendations = loader(actor=actor, source=source)
+    if not recommendations:
+        raise EmptyDataSourceError(
+            "TradingAgents recommendation source returned 0 rows for "
+            f"source={source!r}. This is a data-source/configuration error, not INSUFFICIENT."
+        )
     fetcher = price_fetcher or _ccxt_forward_price_fetcher(benchmark_source)
     samples: list[ForwardSample] = []
     skipped: list[dict[str, str]] = []

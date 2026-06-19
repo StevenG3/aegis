@@ -25,6 +25,7 @@ from aegis.polymarket_tail_backtest import (
     positions_to_dict,
     summarize_tail_backtest,
 )
+from aegis.private_paths import private_dir_from_cli
 
 
 def main() -> int:
@@ -33,7 +34,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--private-dir",
-        default="/home/gggqqy/apps/aegis-strategies/incubating/olympus42",
+        default=None,
         help="Private output directory outside the public aegis repository.",
     )
     parser.add_argument("--survivor-power-json", default=None)
@@ -55,7 +56,7 @@ def main() -> int:
     args = parser.parse_args()
 
     started = time.monotonic()
-    private_dir = Path(args.private_dir)
+    private_dir = private_dir_from_cli(args.private_dir, default_task="olympus42")
     output_dir = private_dir / "tailaware_backtest"
     output_dir.mkdir(parents=True, exist_ok=True)
     survivor_gate = _load_survivor_gate(args.survivor_power_json, private_dir)

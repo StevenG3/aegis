@@ -18,6 +18,7 @@ from aegis.polymarket_onchain import (
     parse_trade,
     survivor_power_coverage_to_dict,
 )
+from aegis.private_paths import private_dir_from_cli
 
 
 def main() -> int:
@@ -26,7 +27,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--private-dir",
-        default="/home/gggqqy/apps/aegis-strategies/incubating/olympus42",
+        default=None,
         help="Private output directory outside the public aegis repository.",
     )
     parser.add_argument("--max-markets", type=int, default=1_000)
@@ -41,7 +42,7 @@ def main() -> int:
     args = parser.parse_args()
 
     started = time.monotonic()
-    private_dir = Path(args.private_dir)
+    private_dir = private_dir_from_cli(args.private_dir, default_task="olympus42")
     output_dir = private_dir / "survivor_power"
     output_dir.mkdir(parents=True, exist_ok=True)
     client = PolymarketDataApiClient(timeout_seconds=float(args.timeout_seconds))

@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+from aegis.private_paths import private_dir_from_cli
+
 SERVICE_DIR = Path(__file__).resolve().parents[1] / "services" / "backtest-service"
 sys.path.insert(0, str(SERVICE_DIR))
 
@@ -25,12 +27,6 @@ DEFAULT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 DEFAULT_SOURCE: FundingSource = "bybit"
 DEFAULT_START = "2023-07-01"
 DEFAULT_END = "2026-01-01"
-DEFAULT_OUTPUT_DIR = Path(
-    os.getenv(
-        "OLYMPUS_EVIDENCE_DIR",
-        str(Path.home() / "aegis-strategies" / "incubating" / "olympus50"),
-    )
-)
 
 
 @dataclass(frozen=True)
@@ -179,7 +175,10 @@ def _run_from_env() -> EvidenceRun:
         slippage_bps=_env_float("FUNDING_ARB_EVIDENCE_SLIPPAGE_BPS", 2.0),
         basis_cost_bps=_env_float("FUNDING_ARB_EVIDENCE_BASIS_COST_BPS", 0.0),
         borrow_cost_bps_annual=_env_float("FUNDING_ARB_EVIDENCE_BORROW_COST_BPS_ANNUAL", 0.0),
-        output_dir=Path(os.getenv("FUNDING_ARB_EVIDENCE_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR))),
+        output_dir=private_dir_from_cli(
+            os.getenv("FUNDING_ARB_EVIDENCE_OUTPUT_DIR"),
+            default_task="olympus50",
+        ),
     )
 
 

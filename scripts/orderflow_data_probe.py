@@ -3,21 +3,15 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from aegis.private_paths import private_dir_from_cli
+
 DEFAULT_EXCHANGES = ("binance", "okx", "bybit")
 DEFAULT_SYMBOL = "BTC/USDT"
 DEFAULT_SWAP_SYMBOL = "BTC/USDT:USDT"
-DEFAULT_OUTPUT_DIR = Path(
-    os.getenv(
-        "OLYMPUS_EVIDENCE_DIR",
-        str(Path(__file__).resolve().parents[2] / "aegis-strategies" / "incubating"),
-    )
-)
-
 
 class ExchangeLike(Protocol):
     has: dict[str, object]
@@ -47,7 +41,7 @@ def main() -> int:
     parser.add_argument("--trade-limit", type=int, default=20)
     parser.add_argument("--book-limit", type=int, default=50)
     parser.add_argument("--since-hours", type=int, default=24)
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-write", action="store_true")
     args = parser.parse_args()
 
@@ -62,7 +56,8 @@ def main() -> int:
         since_hours=args.since_hours,
     )
     if not args.no_write:
-        report["written_files"] = write_report(report, Path(args.output_dir))
+        output_dir = private_dir_from_cli(args.output_dir, default_task="orderflow")
+        report["written_files"] = write_report(report, output_dir)
     print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
     return 0
 

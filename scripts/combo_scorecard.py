@@ -7,18 +7,18 @@ import importlib
 import json
 import time
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
 from aegis.combo_indicator_search import ComboBar, ComboCostModel
 from aegis.combo_scorecard import ScorecardConfig, report_to_dict, run_combo_scorecard
+from aegis.private_paths import private_dir_from_cli
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the read-only Olympus #46 predeclared combo scorecard study."
     )
-    parser.add_argument("--private-dir", required=True)
+    parser.add_argument("--private-dir", default=None)
     parser.add_argument("--exchange", default="binance")
     parser.add_argument(
         "--symbols",
@@ -128,7 +128,7 @@ def main() -> int:
         "wallet_or_order_api_used": False,
         "report": report_to_dict(report),
     }
-    output_dir = Path(args.private_dir)
+    output_dir = private_dir_from_cli(args.private_dir, default_task="olympus46")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"combo-scorecard-{dt.datetime.now(dt.UTC):%Y%m%dT%H%M%SZ}.json"
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

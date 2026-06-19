@@ -31,13 +31,17 @@ def test_predeclared_pilot_universe_loads_from_metadata() -> None:
     assert any(company["status"] == "bankrupt_delisted" for company in companies)
 
 
-def test_default_matrix_out_uses_private_incubating_path(monkeypatch) -> None:
+def test_default_matrix_out_uses_private_incubating_path(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     module = load_ingest_script()
+    private_root = tmp_path / "aegis-strategies"
+    private_root.mkdir()
+    monkeypatch.setenv("AEGIS_STRATEGIES_ROOT", str(private_root))
     monkeypatch.delenv("AEGIS_EDGAR_MATRIX_OUT", raising=False)
 
-    assert str(module._default_matrix_out()).endswith(
-        "apps/aegis-strategies/incubating/olympus37/matrix.json"
-    )
+    assert module._default_matrix_out() == private_root / "incubating" / "olympus37" / "matrix.json"
 
 
 def test_matrix_out_can_be_disabled_with_empty_env(monkeypatch) -> None:
@@ -64,7 +68,11 @@ def test_main_writes_matrix_out_with_missing_derived_cells(
         ),
         encoding="utf-8",
     )
-    matrix_out = tmp_path / "matrix.json"
+    private_root = tmp_path / "aegis-strategies"
+    private_root.mkdir()
+    monkeypatch.setenv("AEGIS_STRATEGIES_ROOT", str(private_root))
+    matrix_out = private_root / "incubating" / "olympus37" / "matrix.json"
+    coverage_out = private_root / "incubating" / "olympus37" / "coverage.json"
 
     class FakeClient:
         def fetch_submissions(self, cik: str, *, force: bool = False) -> dict[str, object]:
@@ -120,7 +128,7 @@ def test_main_writes_matrix_out_with_missing_derived_cells(
             "--matrix-out",
             str(matrix_out),
             "--coverage-out",
-            str(tmp_path / "coverage.json"),
+            str(coverage_out),
         ],
     )
 
