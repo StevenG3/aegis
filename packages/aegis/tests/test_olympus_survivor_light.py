@@ -6,14 +6,20 @@ from pathlib import Path
 
 import pytest
 
-from aegis.edgar_pit import PitFundamentalStore, derive_net_debt
+from aegis.edgar_pit import DelistingAwarePriceSource, PitFundamentalStore, derive_net_debt
 from aegis.olympus_survivor_light import (
     ALLOWED_SURVIVOR_LIGHT_VERDICTS,
     LOCKED_VALUE_QUALITY_FACTORS,
+    SURVIVOR_LIGHT_VERDICT_CEILING,
+    AkSharePriceSource,
+    BaostockPriceSource,
     ConstituentChange,
     FreePriceSource,
     HistoricalConstituentStore,
     PriceBar,
+    TusharePriceSource,
+    UnavailablePriceSource,
+    YFinancePriceSource,
     align_pit_fundamentals_with_prices,
     evaluate_survivor_light_ic,
     first_price_after,
@@ -249,6 +255,121 @@ def test_sharadar_not_configured_degrades_gracefully() -> None:
     assert out["survivorship_status"]["status"] == "paid_source_not_configured"
 
 
+def _synthetic_fetcher(
+    ticker: str,
+    start: date,
+    end: date,
+    adjustment: str,
+) -> list[PriceBar]:
+    assert ticker == "AAA"
+    assert adjustment in {"qfq", "raw_with_adj_close"}
+    return [
+        PriceBar(date(2024, 1, 2), 9, 10, 8, 9.5, 9.4, 100),
+        PriceBar(date(2024, 1, 3), 10, 11, 9, 10.5, 10.4, 110),
+        PriceBar(date(2024, 1, 5), 12, 13, 11, 12.5, 12.4, 120),
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        AkSharePriceSource(fetcher=_synthetic_fetcher, as_of=date(2024, 1, 3)),
+        BaostockPriceSource(fetcher=_synthetic_fetcher, as_of=date(2024, 1, 3)),
+        YFinancePriceSource(
+            fetcher=_synthetic_fetcher,
+            adjustment="raw_with_adj_close",
+            as_of=date(2024, 1, 3),
+        ),
+        TusharePriceSource(token="token", fetcher=_synthetic_fetcher, as_of=date(2024, 1, 3)),
+    ],
+)
+def test_free_equity_sources_share_protocol_metadata_and_asof_filter(
+    source: DelistingAwarePriceSource,
+) -> None:
+    payload = source.get_prices("AAA", date(2024, 1, 1), date(2024, 1, 31))
+
+    assert payload["status"] == "OK"
+    assert [bar["date"] for bar in payload["bars"]] == ["2024-01-02", "2024-01-03"]
+    assert payload["survivorship"] == "light"
+    assert payload["survivorship_level"] == "survivor_light"
+    assert payload["verdict_ceiling"] == SURVIVOR_LIGHT_VERDICT_CEILING
+    assert payload["point_in_time_safe"] is False
+    assert payload["read_only"] is True
+    assert "latest-adjusted histories" in payload["pit_adjustment_limit"]
+
+
+def test_tushare_without_token_degrades_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    source = TusharePriceSource(token="")
+
+    payload = source.get_prices("000001.SZ", date(2024, 1, 1), date(2024, 1, 31))
+
+    assert payload["status"] == "token_not_configured"
+    assert payload["bars"] == []
+    assert payload["survivorship_status"]["status"] == "token_not_configured"
+    assert payload["read_only"] is True
+
+
+def test_yfinance_parser_uses_index_dates_when_records_omit_date() -> None:
+    class FakeFrame:
+        empty = False
+
+        def to_dict(self, orient: str) -> list[dict[str, float]]:
+            assert orient == "records"
+            return [
+                {
+                    "Open": 10.0,
+                    "High": 11.0,
+                    "Low": 9.0,
+                    "Close": 10.5,
+                    "Adj Close": 10.4,
+                    "Volume": 100.0,
+                }
+            ]
+
+        def iterrows(self) -> list[tuple[str, dict[str, float]]]:
+            return [
+                (
+                    "2024-01-02",
+                    {
+                        "Open": 10.0,
+                        "High": 11.0,
+                        "Low": 9.0,
+                        "Close": 10.5,
+                        "Adj Close": 10.4,
+                        "Volume": 100.0,
+                    },
+                )
+            ]
+
+    class FakeYFinance:
+        @staticmethod
+        def download(
+            ticker: str,
+            *,
+            start: str,
+            end: str,
+            progress: bool,
+            auto_adjust: bool,
+            threads: bool,
+        ) -> FakeFrame:
+            assert ticker == "AAPL"
+            assert start == "2024-01-02"
+            assert end == "2024-01-10"
+            assert progress is False
+            assert auto_adjust is False
+            assert threads is False
+            return FakeFrame()
+
+    source = YFinancePriceSource(module_loader=lambda _: FakeYFinance())
+
+    payload = source.get_prices("AAPL", date(2024, 1, 2), date(2024, 1, 9))
+
+    assert payload["status"] == "OK"
+    assert payload["bars"][0]["date"] == "2024-01-02"
+    assert payload["bars"][0]["adj_close"] == 10.4
+
+
 def test_sharadar_parses_sep_and_tickers_with_injected_http() -> None:
     from aegis.olympus_survivor_light import SharadarPriceSource
 
@@ -300,15 +421,40 @@ def test_select_price_source_prefers_sharadar_only_when_key_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from aegis.olympus_survivor_light import (
-        FreePriceSource,
         SharadarPriceSource,
         select_price_source,
     )
 
     for env in ("NASDAQ_DATA_LINK_API_KEY", "SHARADAR_API_KEY", "QUANDL_API_KEY"):
         monkeypatch.delenv(env, raising=False)
-    assert isinstance(select_price_source(delisted_tickers=["TWTR"]), FreePriceSource)
+    assert isinstance(select_price_source(delisted_tickers=["TWTR"]), YFinancePriceSource)
 
     monkeypatch.setenv("NASDAG_PLACEHOLDER", "x")  # noise
     monkeypatch.setenv("SHARADAR_API_KEY", "abc123")
     assert isinstance(select_price_source(), SharadarPriceSource)
+
+
+def test_select_price_source_routes_free_equity_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aegis.olympus_survivor_light import select_price_source
+
+    for env in ("NASDAQ_DATA_LINK_API_KEY", "SHARADAR_API_KEY", "QUANDL_API_KEY", "TUSHARE_TOKEN"):
+        monkeypatch.delenv(env, raising=False)
+
+    assert isinstance(select_price_source(source="akshare", market="hk"), AkSharePriceSource)
+    assert isinstance(select_price_source(source="baostock", market="cn"), BaostockPriceSource)
+    assert isinstance(select_price_source(source="tushare", market="cn"), TusharePriceSource)
+    assert isinstance(select_price_source(source="yfinance", market="us"), YFinancePriceSource)
+    assert isinstance(select_price_source(source="free"), FreePriceSource)
+
+    cn_auto = select_price_source(market="cn")
+    assert isinstance(
+        cn_auto,
+        AkSharePriceSource | BaostockPriceSource | TusharePriceSource | UnavailablePriceSource,
+    )
+    unsupported = select_price_source(market="mars")
+    assert isinstance(unsupported, UnavailablePriceSource)
+    out = unsupported.get_prices("AAA", date(2024, 1, 1), date(2024, 1, 2))
+    assert out["status"] == "source_unavailable"
+    assert out["bars"] == []
