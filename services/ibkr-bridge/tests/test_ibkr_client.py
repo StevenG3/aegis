@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -509,6 +511,29 @@ def test_snapshot_returns_account_summary_positions_and_market_data(
     assert fake_ib.market_data_type_requests == [1]
     assert len(fake_ib.cancel_mkt_data_contracts) == 2
     assert fake_ib.placed == []
+
+
+def test_snapshot_creates_event_loop_inside_worker_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    class EventLoopCheckingIB(FakeIB):
+        def accountSummary(self, account: str = "") -> list[object]:  # noqa: N802
+            asyncio.get_event_loop_policy().get_event_loop()
+            return super().accountSummary(account=account)
+
+    monkeypatch.setattr("ibkr_client.IB", EventLoopCheckingIB)
+    monkeypatch.setattr(
+        "ibkr_client.Stock",
+        lambda symbol, exchange, currency: SimpleNamespace(
+            symbol=symbol, exchange=exchange, currency=currency, conId=f"{symbol}-1"
+        ),
+    )
+    client = IBKRClient(IBKRConfig(account_code="DU123"))
+    client.connect()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        snapshot = pool.submit(client.snapshot).result()
+
+    assert snapshot["ok"] is True
+    assert snapshot["account_summary"]
 
 
 def test_snapshot_falls_back_from_realtime_to_delayed_market_data(
