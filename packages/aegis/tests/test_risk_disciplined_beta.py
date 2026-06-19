@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from aegis.combo_indicator_search import ComboBar, ComboCostModel
 from aegis.risk_disciplined_beta import (
     RiskBetaConfig,
     RiskCandidate,
+    _paired_block_bootstrap_risk_difference_test,
     _target_weights,
     buy_hold_simulation,
     equal_weight_buy_hold,
@@ -38,6 +41,8 @@ def _config() -> RiskBetaConfig:
         locked_oos_fraction=0.30,
         min_is_folds=3,
         oos_folds=2,
+        risk_diff_bootstrap_samples=50,
+        risk_diff_bootstrap_block_bars=5,
     )
 
 
@@ -53,6 +58,8 @@ def test_predeclared_risk_configurations_count_n() -> None:
     assert len(candidates) == 62
     assert report.candidate_count_n == 62
     assert report.multiple_testing["trial_count_n"] == 62
+    assert report.multiple_testing["alpha_significance_role"] == "report_only_not_a_risk_gate"
+    assert "risk_diff_fdr_survivors" in report.multiple_testing
 
 
 def test_volatility_target_uses_lagged_data_only() -> None:
@@ -168,5 +175,30 @@ def test_report_records_gate_checks_for_each_candidate() -> None:
         "realized_vol_near_target",
         "net_cost_positive_and_counted",
         "oos_fold_pass_rate",
-        "fdr_discovery",
+        "risk_difference_ci_lower_gt_0",
+        "risk_difference_fdr_discovery",
     } <= set(gate_checks)
+    assert "fdr_discovery" not in gate_checks
+    alpha_significance = cast(dict[str, object], first["alpha_significance"])
+    risk_difference_test = cast(dict[str, object], first["risk_difference_test"])
+    assert alpha_significance["role"] == "report_only_not_a_risk_gate"
+    assert risk_difference_test["method"] == "paired_block_bootstrap"
+
+
+def test_risk_difference_bootstrap_detects_stable_drawdown_improvement() -> None:
+    benchmark_returns = [0.01, -0.04, 0.012, -0.035, 0.011, -0.03] * 20
+    strategy_returns = [0.006, -0.004, 0.007, -0.003, 0.006, -0.002] * 20
+
+    result = _paired_block_bootstrap_risk_difference_test(
+        strategy_returns,
+        benchmark_returns,
+        0.30,
+        0.0,
+        _config(),
+        "synthetic",
+    )
+
+    assert result["valid"] is True
+    assert cast(float, result["drawdown_reduction"]) > 0
+    assert cast(float, result["drawdown_reduction_ci_low"]) > 0
+    assert cast(float, result["p_value"]) < 0.10

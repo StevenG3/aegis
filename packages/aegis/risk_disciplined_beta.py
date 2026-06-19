@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -21,6 +22,10 @@ class RiskBetaConfig:
     target_vol_tolerance: float = 0.35
     min_oos_fold_pass_rate: float = 2 / 3
     oos_folds: int = 3
+    risk_diff_bootstrap_samples: int = 400
+    risk_diff_bootstrap_block_bars: int = 30
+    risk_diff_ci_alpha: float = 0.05
+    risk_diff_random_seed: int = 47
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,8 @@ class RiskResult:
     gate_checks: dict[str, bool]
     oos_fold_pass_rate: float
     drawdown_reduction: float
+    risk_difference_test: dict[str, float | int | bool | str]
+    alpha_significance: dict[str, float | bool | str]
     verdict: str
     reason: str
 
@@ -93,6 +100,7 @@ class RiskBetaReport:
     locked_oos_start: int
     raw_is_survivors: int
     fdr_is_survivors: int
+    risk_diff_fdr_survivors: int
     risk_improved_count: int
     insufficient_count: int
     results: dict[str, dict[str, object]]
@@ -205,9 +213,41 @@ def run_risk_disciplined_beta(
             candidate_count_n=len(candidates),
             locked_oos_start=locked_oos_start,
         )
-    discoveries = benjamini_hochberg([score.p_value for score in scores], alpha=config.fdr_alpha)
-    fdr_names = {
-        score.candidate.key for score, keep in zip(scores, discoveries, strict=True) if keep
+    alpha_discoveries = benjamini_hochberg(
+        [score.p_value for score in scores], alpha=config.fdr_alpha
+    )
+    alpha_fdr_names = {
+        score.candidate.key
+        for score, keep in zip(scores, alpha_discoveries, strict=True)
+        if keep
+    }
+    alpha_p_values = {score.candidate.key: score.p_value for score in scores}
+    preliminary_results = tuple(
+        _locked_oos_result(
+            candidate,
+            bars_by_symbol,
+            locked_oos_start,
+            config,
+            cost_model,
+            alpha_p_value=alpha_p_values[candidate.key],
+            alpha_fdr_discovery=candidate.key in alpha_fdr_names,
+            risk_diff_fdr_discovery=False,
+        )
+        for candidate in candidates
+    )
+    risk_diff_discoveries = benjamini_hochberg(
+        [
+            float(result.risk_difference_test["p_value"])
+            if result.risk_difference_test["valid"]
+            else 1.0
+            for result in preliminary_results
+        ],
+        alpha=config.fdr_alpha,
+    )
+    risk_diff_fdr_names = {
+        result.candidate.key
+        for result, keep in zip(preliminary_results, risk_diff_discoveries, strict=True)
+        if keep
     }
     results = tuple(
         _locked_oos_result(
@@ -216,7 +256,9 @@ def run_risk_disciplined_beta(
             locked_oos_start,
             config,
             cost_model,
-            fdr_discovery=candidate.key in fdr_names,
+            alpha_p_value=alpha_p_values[candidate.key],
+            alpha_fdr_discovery=candidate.key in alpha_fdr_names,
+            risk_diff_fdr_discovery=candidate.key in risk_diff_fdr_names,
         )
         for candidate in candidates
     )
@@ -232,18 +274,25 @@ def run_risk_disciplined_beta(
         candidate_count_n=len(candidates),
         locked_oos_start=locked_oos_start,
         raw_is_survivors=raw_is_survivors,
-        fdr_is_survivors=len(fdr_names),
+        fdr_is_survivors=len(alpha_fdr_names),
+        risk_diff_fdr_survivors=len(risk_diff_fdr_names),
         risk_improved_count=improved_count,
         insufficient_count=insufficient_count,
         results={result.candidate.key: result_to_dict(result) for result in results},
         benchmarks=benchmarks,
         multiple_testing={
-            "method": "Benjamini-Hochberg FDR over predeclared risk configurations",
+            "method": "Benjamini-Hochberg FDR over predeclared risk-difference tests",
             "alpha": config.fdr_alpha,
             "trial_count_n": len(candidates),
+            "risk_diff_fdr_survivors": len(risk_diff_fdr_names),
+            "risk_diff_test": "paired block bootstrap on locked-OOS strategy-vs-benchmark returns",
+            "risk_diff_bootstrap_samples": config.risk_diff_bootstrap_samples,
+            "risk_diff_bootstrap_block_bars": config.risk_diff_bootstrap_block_bars,
+            "risk_diff_ci_alpha": config.risk_diff_ci_alpha,
             "raw_is_survivors": raw_is_survivors,
-            "fdr_is_survivors": len(fdr_names),
+            "alpha_fdr_is_survivors_report_only": len(alpha_fdr_names),
             "min_p_value": min(score.p_value for score in scores),
+            "alpha_significance_role": "report_only_not_a_risk_gate",
         },
         safety={
             "paper_only": True,
@@ -475,6 +524,8 @@ def result_to_dict(result: RiskResult) -> dict[str, object]:
         "gate_checks": result.gate_checks,
         "oos_fold_pass_rate": result.oos_fold_pass_rate,
         "drawdown_reduction": result.drawdown_reduction,
+        "risk_difference_test": result.risk_difference_test,
+        "alpha_significance": result.alpha_significance,
         "verdict": result.verdict,
         "reason": result.reason,
     }
@@ -489,6 +540,7 @@ def report_to_dict(report: RiskBetaReport) -> dict[str, object]:
         "locked_oos_start": report.locked_oos_start,
         "raw_is_survivors": report.raw_is_survivors,
         "fdr_is_survivors": report.fdr_is_survivors,
+        "risk_diff_fdr_survivors": report.risk_diff_fdr_survivors,
         "risk_improved_count": report.risk_improved_count,
         "insufficient_count": report.insufficient_count,
         "results": report.results,
@@ -580,7 +632,9 @@ def _locked_oos_result(
     config: RiskBetaConfig,
     cost_model: ComboCostModel,
     *,
-    fdr_discovery: bool,
+    alpha_p_value: float,
+    alpha_fdr_discovery: bool,
+    risk_diff_fdr_discovery: bool,
 ) -> RiskResult:
     end = min(len(bars_by_symbol[symbol]) for symbol in candidate.symbols) - 1
     strategy = simulate_candidate(
@@ -614,6 +668,14 @@ def _locked_oos_result(
         candidate, bars_by_symbol, locked_oos_start, end, config, cost_model
     )
     drawdown_reduction = _drawdown_reduction(strategy.metrics, primary.metrics)
+    risk_difference_test = _paired_block_bootstrap_risk_difference_test(
+        strategy.returns,
+        primary.returns,
+        strategy.metrics.target_volatility,
+        primary.metrics.target_volatility,
+        config,
+        candidate.key,
+    )
     gate_checks = {
         "drawdown_reduction_ge_20pct": drawdown_reduction >= config.drawdown_reduction_threshold,
         "calmar_gt_buy_hold": strategy.metrics.calmar > primary.metrics.calmar,
@@ -621,7 +683,8 @@ def _locked_oos_result(
         "realized_vol_near_target": _target_vol_close(strategy.metrics, config),
         "net_cost_positive_and_counted": strategy.metrics.net_cost >= 0.0,
         "oos_fold_pass_rate": fold_pass_rate >= config.min_oos_fold_pass_rate,
-        "fdr_discovery": fdr_discovery,
+        "risk_difference_ci_lower_gt_0": bool(risk_difference_test["ci_lower_gt_0"]),
+        "risk_difference_fdr_discovery": risk_diff_fdr_discovery,
     }
     verdict, reason = _candidate_verdict(gate_checks)
     return RiskResult(
@@ -633,6 +696,12 @@ def _locked_oos_result(
         gate_checks=gate_checks,
         oos_fold_pass_rate=fold_pass_rate,
         drawdown_reduction=drawdown_reduction,
+        risk_difference_test=risk_difference_test,
+        alpha_significance={
+            "role": "report_only_not_a_risk_gate",
+            "p_value": alpha_p_value,
+            "fdr_discovery": alpha_fdr_discovery,
+        },
         verdict=verdict,
         reason=reason,
     )
@@ -711,6 +780,131 @@ def _drawdown_reduction(strategy: RiskMetrics, benchmark: RiskMetrics) -> float:
     if benchmark_dd == 0:
         return 0.0
     return (benchmark_dd - abs(strategy.max_drawdown)) / benchmark_dd
+
+
+def _paired_block_bootstrap_risk_difference_test(
+    strategy_returns: Sequence[float],
+    benchmark_returns: Sequence[float],
+    strategy_target_volatility: float,
+    benchmark_target_volatility: float,
+    config: RiskBetaConfig,
+    candidate_key: str,
+) -> dict[str, float | int | bool | str]:
+    n = min(len(strategy_returns), len(benchmark_returns))
+    if n < max(30, config.risk_diff_bootstrap_block_bars):
+        return {
+            "valid": False,
+            "method": "paired_block_bootstrap",
+            "reason": "insufficient locked-OOS paired returns for risk-difference bootstrap",
+            "sample_count": 0,
+            "p_value": 1.0,
+            "ci_lower_gt_0": False,
+        }
+    strategy = tuple(float(value) for value in strategy_returns[:n])
+    benchmark = tuple(float(value) for value in benchmark_returns[:n])
+    observed = _risk_difference_metrics(
+        strategy,
+        benchmark,
+        strategy_target_volatility,
+        benchmark_target_volatility,
+        config,
+    )
+    rng = random.Random(config.risk_diff_random_seed + sum(ord(char) for char in candidate_key))
+    sampled_drawdown: list[float] = []
+    sampled_calmar: list[float] = []
+    sampled_sortino: list[float] = []
+    block = min(config.risk_diff_bootstrap_block_bars, n)
+    for _ in range(config.risk_diff_bootstrap_samples):
+        indices: list[int] = []
+        while len(indices) < n:
+            start = rng.randint(0, n - block)
+            indices.extend(range(start, start + block))
+        indices = indices[:n]
+        sample_strategy = tuple(strategy[index] for index in indices)
+        sample_benchmark = tuple(benchmark[index] for index in indices)
+        sample = _risk_difference_metrics(
+            sample_strategy,
+            sample_benchmark,
+            strategy_target_volatility,
+            benchmark_target_volatility,
+            config,
+        )
+        sampled_drawdown.append(sample["drawdown_reduction"])
+        sampled_calmar.append(sample["calmar_diff"])
+        sampled_sortino.append(sample["sortino_diff"])
+    drawdown_ci_low = _quantile(sampled_drawdown, config.risk_diff_ci_alpha)
+    calmar_ci_low = _quantile(sampled_calmar, config.risk_diff_ci_alpha)
+    sortino_ci_low = _quantile(sampled_sortino, config.risk_diff_ci_alpha)
+    drawdown_tail = _nonpositive_share(sampled_drawdown)
+    calmar_tail = _nonpositive_share(sampled_calmar)
+    sortino_tail = _nonpositive_share(sampled_sortino)
+    p_value = (
+        max(drawdown_tail, calmar_tail, sortino_tail)
+        if (
+            observed["drawdown_reduction"] > 0
+            and observed["calmar_diff"] > 0
+            and observed["sortino_diff"] > 0
+        )
+        else 1.0
+    )
+    ci_lower_gt_0 = drawdown_ci_low > 0 and calmar_ci_low > 0 and sortino_ci_low > 0
+    return {
+        "valid": True,
+        "method": "paired_block_bootstrap",
+        "sample_count": config.risk_diff_bootstrap_samples,
+        "block_bars": block,
+        "ci_alpha": config.risk_diff_ci_alpha,
+        "p_value": p_value,
+        "ci_lower_gt_0": ci_lower_gt_0,
+        "drawdown_reduction": observed["drawdown_reduction"],
+        "drawdown_reduction_ci_low": drawdown_ci_low,
+        "calmar_diff": observed["calmar_diff"],
+        "calmar_diff_ci_low": calmar_ci_low,
+        "sortino_diff": observed["sortino_diff"],
+        "sortino_diff_ci_low": sortino_ci_low,
+    }
+
+
+def _risk_difference_metrics(
+    strategy_returns: Sequence[float],
+    benchmark_returns: Sequence[float],
+    strategy_target_volatility: float,
+    benchmark_target_volatility: float,
+    config: RiskBetaConfig,
+) -> dict[str, float]:
+    strategy = risk_metrics(
+        strategy_returns,
+        annualization_periods=config.annualization_periods,
+        target_volatility=strategy_target_volatility,
+        turnover=0.0,
+        net_cost=0.0,
+    )
+    benchmark = risk_metrics(
+        benchmark_returns,
+        annualization_periods=config.annualization_periods,
+        target_volatility=benchmark_target_volatility,
+        turnover=0.0,
+        net_cost=0.0,
+    )
+    return {
+        "drawdown_reduction": _drawdown_reduction(strategy, benchmark),
+        "calmar_diff": strategy.calmar - benchmark.calmar,
+        "sortino_diff": strategy.sortino - benchmark.sortino,
+    }
+
+
+def _quantile(values: Sequence[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(max(int(math.floor(q * (len(ordered) - 1))), 0), len(ordered) - 1)
+    return ordered[index]
+
+
+def _nonpositive_share(values: Sequence[float]) -> float:
+    if not values:
+        return 1.0
+    return sum(1 for value in values if value <= 0) / len(values)
 
 
 def _target_vol_close(metrics: RiskMetrics, config: RiskBetaConfig) -> bool:
@@ -862,13 +1056,15 @@ def _insufficient_report(
         locked_oos_start=locked_oos_start,
         raw_is_survivors=0,
         fdr_is_survivors=0,
+        risk_diff_fdr_survivors=0,
         risk_improved_count=0,
         insufficient_count=0,
         results={},
         benchmarks={},
         multiple_testing={
-            "method": "Benjamini-Hochberg FDR over predeclared risk configurations",
+            "method": "Benjamini-Hochberg FDR over predeclared risk-difference tests",
             "trial_count_n": candidate_count_n,
+            "alpha_significance_role": "report_only_not_a_risk_gate",
         },
         safety={
             "paper_only": True,
