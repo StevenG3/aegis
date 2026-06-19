@@ -378,23 +378,41 @@ class IBKRClient:
 
     def _account_summary(self, ib: Any) -> dict[str, dict[str, dict[str, str | None]]]:
         rows: dict[str, dict[str, dict[str, str | None]]] = {}
-        if not hasattr(ib, "accountSummary"):
+
+        def add_values(account_values: Any) -> None:
+            for item in account_values or []:
+                account = str(
+                    getattr(item, "account", "") or self._config.account_code or "default"
+                )
+                tag = str(getattr(item, "tag", ""))
+                if not tag:
+                    continue
+                value = getattr(item, "value", None)
+                rows.setdefault(account, {})[tag] = {
+                    "value": str(value) if value is not None else None,
+                    "currency": str(getattr(item, "currency", "") or ""),
+                    "numeric": _decimal_str(_decimal(value)) if value not in (None, "") else None,
+                }
+
+        if hasattr(ib, "accountValues"):
+            add_values(ib.accountValues(account=self._config.account_code))
+        required_tags = {"NetLiquidation", "TotalCashValue", "GrossPositionValue"}
+        has_required_tags = any(required_tags.issubset(tags.keys()) for tags in rows.values())
+        if has_required_tags or not hasattr(ib, "accountSummary"):
             return rows
-        if self._config.account_code:
-            account_values = ib.accountSummary(account=self._config.account_code)
-        else:
-            account_values = ib.accountSummary()
-        for item in account_values or []:
-            account = str(getattr(item, "account", "") or self._config.account_code or "default")
-            tag = str(getattr(item, "tag", ""))
-            if not tag:
-                continue
-            value = getattr(item, "value", None)
-            rows.setdefault(account, {})[tag] = {
-                "value": str(value) if value is not None else None,
-                "currency": str(getattr(item, "currency", "") or ""),
-                "numeric": _decimal_str(_decimal(value)) if value not in (None, "") else None,
-            }
+        old_timeout = getattr(ib, "RequestTimeout", None)
+        if hasattr(ib, "RequestTimeout") and not old_timeout:
+            ib.RequestTimeout = self._config.timeout_sec
+        try:
+            if self._config.account_code:
+                add_values(ib.accountSummary(account=self._config.account_code))
+            else:
+                add_values(ib.accountSummary())
+        except Exception:
+            logger.warning("IBKR account summary request failed", exc_info=True)
+        finally:
+            if hasattr(ib, "RequestTimeout"):
+                ib.RequestTimeout = old_timeout
         return rows
 
     def _market_data_for_positions(
@@ -413,10 +431,27 @@ class IBKRClient:
             if not symbol:
                 continue
             contract = Stock(symbol, "SMART", "USD")
-            qualified = ib.qualifyContracts(contract)
+            old_timeout = getattr(ib, "RequestTimeout", None)
+            if hasattr(ib, "RequestTimeout") and not old_timeout:
+                ib.RequestTimeout = self._config.timeout_sec
+            try:
+                qualified = ib.qualifyContracts(contract)
+            except Exception:
+                logger.warning(
+                    "IBKR contract qualification failed symbol=%s",
+                    symbol,
+                    exc_info=True,
+                )
+                continue
+            finally:
+                if hasattr(ib, "RequestTimeout"):
+                    ib.RequestTimeout = old_timeout
             if not qualified:
                 continue
-            tickers.append(ib.reqMktData(qualified[0], "", False, False))
+            try:
+                tickers.append(ib.reqMktData(qualified[0], "", False, False))
+            except Exception:
+                logger.warning("IBKR market data request failed symbol=%s", symbol, exc_info=True)
         ib.sleep(3.0)
         rows = [self._ticker_to_snapshot_row(ticker) for ticker in tickers]
         for ticker in tickers:
