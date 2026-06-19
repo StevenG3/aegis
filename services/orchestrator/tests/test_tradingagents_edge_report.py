@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -21,24 +21,22 @@ def load_edge_script(monkeypatch, tmp_path: Path):
     return module
 
 
-def insert_closed_outcome(
+def insert_scorecard(
     module,
     *,
     scorecard_id: str,
-    outcome_id: str,
-    actor: str = "tg_1",
+    actor: str = "fixture_actor",
+    symbol: str = "BTCUSDT",
+    action: str = "buy",
     source: str = "tradingagents",
     conviction: str = "0.70",
-    closed_return_pct: str = "0.03000000",
-    closed_realized_pnl: str = "3.00000000",
-    opened_at: str = "2026-05-25T00:00:00+00:00",
-    closed_at: str = "2026-05-26T00:00:00+00:00",
+    created_at: str = "2026-05-25T00:30:00+00:00",
     factors: list[dict[str, object]] | None = None,
 ) -> None:
     payload = {
         "actor": actor,
-        "symbol": "BTCUSDT",
-        "action": "buy",
+        "symbol": symbol,
+        "action": action,
         "source": source,
         "conviction": conviction,
         "metadata": {
@@ -62,136 +60,172 @@ def insert_closed_outcome(
             (
                 scorecard_id,
                 actor,
-                "BTCUSDT",
-                "buy",
+                symbol,
+                action,
                 source,
                 json.dumps(payload),
-                opened_at,
-                closed_at,
-            ),
-        )
-        conn.execute(
-            """
-            insert into scorecard_outcomes
-              (outcome_id, scorecard_id, actor, symbol, source, action,
-               opened_intent_id, opened_at, opened_qty, opened_avg_cost,
-               opened_cost_basis, status, closed_at, closed_realized_pnl,
-               closed_return_pct, notes)
-            values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
-            """,
-            (
-                outcome_id,
-                scorecard_id,
-                actor,
-                "BTCUSDT",
-                source,
-                "buy",
-                f"intent-{outcome_id}",
-                opened_at,
-                "0.00100000",
-                "100000.00000000",
-                "100.00000000",
-                "closed",
-                closed_at,
-                closed_realized_pnl,
-                closed_return_pct,
+                created_at,
+                (datetime.fromisoformat(created_at) + timedelta(hours=24)).isoformat(),
             ),
         )
         conn.commit()
 
 
-def test_build_report_compares_net_return_to_btc_hold(monkeypatch, tmp_path: Path) -> None:
-    module = load_edge_script(monkeypatch, tmp_path)
-    insert_closed_outcome(
-        module,
-        scorecard_id="sc-good",
-        outcome_id="out-good",
-        conviction="0.85",
-        closed_return_pct="0.03000000",
-        factors=[{"name": "market", "direction": "support"}],
-    )
-    insert_closed_outcome(
-        module,
-        scorecard_id="sc-bad",
-        outcome_id="out-bad",
-        conviction="0.55",
-        closed_return_pct="-0.01000000",
-        factors=[{"name": "market", "direction": "support"}],
-    )
+def test_forward_prices_use_first_bar_after_recommendation() -> None:
+    module = load_edge_script_no_db()
+    created_at = datetime(2026, 5, 25, 0, 30, tzinfo=UTC)
+    rows = [
+        [int(datetime(2026, 5, 25, 0, 0, tzinfo=UTC).timestamp() * 1000), 0, 0, 0, 99, 0],
+        [int(datetime(2026, 5, 25, 1, 0, tzinfo=UTC).timestamp() * 1000), 0, 0, 0, 100, 0],
+        [int(datetime(2026, 5, 26, 1, 0, tzinfo=UTC).timestamp() * 1000), 0, 0, 0, 110, 0],
+    ]
 
-    def fake_btc_hold(opened_at: datetime, closed_at: datetime) -> tuple[float, float]:
-        assert opened_at.tzinfo == UTC
-        assert closed_at.tzinfo == UTC
-        return 100.0, 101.0
+    prices = module._forward_prices_from_ohlcv(rows, created_at, 24, "BTC/USDT")
 
-    report = module.build_report(
-        actor="tg_1",
-        source="tradingagents",
-        benchmark="BTC/USDT",
-        benchmark_source="fixture",
-        costs=module.CostModel(fee_bps=10, slippage_bps=2, funding_bps=0),
-        min_n=30,
-        price_fetcher=fake_btc_hold,
-    )
-
-    assert report["sample_sufficiency"]["closed_outcomes_n"] == 2
-    assert report["sample_sufficiency"]["verdict"] == "INSUFFICIENT_DATA"
-    assert report["summary"]["edge_claim"] == "NO_CLAIM_INSUFFICIENT_DATA"
-    assert report["summary"]["benchmark_available_n"] == 2
-    assert report["summary"]["total_net_return_pct"] == 0.0152
-    assert report["summary"]["total_alpha_vs_btc_pct"] == -0.0048
-    assert report["recommendation"]["status"] == "insufficient_data_continue_bootstrap"
+    assert prices.entry_time == datetime(2026, 5, 25, 1, 0, tzinfo=UTC)
+    assert prices.exit_time == datetime(2026, 5, 26, 1, 0, tzinfo=UTC)
+    assert prices.entry_price == 100
+    assert prices.exit_price == 110
 
 
-def test_conviction_and_analyst_attribution_use_alpha_direction(
+def test_build_report_scores_recommendations_against_buy_hold_and_cash(
     monkeypatch, tmp_path: Path
 ) -> None:
     module = load_edge_script(monkeypatch, tmp_path)
-    insert_closed_outcome(
+    insert_scorecard(module, scorecard_id="sc-buy", action="buy", conviction="0.85")
+    insert_scorecard(
         module,
-        scorecard_id="sc-high",
-        outcome_id="out-high",
-        conviction="0.90",
-        closed_return_pct="0.05000000",
-        factors=[
-            {"name": "market", "direction": "support"},
-            {"name": "news", "direction": "oppose"},
-        ],
+        scorecard_id="sc-sell",
+        action="sell",
+        conviction="0.55",
+        created_at="2026-05-25T02:30:00+00:00",
     )
-    insert_closed_outcome(
-        module,
-        scorecard_id="sc-low",
-        outcome_id="out-low",
-        conviction="0.60",
-        closed_return_pct="-0.02000000",
-        factors=[
-            {"name": "market", "direction": "support"},
-            {"name": "news", "direction": "oppose"},
-        ],
-    )
+
+    def fake_prices(symbol: str, created_at: datetime, horizon_hours: int):
+        assert symbol == "BTCUSDT"
+        entry = created_at.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        return module.ForwardPrices(
+            entry_time=entry,
+            exit_time=entry + timedelta(hours=horizon_hours),
+            entry_price=100.0,
+            exit_price=110.0,
+        )
 
     report = module.build_report(
         actor=None,
         source="tradingagents",
-        benchmark="BTC/USDT",
         benchmark_source="fixture",
-        costs=module.CostModel(fee_bps=0, slippage_bps=0, funding_bps=0),
-        bucket_min_n=1,
-        analyst_min_n=1,
-        price_fetcher=lambda opened_at, closed_at: (100.0, 100.0),
+        horizon_hours=24,
+        costs=module.CostModel(
+            fee_bps=10,
+            slippage_bps=2,
+            funding_bps_per_8h=1,
+            cash_rate_annual=0.04,
+        ),
+        min_n=30,
+        price_fetcher=fake_prices,
     )
 
-    buckets = {
-        item["bucket"]: item for item in report["conviction_calibration"]["items"]
-    }
-    assert buckets["0.50-0.65"]["alpha_win_rate"] == 0.0
-    assert buckets["0.80-1.01"]["alpha_win_rate"] == 1.0
-    assert report["conviction_calibration"]["monotonic_alpha_win_rate"] is True
+    assert report["verdict"] == "INSUFFICIENT"
+    assert report["sample_counts"]["recommendations_loaded"] == 2
+    assert report["sample_counts"]["evaluated_n"] == 2
+    rows = report["private_rows"]
+    assert rows[0]["strategy_return"] == 0.0976
+    assert rows[0]["buy_hold_return"] == 0.0976
+    assert rows[1]["strategy_return"] < 0
+    assert rows[1]["excess_vs_buy_hold"] < 0
+    assert report["overall"]["cash"]["median"] > 0
+    assert report["sanitized_public_summary"]["contains_actor_or_recommendation_rows"] is False
 
-    analysts = {
-        (item["analyst"], item["direction"]): item
-        for item in report["analyst_attribution"]["items"]
-    }
-    assert analysts[("market", "support")]["directional_hit_rate_vs_btc"] == 0.5
-    assert analysts[("market", "support")]["preliminary_label"] == "possible_noise"
-    assert analysts[("news", "oppose")]["directional_hit_rate_vs_btc"] == 0.5
+
+def test_min_sample_gate_prevents_edge_claim(monkeypatch, tmp_path: Path) -> None:
+    module = load_edge_script(monkeypatch, tmp_path)
+    for index in range(5):
+        insert_scorecard(module, scorecard_id=f"sc-{index}")
+
+    report = module.build_report(
+        actor=None,
+        source="tradingagents",
+        benchmark_source="fixture",
+        horizon_hours=24,
+        costs=module.CostModel(0, 0, 0, 0),
+        min_n=30,
+        price_fetcher=lambda symbol, created_at, horizon_hours: module.ForwardPrices(
+            entry_time=created_at + timedelta(hours=1),
+            exit_time=created_at + timedelta(hours=25),
+            entry_price=100,
+            exit_price=120,
+        ),
+    )
+
+    assert report["overall"]["status"] == "INSUFFICIENT"
+    assert report["verdict"] == "INSUFFICIENT"
+
+
+def test_bucket_and_analyst_fdr_are_reported(monkeypatch, tmp_path: Path) -> None:
+    module = load_edge_script(monkeypatch, tmp_path)
+    base = datetime(2026, 5, 25, 0, 30, tzinfo=UTC)
+    for index in range(12):
+        insert_scorecard(
+            module,
+            scorecard_id=f"good-{index}",
+            conviction="0.90",
+            created_at=(base + timedelta(hours=index * 2)).isoformat(),
+            factors=[{"name": "trend", "direction": "support"}],
+        )
+    for index in range(12):
+        insert_scorecard(
+            module,
+            scorecard_id=f"bad-{index}",
+            action="sell",
+            conviction="0.60",
+            created_at=(base + timedelta(hours=100 + index * 2)).isoformat(),
+            factors=[{"name": "macro", "direction": "support"}],
+        )
+
+    def fake_prices(symbol: str, created_at: datetime, horizon_hours: int):
+        entry = created_at + timedelta(hours=1)
+        if created_at.hour < 12 and created_at.day == 25:
+            exit_price = 105
+        else:
+            exit_price = 103
+        return module.ForwardPrices(entry, entry + timedelta(hours=horizon_hours), 100, exit_price)
+
+    report = module.build_report(
+        actor=None,
+        source="tradingagents",
+        benchmark_source="fixture",
+        horizon_hours=24,
+        costs=module.CostModel(0, 0, 0, 0),
+        min_n=20,
+        bucket_min_n=10,
+        analyst_min_n=10,
+        price_fetcher=fake_prices,
+    )
+
+    assert report["overall"]["status"] == "TESTED"
+    assert any(row["kind"] == "confidence" for row in report["buckets"])
+    assert any(row["kind"] == "analyst" for row in report["analysts"])
+    assert all("bh_fdr_discovery" in row for row in report["buckets"])
+    assert all("bh_fdr_discovery" in row for row in report["analysts"])
+
+
+def test_sign_test_is_one_sided_for_positive_excess() -> None:
+    module = load_edge_script_no_db()
+
+    assert module._positive_sign_test_p_value([-1.0, -0.5, -0.1]) == 1.0
+    assert module._positive_sign_test_p_value([1.0, 0.5, 0.1]) < 0.20
+
+
+def load_edge_script_no_db():
+    repo_root = Path(__file__).resolve().parents[3]
+    script_path = repo_root / "scripts" / "tradingagents_edge_report.py"
+    sys.modules.pop("tradingagents_edge_report_script_no_db", None)
+    spec = importlib.util.spec_from_file_location(
+        "tradingagents_edge_report_script_no_db", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["tradingagents_edge_report_script_no_db"] = module
+    spec.loader.exec_module(module)
+    return module
