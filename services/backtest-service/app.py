@@ -133,6 +133,8 @@ class FundingArbRequest(BaseModel):
     basis_cost_bps: float | None = Field(default=None, ge=0)
     borrow_cost_bps_annual: float | None = Field(default=None, ge=0)
     settlement_hours: float | None = Field(default=None, gt=0)
+    cash_rate_annual: float | None = Field(default=None, ge=0)
+    max_holding_events: int | None = Field(default=None, gt=0)
     use_maker_fees: bool = False
     max_funding_events: int | None = Field(default=None, gt=0)
 
@@ -671,6 +673,8 @@ def funding_arb_backtest(request: FundingArbRequest) -> dict[str, Any]:
                 basis_cost_bps=request.basis_cost_bps,
                 borrow_cost_bps_annual=request.borrow_cost_bps_annual,
                 settlement_hours=request.settlement_hours,
+                cash_rate_annual=request.cash_rate_annual,
+                max_holding_events=request.max_holding_events,
                 use_maker_fees=request.use_maker_fees,
                 max_funding_events=request.max_funding_events,
             )
