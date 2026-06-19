@@ -81,6 +81,38 @@ class FakeClient:
     def positions_last_update(self) -> str | None:
         return self.position_last_update
 
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "ok": True,
+            "source": "ibkr-bridge",
+            "ready": True,
+            "account_summary": {
+                "DU123": {
+                    "NetLiquidation": {"value": "1000", "currency": "USD", "numeric": "1000"},
+                    "TotalCashValue": {"value": "100", "currency": "USD", "numeric": "100"},
+                    "GrossPositionValue": {"value": "900", "currency": "USD", "numeric": "900"},
+                }
+            },
+            "positions": [
+                {
+                    "symbol": "NVDA",
+                    "qty": "10.00000000",
+                    "avg_cost": "450.25000000",
+                    "market_price": "452.50",
+                    "market_value": "4525.0000000000",
+                }
+            ],
+            "positions_count": 1,
+            "gross_position_value_computed": "4525.0000000000",
+            "market_data_type": 3,
+            "market_data_fallback_used": True,
+            "market_data": [
+                {"symbol": "NVDA", "market_price": "452.50", "price_source": "marketPrice"}
+            ],
+            "last_update": self.position_last_update,
+            "ts_utc": "2026-05-30T00:00:01+00:00",
+        }
+
 
 class RuntimeErrorClient(FakeClient):
     def __init__(self, message: str) -> None:
@@ -294,5 +326,40 @@ def test_get_positions_503_when_not_primed(monkeypatch) -> None:
     fake.position_cache_ready = False
     monkeypatch.setattr(bridge_app, "client", fake)
     response = TestClient(bridge_app.app).get("/positions")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "IBKR_POSITIONS_NOT_READY"
+
+
+def test_get_snapshot_returns_account_positions_prices(monkeypatch) -> None:
+    fake = FakeClient()
+    fake.connect()
+    monkeypatch.setattr(bridge_app, "client", fake)
+    response = TestClient(bridge_app.app).get("/snapshot")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["source"] == "ibkr-bridge"
+    assert body["account_summary"]["DU123"]["NetLiquidation"]["numeric"] == "1000"
+    assert body["positions_count"] == 1
+    assert body["positions"][0]["symbol"] == "NVDA"
+    assert body["positions"][0]["market_value"] == "4525.0000000000"
+    assert body["gross_position_value_computed"] == "4525.0000000000"
+    assert body["market_data_type"] == 3
+    assert body["market_data_fallback_used"] is True
+
+
+def test_get_snapshot_when_not_connected(monkeypatch) -> None:
+    monkeypatch.setattr(bridge_app, "client", RuntimeErrorClient("Gateway not ready"))
+    response = TestClient(bridge_app.app).get("/snapshot")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "IBKR_NOT_READY"
+
+
+def test_get_snapshot_503_when_not_primed(monkeypatch) -> None:
+    fake = FakeClient()
+    fake.connect()
+    fake.position_cache_ready = False
+    monkeypatch.setattr(bridge_app, "client", fake)
+    response = TestClient(bridge_app.app).get("/snapshot")
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "IBKR_POSITIONS_NOT_READY"

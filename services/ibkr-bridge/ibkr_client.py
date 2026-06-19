@@ -65,6 +65,7 @@ def _ensure_event_loop_for_sync_ib() -> None:
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
+
 def _is_live_gateway_port(port: int) -> bool:
     if port in LIVE_GATEWAY_PORTS:
         logger.warning("IBKR bridge configured for a live gateway port: %s", port)
@@ -77,6 +78,22 @@ def _decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return default
+
+
+def _optional_decimal(value: object) -> Decimal | None:
+    try:
+        if value is None:
+            return None
+        parsed = Decimal(str(value))
+        if parsed.is_nan() or parsed <= 0 or parsed == Decimal("-1"):
+            return None
+        return parsed
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _decimal_str(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
 
 
 def _normalize_status(status: str) -> OrderStatus:
@@ -299,6 +316,156 @@ class IBKRClient:
         if price <= 0:
             raise ValueError("MARKET_DATA_UNAVAILABLE")
         return {"symbol": normalized, "price": str(price), "source": "ibkr"}
+
+    def snapshot(self) -> dict[str, object]:
+        """Return a read-only account, position, and quote snapshot."""
+        ib = self._require_ready()
+        positions = self.positions()
+        account_summary = self._account_summary(ib)
+        market_data_type = 1
+        market_data_fallback_used = False
+        market_data = self._market_data_for_positions(ib, positions, market_data_type)
+        if positions and self._valid_price_count(market_data) == 0:
+            market_data_type = 3
+            market_data_fallback_used = True
+            market_data = self._market_data_for_positions(ib, positions, market_data_type)
+
+        price_by_symbol: dict[str, Decimal] = {}
+        for row in market_data:
+            symbol = str(row.get("symbol") or "").upper()
+            price = _optional_decimal(row.get("market_price"))
+            if symbol and price is not None:
+                price_by_symbol[symbol] = price
+
+        enriched_positions: list[dict[str, str | None]] = []
+        gross_position_value = Decimal("0")
+        known_position_value = False
+        for pos in positions:
+            symbol = str(pos.get("symbol", "")).upper()
+            qty = _decimal(pos.get("qty", "0"))
+            price = price_by_symbol.get(symbol)
+            market_value = qty * price if price is not None else None
+            if market_value is not None:
+                gross_position_value += market_value
+                known_position_value = True
+            enriched_positions.append(
+                {
+                    "symbol": symbol,
+                    "qty": str(qty),
+                    "avg_cost": str(_decimal(pos.get("avg_cost", "0"))),
+                    "market_price": _decimal_str(price),
+                    "market_value": _decimal_str(market_value),
+                }
+            )
+
+        return {
+            "ok": True,
+            "source": "ibkr-bridge",
+            "ready": True,
+            "account_summary": account_summary,
+            "positions": enriched_positions,
+            "positions_count": len(enriched_positions),
+            "gross_position_value_computed": (
+                str(gross_position_value) if known_position_value else None
+            ),
+            "market_data_type": market_data_type,
+            "market_data_fallback_used": market_data_fallback_used,
+            "market_data": market_data,
+            "last_update": self.positions_last_update() or _now_iso(),
+            "ts_utc": _now_iso(),
+        }
+
+    def _account_summary(self, ib: Any) -> dict[str, dict[str, dict[str, str | None]]]:
+        rows: dict[str, dict[str, dict[str, str | None]]] = {}
+        if not hasattr(ib, "accountSummary"):
+            return rows
+        if self._config.account_code:
+            account_values = ib.accountSummary(account=self._config.account_code)
+        else:
+            account_values = ib.accountSummary()
+        for item in account_values or []:
+            account = str(getattr(item, "account", "") or self._config.account_code or "default")
+            tag = str(getattr(item, "tag", ""))
+            if not tag:
+                continue
+            value = getattr(item, "value", None)
+            rows.setdefault(account, {})[tag] = {
+                "value": str(value) if value is not None else None,
+                "currency": str(getattr(item, "currency", "") or ""),
+                "numeric": _decimal_str(_decimal(value)) if value not in (None, "") else None,
+            }
+        return rows
+
+    def _market_data_for_positions(
+        self,
+        ib: Any,
+        positions: list[dict[str, str]],
+        market_data_type: int,
+    ) -> list[dict[str, str | None]]:
+        if Stock is None:
+            raise RuntimeError("ib_async contract classes are not available")
+        if hasattr(ib, "reqMarketDataType"):
+            ib.reqMarketDataType(market_data_type)
+        tickers: list[Any] = []
+        for pos in positions:
+            symbol = str(pos.get("symbol", "")).upper().strip()
+            if not symbol:
+                continue
+            contract = Stock(symbol, "SMART", "USD")
+            qualified = ib.qualifyContracts(contract)
+            if not qualified:
+                continue
+            tickers.append(ib.reqMktData(qualified[0], "", False, False))
+        ib.sleep(3.0)
+        rows = [self._ticker_to_snapshot_row(ticker) for ticker in tickers]
+        for ticker in tickers:
+            try:
+                if hasattr(ib, "cancelMktData"):
+                    ib.cancelMktData(getattr(ticker, "contract", None))
+            except Exception:
+                logger.debug("IBKR cancelMktData failed", exc_info=True)
+        return rows
+
+    def _ticker_to_snapshot_row(self, ticker: Any) -> dict[str, str | None]:
+        contract = getattr(ticker, "contract", object())
+        symbol = str(getattr(contract, "symbol", "")).upper()
+        last = _optional_decimal(getattr(ticker, "last", None))
+        close = _optional_decimal(getattr(ticker, "close", None))
+        bid = _optional_decimal(getattr(ticker, "bid", None))
+        ask = _optional_decimal(getattr(ticker, "ask", None))
+        market_price = None
+        price_source = None
+        try:
+            market_price = _optional_decimal(ticker.marketPrice())
+            if market_price is not None:
+                price_source = "marketPrice"
+        except Exception:
+            pass
+        if market_price is None:
+            if last is not None:
+                market_price = last
+                price_source = "last"
+            elif bid is not None and ask is not None:
+                market_price = (bid + ask) / Decimal("2")
+                price_source = "bid_ask_mid"
+            elif close is not None:
+                market_price = close
+                price_source = "close"
+        return {
+            "symbol": symbol,
+            "con_id": str(getattr(contract, "conId", "") or ""),
+            "currency": str(getattr(contract, "currency", "USD") or "USD"),
+            "last": _decimal_str(last),
+            "close": _decimal_str(close),
+            "bid": _decimal_str(bid),
+            "ask": _decimal_str(ask),
+            "market_price": _decimal_str(market_price),
+            "price_source": price_source,
+        }
+
+    @staticmethod
+    def _valid_price_count(rows: list[dict[str, str | None]]) -> int:
+        return sum(1 for row in rows if _optional_decimal(row.get("market_price")) is not None)
 
     def positions(self) -> list[dict[str, str]]:
         self._require_ready()

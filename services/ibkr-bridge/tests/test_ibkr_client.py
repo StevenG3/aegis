@@ -45,6 +45,12 @@ class FakeIB:
         self.cancel_positions_calls = 0
         self.connect_readonly: bool | None = None
         self.connect_account: str | None = None
+        self.current_market_data_type = 1
+        self.market_data_type_requests: list[int] = []
+        self.cancel_mkt_data_contracts: list[object] = []
+        self.market_prices_by_type: dict[int, dict[str, Decimal | None]] = {
+            1: {"NVDA": Decimal("452.50"), "MSFT": Decimal("430.00")}
+        }
         self.seed_positions = [
             SimpleNamespace(
                 contract=SimpleNamespace(symbol="NVDA"),
@@ -102,10 +108,52 @@ class FakeIB:
         )
 
     def reqMktData(self, contract: object, *args: object, **kwargs: object) -> object:  # noqa: N802
-        return SimpleNamespace(marketPrice=lambda: 452.5)
+        _ = args, kwargs
+        symbol = str(getattr(contract, "symbol", "")).upper()
+        price = self.market_prices_by_type.get(self.current_market_data_type, {}).get(
+            symbol, Decimal("452.50")
+        )
+        return SimpleNamespace(
+            contract=contract,
+            last=price,
+            close=None,
+            bid=None,
+            ask=None,
+            marketPrice=lambda: price if price is not None else Decimal("-1"),
+        )
 
     def sleep(self, seconds: float) -> None:
-        assert seconds == 1.0
+        assert seconds in {1.0, 3.0}
+
+    def reqMarketDataType(self, market_data_type: int) -> None:  # noqa: N802
+        self.current_market_data_type = market_data_type
+        self.market_data_type_requests.append(market_data_type)
+
+    def cancelMktData(self, contract: object) -> None:  # noqa: N802
+        self.cancel_mkt_data_contracts.append(contract)
+
+    def accountSummary(self, account: str = "") -> list[object]:  # noqa: N802
+        account_code = account or "DU123"
+        return [
+            SimpleNamespace(
+                account=account_code,
+                tag="NetLiquidation",
+                value="10000",
+                currency="USD",
+            ),
+            SimpleNamespace(
+                account=account_code,
+                tag="TotalCashValue",
+                value="1000",
+                currency="USD",
+            ),
+            SimpleNamespace(
+                account=account_code,
+                tag="GrossPositionValue",
+                value="9000",
+                currency="USD",
+            ),
+        ]
 
     def reqPositions(self) -> None:  # noqa: N802
         self.req_positions_calls += 1
@@ -422,6 +470,113 @@ def test_positions_returns_copy_on_read(monkeypatch: pytest.MonkeyPatch) -> None
     first[0]["qty"] = "999"
     second = client.positions()
     assert second[0]["qty"] == "10.00000000"
+
+
+def test_snapshot_returns_account_summary_positions_and_market_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    monkeypatch.setattr(
+        "ibkr_client.Stock",
+        lambda symbol, exchange, currency: SimpleNamespace(
+            symbol=symbol, exchange=exchange, currency=currency, conId=f"{symbol}-1"
+        ),
+    )
+    client = IBKRClient(IBKRConfig(account_code="DU123"))
+    client.connect()
+
+    snapshot = client.snapshot()
+
+    assert snapshot["ok"] is True
+    assert snapshot["source"] == "ibkr-bridge"
+    assert snapshot["positions_count"] == 2
+    assert snapshot["market_data_type"] == 1
+    assert snapshot["market_data_fallback_used"] is False
+    account_summary = snapshot["account_summary"]
+    assert isinstance(account_summary, dict)
+    assert account_summary["DU123"]["NetLiquidation"]["numeric"] == "10000"
+    positions = snapshot["positions"]
+    assert isinstance(positions, list)
+    nvda = next(p for p in positions if p["symbol"] == "NVDA")
+    assert nvda["market_price"] == "452.50"
+    assert nvda["market_value"] == "4525.0000000000"
+    assert snapshot["gross_position_value_computed"] == "6675.0000000000"
+    market_data = snapshot["market_data"]
+    assert isinstance(market_data, list)
+    assert {row["symbol"] for row in market_data} == {"NVDA", "MSFT"}
+    fake_ib = client._ib
+    assert fake_ib is not None
+    assert fake_ib.market_data_type_requests == [1]
+    assert len(fake_ib.cancel_mkt_data_contracts) == 2
+    assert fake_ib.placed == []
+
+
+def test_snapshot_falls_back_from_realtime_to_delayed_market_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DelayedOnlyIB(FakeIB):
+        def __init__(self) -> None:
+            super().__init__()
+            self.market_prices_by_type = {
+                1: {"NVDA": None, "MSFT": None},
+                3: {"NVDA": Decimal("453.00"), "MSFT": Decimal("431.00")},
+            }
+
+    monkeypatch.setattr("ibkr_client.IB", DelayedOnlyIB)
+    monkeypatch.setattr(
+        "ibkr_client.Stock",
+        lambda symbol, exchange, currency: SimpleNamespace(
+            symbol=symbol, exchange=exchange, currency=currency, conId=f"{symbol}-1"
+        ),
+    )
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+
+    snapshot = client.snapshot()
+
+    assert snapshot["market_data_type"] == 3
+    assert snapshot["market_data_fallback_used"] is True
+    positions = snapshot["positions"]
+    assert isinstance(positions, list)
+    nvda = next(p for p in positions if p["symbol"] == "NVDA")
+    assert nvda["market_price"] == "453.00"
+    assert nvda["market_value"] == "4530.0000000000"
+    fake_ib = client._ib
+    assert fake_ib is not None
+    assert fake_ib.market_data_type_requests == [1, 3]
+    assert len(fake_ib.cancel_mkt_data_contracts) == 4
+
+
+def test_snapshot_returns_fallback_metadata_when_market_data_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoMarketDataIB(FakeIB):
+        def __init__(self) -> None:
+            super().__init__()
+            self.market_prices_by_type = {
+                1: {"NVDA": None, "MSFT": None},
+                3: {"NVDA": None, "MSFT": None},
+            }
+
+    monkeypatch.setattr("ibkr_client.IB", NoMarketDataIB)
+    monkeypatch.setattr(
+        "ibkr_client.Stock",
+        lambda symbol, exchange, currency: SimpleNamespace(
+            symbol=symbol, exchange=exchange, currency=currency, conId=f"{symbol}-1"
+        ),
+    )
+    client = IBKRClient(IBKRConfig())
+    client.connect()
+
+    snapshot = client.snapshot()
+
+    assert snapshot["market_data_type"] == 3
+    assert snapshot["market_data_fallback_used"] is True
+    assert snapshot["gross_position_value_computed"] is None
+    positions = snapshot["positions"]
+    assert isinstance(positions, list)
+    assert all(position["market_price"] is None for position in positions)
+    assert all(position["market_value"] is None for position in positions)
 
 
 def test_reconnect_rebuilds_position_cache(monkeypatch: pytest.MonkeyPatch) -> None:
