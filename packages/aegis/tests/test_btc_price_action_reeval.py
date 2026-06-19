@@ -8,11 +8,14 @@ from aegis.btc_price_action_reeval import (
     DEFAULT_PRICE_ACTION_COST_MODEL,
     ExternalContext,
     PriceActionConfig,
+    PriceActionDefinitiveConfig,
     PriceActionParams,
     _execute_trade,
+    definitive_report_to_dict,
     predeclared_price_action_params,
     report_to_dict,
     run_btc_price_action_reeval,
+    run_price_action_definitive,
     simulate_price_action,
 )
 from aegis.combo_indicator_search import ComboBar, ComboCostModel
@@ -169,3 +172,107 @@ def test_report_uses_bh_fdr_and_reports_private_boundary() -> None:
         "no forward fill; use same-timestamp OI, else same-timestamp futures/spot "
         "volume ratio proxy if available"
     )
+
+
+def _breakout_fixture(rows: int = 170) -> list[ComboBar]:
+    bars = [_bar(index, 100 + index * 0.04, volume=1000) for index in range(rows)]
+    for signal_index in range(55, rows - 3, 12):
+        high = max(bar.high for bar in bars[signal_index - 7 : signal_index - 2])
+        bars[signal_index - 1] = _bar(
+            signal_index - 1,
+            high * 1.012,
+            high=high * 1.02,
+            low=high * 1.006,
+            volume=1800,
+        )
+        bars[signal_index] = _bar(
+            signal_index,
+            high * 1.014,
+            high=high * 1.025,
+            low=high * 1.002,
+            volume=1900,
+        )
+        bars[signal_index + 1] = _bar(
+            signal_index + 1,
+            high * 1.035,
+            open_=high * 1.016,
+            high=high * 1.045,
+            low=high * 1.012,
+            volume=1200,
+        )
+    return bars
+
+
+def test_definitive_pooling_accumulates_walk_forward_oos_trades() -> None:
+    config = PriceActionConfig(
+        train_bars=40,
+        test_bars=20,
+        step_bars=20,
+        locked_oos_fraction=0.30,
+        min_is_folds=1,
+        min_trades=3,
+        lookbacks=(5,),
+        risk_rewards=(1.0,),
+        max_holds=(4,),
+        sma_window=5,
+        daily_sma_window=10,
+        atr_period=5,
+        volume_window=3,
+        min_atr_pct=0.0,
+        max_atr_pct=10.0,
+        risk_diff_bootstrap_samples=40,
+        risk_diff_bootstrap_block_bars=5,
+    )
+
+    report = run_price_action_definitive(
+        {
+            "BTC": _breakout_fixture(),
+            "ETH": _breakout_fixture(),
+        },
+        config=config,
+        definitive_config=PriceActionDefinitiveConfig(min_pooled_trades=3),
+        cost_model=ComboCostModel(fee_bps=0, slippage_bps=0),
+    )
+    payload = definitive_report_to_dict(report)
+
+    assert report.status == "OK"
+    assert report.candidate_count_n == 2
+    assert report.pooled_trade_count >= 3
+    assert report.alpha_verdict in {"EDGE", "NO_EDGE"}
+    assert report.risk_verdict in {"RISK_IMPROVED", "NO_IMPROVEMENT"}
+    multiple_testing = cast(dict[str, object], payload["multiple_testing"])
+    safety = cast(dict[str, object], payload["safety"])
+    assert multiple_testing["pooling"] == (
+        "all walk-forward OOS folds per symbol-parameter candidate"
+    )
+    assert safety["strategy_rules_changed"] is False
+
+
+def test_definitive_sparse_strategy_is_no_edge_not_insufficient() -> None:
+    config = PriceActionConfig(
+        train_bars=40,
+        test_bars=20,
+        step_bars=20,
+        min_is_folds=1,
+        min_trades=30,
+        lookbacks=(5,),
+        risk_rewards=(1.0,),
+        max_holds=(4,),
+        sma_window=5,
+        daily_sma_window=10,
+        atr_period=5,
+        volume_window=3,
+    )
+    bars = [_bar(index, 100 + index * 0.01, volume=1000) for index in range(100)]
+
+    report = run_price_action_definitive(
+        {"BTC": bars},
+        config=config,
+        definitive_config=PriceActionDefinitiveConfig(min_pooled_trades=30),
+    )
+
+    assert report.status == "OK"
+    assert report.alpha_verdict == "NO_EDGE"
+    assert report.risk_verdict == "NO_IMPROVEMENT"
+    assert report.sparse_undeployable is True
+    assert "too sparse" in report.reason

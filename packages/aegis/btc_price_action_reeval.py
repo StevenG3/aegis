@@ -3,6 +3,7 @@ from __future__ import annotations
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from aegis.combo_indicator_search import (
     ComboBar,
@@ -146,6 +147,57 @@ class PriceActionReport:
     external_coverage: dict[str, float | int | str]
     hermes_reconciliation: dict[str, float | int | str]
     results: dict[str, dict[str, object]]
+    multiple_testing: dict[str, float | int | str]
+    safety: dict[str, bool | str]
+
+
+@dataclass(frozen=True)
+class PriceActionDefinitiveConfig:
+    min_pooled_trades: int = 30
+    regime_bull_return: float = 0.10
+    regime_bear_return: float = -0.10
+
+
+@dataclass(frozen=True)
+class PriceActionPooledCandidate:
+    symbol: str
+    params: PriceActionParams
+    fold_count: int
+    trade_count: int
+    strategy_metrics: ComboMetrics
+    buy_hold_metrics: ComboMetrics
+    trade_scorecard: TradeScorecard
+    fold_excess_returns: tuple[float, ...]
+    alpha_p_value: float
+    alpha_fdr_discovery: bool
+    risk_difference_test: dict[str, float | int | bool | str]
+    risk_diff_fdr_discovery: bool
+    alpha_gate_checks: dict[str, bool]
+    risk_gate_checks: dict[str, bool]
+    alpha_verdict: str
+    risk_verdict: str
+    regime_windows: dict[str, dict[str, float | int | None]]
+
+
+@dataclass(frozen=True)
+class PriceActionDefinitiveReport:
+    status: str
+    alpha_verdict: str
+    risk_verdict: str
+    reason: str
+    symbols: tuple[str, ...]
+    candidate_count_n: int
+    pooled_trade_count: int
+    max_candidate_trade_count: int
+    alpha_fdr_survivors: int
+    risk_diff_fdr_survivors: int
+    edge_candidate_count: int
+    risk_improved_count: int
+    sparse_undeployable: bool
+    whole_cycle: dict[str, dict[str, float | int]]
+    regime_summary: dict[str, dict[str, float | int | None]]
+    hermes_reconciliation: dict[str, float | int | str]
+    candidates: dict[str, dict[str, object]]
     multiple_testing: dict[str, float | int | str]
     safety: dict[str, bool | str]
 
@@ -318,6 +370,164 @@ def run_btc_price_action_reeval(
     )
 
 
+def run_price_action_definitive(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    external_by_symbol: dict[str, ExternalContext] | None = None,
+    config: PriceActionConfig = DEFAULT_PRICE_ACTION_CONFIG,
+    definitive_config: PriceActionDefinitiveConfig | None = None,
+    cost_model: ComboCostModel = DEFAULT_PRICE_ACTION_COST_MODEL,
+    hermes_total_return_pct: float = 17.93072784238161,
+    hermes_buy_hold_pct: float = 134.90259013211917,
+) -> PriceActionDefinitiveReport:
+    external_by_symbol = external_by_symbol or {}
+    definitive_config = definitive_config or PriceActionDefinitiveConfig()
+    params_grid = predeclared_price_action_params(config)
+    candidates: list[PriceActionPooledCandidate] = []
+    pending: list[tuple[str, PriceActionParams, dict[str, object]]] = []
+    for symbol in sorted(bars_by_symbol):
+        bars = bars_by_symbol[symbol]
+        external = external_by_symbol.get(symbol, EMPTY_EXTERNAL_CONTEXT)
+        for params in params_grid:
+            pooled = _pooled_walk_forward_oos(
+                symbol,
+                bars,
+                external,
+                params,
+                config,
+                definitive_config,
+                cost_model,
+            )
+            if pooled is not None:
+                pending.append((symbol, params, pooled))
+    if not pending:
+        return _definitive_empty_report(
+            "no candidate had enough bars for walk-forward OOS pooling",
+            bars_by_symbol,
+            config,
+            hermes_total_return_pct,
+            hermes_buy_hold_pct,
+        )
+    alpha_p_values = [
+        sign_test_p_value(cast(tuple[float, ...], pooled["fold_excess_returns"]))
+        for _symbol, _params, pooled in pending
+    ]
+    alpha_discoveries = benjamini_hochberg(alpha_p_values, alpha=config.fdr_alpha)
+    preliminary = [
+        _pooled_candidate_from_payload(
+            symbol,
+            params,
+            pooled,
+            config,
+            definitive_config,
+            alpha_p_value=alpha_p_values[index],
+            alpha_fdr_discovery=alpha_discoveries[index],
+            risk_diff_fdr_discovery=False,
+        )
+        for index, (symbol, params, pooled) in enumerate(pending)
+    ]
+    risk_discoveries = benjamini_hochberg(
+        [
+            float(candidate.risk_difference_test["p_value"])
+            if candidate.risk_difference_test["valid"]
+            else 1.0
+            for candidate in preliminary
+        ],
+        alpha=config.fdr_alpha,
+    )
+    candidates = [
+        _pooled_candidate_from_payload(
+            symbol,
+            params,
+            pooled,
+            config,
+            definitive_config,
+            alpha_p_value=alpha_p_values[index],
+            alpha_fdr_discovery=alpha_discoveries[index],
+            risk_diff_fdr_discovery=risk_discoveries[index],
+        )
+        for index, (symbol, params, pooled) in enumerate(pending)
+    ]
+    max_trades = max((candidate.trade_count for candidate in candidates), default=0)
+    pooled_trade_count = sum(candidate.trade_count for candidate in candidates)
+    edge_count = sum(1 for candidate in candidates if candidate.alpha_verdict == "EDGE")
+    risk_count = sum(1 for candidate in candidates if candidate.risk_verdict == "RISK_IMPROVED")
+    sparse = pooled_trade_count < definitive_config.min_pooled_trades
+    alpha_verdict = "EDGE" if edge_count else "NO_EDGE"
+    risk_verdict = "RISK_IMPROVED" if risk_count else "NO_IMPROVEMENT"
+    if sparse:
+        reason = (
+            "pooled walk-forward OOS remained too sparse for deployment; "
+            "treat as definitive NO_EDGE rather than INSUFFICIENT"
+        )
+        alpha_verdict = "NO_EDGE"
+        risk_verdict = "NO_IMPROVEMENT"
+    else:
+        reason = (
+            "at least one pooled candidate passed alpha gates"
+            if edge_count
+            else "no pooled candidate passed full-cost buy-and-hold alpha gates"
+        )
+        if risk_count:
+            reason += "; at least one candidate passed risk-difference gates"
+        else:
+            reason += "; no candidate passed risk-difference gates"
+    return PriceActionDefinitiveReport(
+        status="OK",
+        alpha_verdict=alpha_verdict,
+        risk_verdict=risk_verdict,
+        reason=reason,
+        symbols=tuple(sorted(bars_by_symbol)),
+        candidate_count_n=len(candidates),
+        pooled_trade_count=pooled_trade_count,
+        max_candidate_trade_count=max_trades,
+        alpha_fdr_survivors=sum(1 for value in alpha_discoveries if value),
+        risk_diff_fdr_survivors=sum(1 for value in risk_discoveries if value),
+        edge_candidate_count=edge_count,
+        risk_improved_count=risk_count,
+        sparse_undeployable=sparse,
+        whole_cycle=_whole_cycle_summary(bars_by_symbol, config, cost_model),
+        regime_summary=_aggregate_regime_summary(candidates),
+        hermes_reconciliation={
+            "hermes_in_sample_total_return_pct": hermes_total_return_pct,
+            "hermes_buy_hold_pct": hermes_buy_hold_pct,
+            "pooled_oos_best_total_return_pct": max(
+                candidate.strategy_metrics.total_return for candidate in candidates
+            )
+            * 100.0,
+            "pooled_oos_best_buy_hold_pct": max(
+                candidate.buy_hold_metrics.total_return for candidate in candidates
+            )
+            * 100.0,
+            "note": "rules unchanged from #49; only OOS pooling and symbols expanded",
+        },
+        candidates={
+            _candidate_key(candidate): pooled_candidate_to_dict(candidate)
+            for candidate in candidates
+        },
+        multiple_testing={
+            "method": "BH-FDR over symbol x predeclared parameter grid",
+            "candidate_count_n": len(candidates),
+            "alpha": config.fdr_alpha,
+            "alpha_fdr_survivors": sum(1 for value in alpha_discoveries if value),
+            "risk_diff_fdr_survivors": sum(1 for value in risk_discoveries if value),
+            "risk_diff_test": "paired block bootstrap reused from risk_disciplined_beta",
+            "pooling": "all walk-forward OOS folds per symbol-parameter candidate",
+            "min_pooled_trades": definitive_config.min_pooled_trades,
+        },
+        safety={
+            "paper_only": True,
+            "live_trading": False,
+            "strategy_plugin_registered": False,
+            "order_path_added": False,
+            "wallet_or_order_api_used": False,
+            "hermes_source_in_public": False,
+            "strategy_rules_changed": False,
+            "parameters_tuned_for_edge": False,
+        },
+    )
+
+
 def simulate_price_action(
     bars: Sequence[ComboBar],
     params: PriceActionParams,
@@ -456,6 +666,343 @@ def report_to_dict(report: PriceActionReport) -> dict[str, object]:
         "multiple_testing": report.multiple_testing,
         "safety": report.safety,
     }
+
+
+def definitive_report_to_dict(report: PriceActionDefinitiveReport) -> dict[str, object]:
+    return {
+        "status": report.status,
+        "alpha_verdict": report.alpha_verdict,
+        "risk_verdict": report.risk_verdict,
+        "reason": report.reason,
+        "symbols": report.symbols,
+        "candidate_count_n": report.candidate_count_n,
+        "pooled_trade_count": report.pooled_trade_count,
+        "max_candidate_trade_count": report.max_candidate_trade_count,
+        "alpha_fdr_survivors": report.alpha_fdr_survivors,
+        "risk_diff_fdr_survivors": report.risk_diff_fdr_survivors,
+        "edge_candidate_count": report.edge_candidate_count,
+        "risk_improved_count": report.risk_improved_count,
+        "sparse_undeployable": report.sparse_undeployable,
+        "whole_cycle": report.whole_cycle,
+        "regime_summary": report.regime_summary,
+        "hermes_reconciliation": report.hermes_reconciliation,
+        "candidates": report.candidates,
+        "multiple_testing": report.multiple_testing,
+        "safety": report.safety,
+    }
+
+
+def pooled_candidate_to_dict(candidate: PriceActionPooledCandidate) -> dict[str, object]:
+    return {
+        "symbol": candidate.symbol,
+        "params": {
+            "lookback": candidate.params.lookback,
+            "risk_reward": candidate.params.risk_reward,
+            "max_hold": candidate.params.max_hold,
+        },
+        "fold_count": candidate.fold_count,
+        "trade_count": candidate.trade_count,
+        "strategy_metrics": metrics_to_dict(candidate.strategy_metrics),
+        "buy_hold_metrics": metrics_to_dict(candidate.buy_hold_metrics),
+        "trade_scorecard": {
+            "total_trades": candidate.trade_scorecard.total_trades,
+            "win_rate": candidate.trade_scorecard.win_rate,
+            "average_win": candidate.trade_scorecard.average_win,
+            "average_loss": candidate.trade_scorecard.average_loss,
+            "win_loss_ratio": candidate.trade_scorecard.win_loss_ratio,
+            "expectancy_per_trade": candidate.trade_scorecard.expectancy_per_trade,
+            "profit_factor": candidate.trade_scorecard.profit_factor,
+            "max_consecutive_losses": candidate.trade_scorecard.max_consecutive_losses,
+        },
+        "alpha_p_value": candidate.alpha_p_value,
+        "alpha_fdr_discovery": candidate.alpha_fdr_discovery,
+        "risk_difference_test": candidate.risk_difference_test,
+        "risk_diff_fdr_discovery": candidate.risk_diff_fdr_discovery,
+        "alpha_gate_checks": candidate.alpha_gate_checks,
+        "risk_gate_checks": candidate.risk_gate_checks,
+        "alpha_verdict": candidate.alpha_verdict,
+        "risk_verdict": candidate.risk_verdict,
+        "regime_windows": candidate.regime_windows,
+    }
+
+
+def _pooled_walk_forward_oos(
+    symbol: str,
+    bars: Sequence[ComboBar],
+    external: ExternalContext,
+    params: PriceActionParams,
+    config: PriceActionConfig,
+    definitive_config: PriceActionDefinitiveConfig,
+    cost_model: ComboCostModel,
+) -> dict[str, object] | None:
+    if len(bars) < config.train_bars + config.test_bars:
+        return None
+    strategy_returns: list[float] = []
+    benchmark_returns: list[float] = []
+    costs: list[float] = []
+    trades: list[PriceActionTrade] = []
+    fold_excess: list[float] = []
+    regime_rows: dict[str, list[dict[str, float | int]]] = {"bear": [], "bull": [], "range": []}
+    for train_start in range(
+        0,
+        len(bars) - config.train_bars - config.test_bars,
+        config.step_bars,
+    ):
+        test_start = train_start + config.train_bars
+        test_end = test_start + config.test_bars
+        strategy = simulate_price_action(
+            bars,
+            params,
+            external=external,
+            start=test_start,
+            end=test_end,
+            config=config,
+            cost_model=cost_model,
+        )
+        benchmark = buy_hold_simulation(
+            bars,
+            start=test_start,
+            end=test_end,
+            config=_combo_config(config),
+            cost_model=cost_model,
+        )
+        if not strategy.returns or not benchmark.returns:
+            continue
+        strategy_returns.extend(strategy.returns)
+        benchmark_returns.extend(benchmark.returns)
+        costs.extend(strategy.costs)
+        trades.extend(strategy.trades)
+        strategy_total = strategy.metrics.total_return
+        benchmark_total = benchmark.metrics.total_return
+        fold_excess.append(strategy_total - benchmark_total)
+        regime = _regime_name(benchmark_total, definitive_config)
+        regime_rows[regime].append(
+            {
+                "strategy_return": strategy_total,
+                "buy_hold_return": benchmark_total,
+                "excess": strategy_total - benchmark_total,
+                "trades": len(strategy.trades),
+            }
+        )
+    if not strategy_returns or not fold_excess:
+        return None
+    strategy_metrics = metrics_from_returns(
+        strategy_returns,
+        annualization_periods=config.annualization_periods,
+        turnover=sum(1.0 for value in costs if value > 0.0) * 2.0,
+        net_cost=sum(costs),
+    )
+    benchmark_metrics = metrics_from_returns(
+        benchmark_returns,
+        annualization_periods=config.annualization_periods,
+        turnover=2.0,
+        net_cost=cost_model.one_way_cost * 2.0,
+    )
+    return {
+        "symbol": symbol,
+        "strategy_returns": tuple(strategy_returns),
+        "benchmark_returns": tuple(benchmark_returns),
+        "strategy_metrics": strategy_metrics,
+        "benchmark_metrics": benchmark_metrics,
+        "trade_scorecard": trade_scorecard([trade.net_return for trade in trades]),
+        "trade_count": len(trades),
+        "fold_excess_returns": tuple(fold_excess),
+        "fold_count": len(fold_excess),
+        "regime_windows": _regime_summary(regime_rows),
+    }
+
+
+def _pooled_candidate_from_payload(
+    symbol: str,
+    params: PriceActionParams,
+    pooled: dict[str, object],
+    config: PriceActionConfig,
+    definitive_config: PriceActionDefinitiveConfig,
+    *,
+    alpha_p_value: float,
+    alpha_fdr_discovery: bool,
+    risk_diff_fdr_discovery: bool,
+) -> PriceActionPooledCandidate:
+    strategy_returns = cast(tuple[float, ...], pooled["strategy_returns"])
+    benchmark_returns = cast(tuple[float, ...], pooled["benchmark_returns"])
+    strategy_metrics = cast(ComboMetrics, pooled["strategy_metrics"])
+    benchmark_metrics = cast(ComboMetrics, pooled["benchmark_metrics"])
+    trade_count = cast(int, pooled["trade_count"])
+    risk_config = RiskBetaConfig(
+        annualization_periods=config.annualization_periods,
+        fdr_alpha=config.fdr_alpha,
+        risk_diff_bootstrap_samples=config.risk_diff_bootstrap_samples,
+        risk_diff_bootstrap_block_bars=config.risk_diff_bootstrap_block_bars,
+        risk_diff_ci_alpha=config.risk_diff_ci_alpha,
+    )
+    risk_difference = _paired_block_bootstrap_risk_difference_test(
+        strategy_returns,
+        benchmark_returns,
+        0.0,
+        0.0,
+        risk_config,
+        f"{symbol}:{params.key}",
+    )
+    alpha_checks = {
+        "min_pooled_trades": trade_count >= definitive_config.min_pooled_trades,
+        "total_return_gt_buy_hold": strategy_metrics.total_return > benchmark_metrics.total_return,
+        "sharpe_gt_buy_hold": strategy_metrics.sharpe > benchmark_metrics.sharpe,
+        "calmar_gt_buy_hold": strategy_metrics.calmar > benchmark_metrics.calmar,
+        "alpha_fdr_discovery": alpha_fdr_discovery,
+    }
+    risk_checks = {
+        "min_pooled_trades": trade_count >= definitive_config.min_pooled_trades,
+        "drawdown_reduction_positive": _drawdown_reduction(
+            strategy_metrics, benchmark_metrics
+        )
+        > 0,
+        "calmar_gt_buy_hold": strategy_metrics.calmar > benchmark_metrics.calmar,
+        "sortino_gt_buy_hold": strategy_metrics.sortino > benchmark_metrics.sortino,
+        "risk_difference_ci_lower_gt_0": bool(risk_difference["ci_lower_gt_0"]),
+        "risk_difference_fdr_discovery": risk_diff_fdr_discovery,
+    }
+    alpha_verdict, _alpha_reason = _gate_verdict(alpha_checks, "EDGE")
+    risk_verdict, _risk_reason = _gate_verdict(risk_checks, "RISK_IMPROVED")
+    return PriceActionPooledCandidate(
+        symbol=symbol,
+        params=params,
+        fold_count=cast(int, pooled["fold_count"]),
+        trade_count=trade_count,
+        strategy_metrics=strategy_metrics,
+        buy_hold_metrics=benchmark_metrics,
+        trade_scorecard=cast(TradeScorecard, pooled["trade_scorecard"]),
+        fold_excess_returns=cast(tuple[float, ...], pooled["fold_excess_returns"]),
+        alpha_p_value=alpha_p_value,
+        alpha_fdr_discovery=alpha_fdr_discovery,
+        risk_difference_test=risk_difference,
+        risk_diff_fdr_discovery=risk_diff_fdr_discovery,
+        alpha_gate_checks=alpha_checks,
+        risk_gate_checks=risk_checks,
+        alpha_verdict=alpha_verdict,
+        risk_verdict=risk_verdict,
+        regime_windows=cast(dict[str, dict[str, float | int | None]], pooled["regime_windows"]),
+    )
+
+
+def _candidate_key(candidate: PriceActionPooledCandidate) -> str:
+    return f"{candidate.symbol}:{candidate.params.key}"
+
+
+def _regime_name(total_return: float, config: PriceActionDefinitiveConfig) -> str:
+    if total_return >= config.regime_bull_return:
+        return "bull"
+    if total_return <= config.regime_bear_return:
+        return "bear"
+    return "range"
+
+
+def _regime_summary(
+    rows: dict[str, list[dict[str, float | int]]]
+) -> dict[str, dict[str, float | int | None]]:
+    summary: dict[str, dict[str, float | int | None]] = {}
+    for regime, values in rows.items():
+        excess = [float(row["excess"]) for row in values]
+        trades = [int(row["trades"]) for row in values]
+        summary[regime] = {
+            "windows": len(values),
+            "trades": sum(trades),
+            "median_excess": statistics.median(excess) if excess else None,
+            "positive_excess_share": (
+                sum(1 for value in excess if value > 0.0) / len(excess) if excess else None
+            ),
+        }
+    return summary
+
+
+def _aggregate_regime_summary(
+    candidates: Sequence[PriceActionPooledCandidate],
+) -> dict[str, dict[str, float | int | None]]:
+    rows: dict[str, list[dict[str, float | int]]] = {"bear": [], "bull": [], "range": []}
+    for candidate in candidates:
+        for regime, summary in candidate.regime_windows.items():
+            windows = int(summary["windows"] or 0)
+            if windows <= 0:
+                continue
+            rows[regime].append(
+                {
+                    "excess": float(summary["median_excess"] or 0.0),
+                    "trades": int(summary["trades"] or 0),
+                }
+            )
+    return _regime_summary(rows)
+
+
+def _whole_cycle_summary(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    config: PriceActionConfig,
+    cost_model: ComboCostModel,
+) -> dict[str, dict[str, float | int]]:
+    summary: dict[str, dict[str, float | int]] = {}
+    for symbol, bars in sorted(bars_by_symbol.items()):
+        if len(bars) < 2:
+            continue
+        benchmark = buy_hold_simulation(
+            bars,
+            start=0,
+            end=len(bars) - 1,
+            config=_combo_config(config),
+            cost_model=cost_model,
+        )
+        summary[symbol] = {
+            "bars": len(bars),
+            "buy_hold_total_return": benchmark.metrics.total_return,
+            "buy_hold_sharpe": benchmark.metrics.sharpe,
+            "buy_hold_sortino": benchmark.metrics.sortino,
+            "buy_hold_calmar": benchmark.metrics.calmar,
+            "buy_hold_max_drawdown": benchmark.metrics.max_drawdown,
+        }
+    return summary
+
+
+def _definitive_empty_report(
+    reason: str,
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    config: PriceActionConfig,
+    hermes_total_return_pct: float,
+    hermes_buy_hold_pct: float,
+) -> PriceActionDefinitiveReport:
+    return PriceActionDefinitiveReport(
+        status="OK",
+        alpha_verdict="NO_EDGE",
+        risk_verdict="NO_IMPROVEMENT",
+        reason=reason,
+        symbols=tuple(sorted(bars_by_symbol)),
+        candidate_count_n=0,
+        pooled_trade_count=0,
+        max_candidate_trade_count=0,
+        alpha_fdr_survivors=0,
+        risk_diff_fdr_survivors=0,
+        edge_candidate_count=0,
+        risk_improved_count=0,
+        sparse_undeployable=True,
+        whole_cycle={},
+        regime_summary={},
+        hermes_reconciliation={
+            "hermes_in_sample_total_return_pct": hermes_total_return_pct,
+            "hermes_buy_hold_pct": hermes_buy_hold_pct,
+        },
+        candidates={},
+        multiple_testing={
+            "method": "BH-FDR over symbol x predeclared parameter grid",
+            "candidate_count_n": 0,
+            "alpha": config.fdr_alpha,
+        },
+        safety={
+            "paper_only": True,
+            "live_trading": False,
+            "strategy_plugin_registered": False,
+            "order_path_added": False,
+            "wallet_or_order_api_used": False,
+            "hermes_source_in_public": False,
+            "strategy_rules_changed": False,
+            "parameters_tuned_for_edge": False,
+        },
+    )
 
 
 def _evaluate_is(

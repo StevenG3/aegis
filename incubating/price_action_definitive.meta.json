@@ -1,0 +1,30 @@
+{
+  "briefing": "CODEX_OLYMPUS_49B_PRICE_ACTION_DEFINITIVE",
+  "status": "research_harness_public_only",
+  "verdict_values": [
+    "EDGE",
+    "NO_EDGE",
+    "RISK_IMPROVED",
+    "NO_IMPROVEMENT"
+  ],
+  "discipline": {
+    "strategy_rules": "unchanged from Olympus #49 btc_price_action_reeval.py",
+    "pooling": "all walk-forward OOS folds per symbol-parameter candidate",
+    "symbols": "BTC/ETH/SOL evaluated independently; no shared fitted parameters",
+    "benchmarks": "same-symbol buy-and-hold, absolute and risk-adjusted",
+    "regimes": "bear/bull/range windows reported from OOS buy-and-hold returns",
+    "risk_test": "paired block bootstrap risk-difference test reused from risk_disciplined_beta",
+    "multiple_testing": "BH-FDR across symbol x predeclared parameter grid",
+    "safety": "read-only; no live trading, orders, wallet, or account path"
+  },
+  "public_boundary": {
+    "raw_data": "excluded",
+    "private_results": "~/aegis-strategies/incubating/olympus49b/",
+    "credentials": "excluded",
+    "hermes_source": "excluded"
+  },
+  "commands": {
+    "unit": "pytest -q packages/aegis/tests/test_btc_price_action_reeval.py",
+    "private_evidence": "python scripts/btc_price_action_reeval.py --private-dir ~/aegis-strategies/incubating/olympus49b"
+  }
+}

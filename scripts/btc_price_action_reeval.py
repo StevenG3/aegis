@@ -13,26 +13,27 @@ from aegis.btc_price_action_reeval import (
     DEFAULT_PRICE_ACTION_COST_MODEL,
     ExternalContext,
     PriceActionConfig,
-    report_to_dict,
-    run_btc_price_action_reeval,
+    definitive_report_to_dict,
+    run_price_action_definitive,
 )
 from aegis.combo_indicator_search import ComboBar, ComboCostModel
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Olympus #49 BTC 4H price-action reevaluation."
+        description="Run Olympus #49B definitive pooled 4H price-action evaluation."
     )
     parser.add_argument("--private-dir", required=True)
     parser.add_argument("--exchange", default="okx")
-    parser.add_argument("--symbol", default="BTC/USDT")
-    parser.add_argument("--funding-symbol", default="BTC/USDT:USDT")
+    parser.add_argument("--symbols", default="BTC/USDT,ETH/USDT,SOL/USDT")
+    parser.add_argument("--funding-symbols", default="BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT")
     parser.add_argument("--ethbtc-symbol", default="ETH/BTC")
     parser.add_argument("--timeframe", default="4h")
-    parser.add_argument("--since", default="2023-05-01")
-    parser.add_argument("--max-bars", type=int, default=7000)
+    parser.add_argument("--since", default="2019-01-01")
+    parser.add_argument("--max-bars", type=int, default=12000)
     parser.add_argument("--fee-bps", type=float, default=4.0)
     parser.add_argument("--slippage-bps", type=float, default=4.0)
+    parser.add_argument("--risk-bootstrap-samples", type=int, default=400)
     return parser.parse_args()
 
 
@@ -60,7 +61,8 @@ def fetch_ohlcv(
     rows: list[list[float]] = []
     cursor = since_ms
     while len(rows) < max_bars:
-        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=300)
+        limit = min(1000, max_bars - len(rows))
+        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=limit)
         if not batch:
             break
         rows.extend(batch)
@@ -69,7 +71,7 @@ def fetch_ohlcv(
             break
         cursor = next_cursor
         time.sleep(exchange.rateLimit / 1000)
-        if len(batch) < 300:
+        if len(batch) < limit:
             break
     return [
         ComboBar(
@@ -118,17 +120,30 @@ def fetch_funding_by_timestamp(
     }
 
 
+def _csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def main() -> int:
     args = parse_args()
     exchange = load_ccxt_exchange(args.exchange)
     since_ms = iso_to_ms(args.since)
-    bars = fetch_ohlcv(
-        exchange,
-        args.symbol,
-        timeframe=args.timeframe,
-        since_ms=since_ms,
-        max_bars=args.max_bars,
-    )
+    symbols = _csv(args.symbols)
+    funding_symbols = _csv(args.funding_symbols)
+    funding_by_symbol = {
+        symbol: funding_symbols[index] if index < len(funding_symbols) else ""
+        for index, symbol in enumerate(symbols)
+    }
+    bars_by_symbol = {
+        symbol: fetch_ohlcv(
+            exchange,
+            symbol,
+            timeframe=args.timeframe,
+            since_ms=since_ms,
+            max_bars=args.max_bars,
+        )
+        for symbol in symbols
+    }
     ethbtc = fetch_ohlcv(
         exchange,
         args.ethbtc_symbol,
@@ -136,43 +151,60 @@ def main() -> int:
         since_ms=since_ms,
         max_bars=args.max_bars,
     )
-    funding = fetch_funding_by_timestamp(
-        exchange,
-        args.funding_symbol,
-        since_ms=since_ms,
-        max_rows=args.max_bars,
-    )
+    external_by_symbol: dict[str, ExternalContext] = {}
+    for symbol in symbols:
+        funding_symbol = funding_by_symbol.get(symbol, "")
+        funding = (
+            fetch_funding_by_timestamp(
+                exchange,
+                funding_symbol,
+                since_ms=since_ms,
+                max_rows=args.max_bars,
+            )
+            if funding_symbol
+            else {}
+        )
+        external_by_symbol[symbol] = ExternalContext(
+            ethbtc=tuple(ethbtc),
+            funding_by_timestamp=funding,
+        )
     cost_model = ComboCostModel(
         fee_bps=args.fee_bps,
         slippage_bps=args.slippage_bps,
         funding_bps_per_period=DEFAULT_PRICE_ACTION_COST_MODEL.funding_bps_per_period,
         funding_label="short funding debited from ccxt funding history when available",
     )
-    external = ExternalContext(ethbtc=tuple(ethbtc), funding_by_timestamp=funding)
-    report = run_btc_price_action_reeval(
-        bars,
-        external=external,
-        config=PriceActionConfig(),
+    report = run_price_action_definitive(
+        bars_by_symbol,
+        external_by_symbol=external_by_symbol,
+        config=PriceActionConfig(
+            min_trades=30,
+            risk_diff_bootstrap_samples=args.risk_bootstrap_samples,
+        ),
         cost_model=cost_model,
     )
     payload = {
         "run_at": dt.datetime.now(dt.UTC).isoformat(),
         "exchange": args.exchange,
-        "symbol": args.symbol,
-        "funding_symbol": args.funding_symbol,
+        "symbols": symbols,
+        "funding_symbols": funding_by_symbol,
         "timeframe": args.timeframe,
         "since": args.since,
-        "bars": len(bars),
+        "bars": {symbol: len(bars) for symbol, bars in bars_by_symbol.items()},
         "ethbtc_bars": len(ethbtc),
-        "funding_rows": len(funding),
+        "funding_rows": {
+            symbol: len(context.funding_by_timestamp or {})
+            for symbol, context in external_by_symbol.items()
+        },
         "read_only": True,
         "wallet_or_order_api_used": False,
-        "report": report_to_dict(report),
+        "report": definitive_report_to_dict(report),
     }
     output_dir = Path(args.private_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = (
-        output_dir / f"btc-price-action-reeval-{dt.datetime.now(dt.UTC):%Y%m%dT%H%M%SZ}.json"
+    output_path = output_dir / (
+        f"price-action-definitive-"
+        f"{dt.datetime.now(dt.UTC):%Y%m%dT%H%M%SZ}.json"
     )
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     print(
@@ -180,18 +212,16 @@ def main() -> int:
             {
                 "output_path": str(output_path),
                 "status": report.status,
-                "verdict": report.verdict,
+                "alpha_verdict": report.alpha_verdict,
+                "risk_verdict": report.risk_verdict,
                 "reason": report.reason,
                 "candidate_count_n": report.candidate_count_n,
-                "raw_is_survivors": report.raw_is_survivors,
+                "pooled_trade_count": report.pooled_trade_count,
+                "max_candidate_trade_count": report.max_candidate_trade_count,
                 "alpha_fdr_survivors": report.alpha_fdr_survivors,
                 "risk_diff_fdr_survivors": report.risk_diff_fdr_survivors,
-                "alpha_edge_count": report.alpha_edge_count,
-                "risk_improved_count": report.risk_improved_count,
-                "insufficient_count": report.insufficient_count,
-                "bars": len(bars),
-                "ethbtc_bars": len(ethbtc),
-                "funding_rows": len(funding),
+                "sparse_undeployable": report.sparse_undeployable,
+                "bars": {symbol: len(bars) for symbol, bars in bars_by_symbol.items()},
             },
             indent=2,
             sort_keys=True,
