@@ -1,0 +1,47 @@
+{
+  "olympus": 49,
+  "name": "btc_price_action_reeval",
+  "status": "research_reevaluation",
+  "verdict": "INSUFFICIENT",
+  "public_artifact_policy": "sanitized only; Hermes source, bars, trades, equity curves, and full parameter results stay in private aegis-strategies/incubating/olympus49",
+  "strategy": {
+    "symbol": "BTC/USDT",
+    "timeframe": "4h",
+    "direction": "long_and_short",
+    "execution": "signal on confirmed bar, enter next bar open",
+    "costs": "8 bps one-way total fee/slippage; short funding debited when timestamp-aligned funding is available",
+    "parameter_grid_n": 12
+  },
+  "strict_rerun_summary": {
+    "candidate_count_n": 12,
+    "raw_is_survivors": 0,
+    "alpha_fdr_survivors": 0,
+    "risk_diff_fdr_survivors": 0,
+    "alpha_edge_count": 0,
+    "risk_improved_count": 0,
+    "insufficient_count": 12,
+    "best_locked_oos_total_return_pct": 10.934578416708685,
+    "best_locked_oos_buy_hold_pct": -43.74359334504964
+  },
+  "hermes_reconciliation": {
+    "hermes_headline_total_return_pct": 17.93072784238161,
+    "hermes_buy_hold_pct": 134.90259013211917,
+    "strict_best_minus_hermes_headline_pct": -6.996149425672925
+  },
+  "external_data_coverage": {
+    "btc_bars": 6872,
+    "ethbtc_bars": 6872,
+    "funding_rows": 285,
+    "oi_rows": 0,
+    "oi_policy": "no forward fill; missing OI remains missing"
+  },
+  "safety": {
+    "paper_only": true,
+    "live_trading": false,
+    "strategy_plugin_registered": false,
+    "order_path_added": false,
+    "wallet_or_order_api_used": false,
+    "hermes_source_in_public": false
+  },
+  "private_result_path": "/home/gggqqy/apps/aegis-strategies/incubating/olympus49/btc-price-action-reeval-20260619T043937Z.json"
+}
