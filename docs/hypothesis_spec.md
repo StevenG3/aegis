@@ -1,9 +1,10 @@
 # HypothesisSpec Private File Contract
 
-`scripts/run_hypothesis.py` is the #59 file-only seam from Hermes into the Aegis
+`scripts/run_hypothesis.py` is the file-only seam from Hermes into the Aegis
 backtest core. It reads one local JSON file from the private incubating tree,
-validates the discipline flags, calls `aegis.backtest_core.run_backtest`, writes
-one private verdict JSON, and appends one private registry row.
+validates the discipline flags, binds a reviewed local runner when requested,
+calls `aegis.backtest_core.run_backtest`, writes one private verdict JSON, and
+appends one private registry row.
 
 The JSON Schema lives at
 `packages/aegis/backtest_core/hypothesis_schema.json`.
@@ -24,10 +25,11 @@ The seam is offline and human-triggered:
 - no automatic Hermes pull
 - no live trading
 - no account, order, wallet, or broker mutation
-- no strategy adapter wired in by #59
+- only reviewed, local Aegis runners can be named
 
-The #59 CLI therefore returns a validation-only `INSUFFICIENT` verdict until a
-future reviewed briefing binds a real local runner.
+When `runner` is omitted, the CLI returns a validation-only `INSUFFICIENT`
+verdict. A named runner never comes from executable JSON; it must already be
+registered in public Aegis code.
 
 ## Field Mapping
 
@@ -45,9 +47,10 @@ future reviewed briefing binds a real local runner.
 | `survivor_light` | `survivor_light` | Applies the survivor-light positive-verdict ceiling. |
 | `discipline` | `BacktestDiscipline` | Required t+1, locked OOS, walk-forward, full costs, and multiple-testing gates. |
 | `trust` | CLI guard metadata | Private registry scope and no-live/read-only assertions. |
+| `runner` | local runner registry | Optional `validation_only` or reviewed named runner such as `microstructure_perp`. |
 
-`runner` and `verdict_adapter` are intentionally not part of the JSON contract.
-They are Python callables and must only be added by reviewed Aegis code.
+`verdict_adapter` is intentionally not part of the JSON contract. Runners are
+names only; Python callables must be registered by reviewed Aegis code.
 
 ## Required Gates
 
@@ -86,6 +89,7 @@ This is a synthetic shape template only:
   "benchmark": "placeholder benchmark",
   "data_source": "sanitized_offline_dataset_label",
   "trial_n": 1,
+  "runner": "validation_only",
   "survivor_light": false,
   "trust": {
     "registry_scope": "private",
@@ -112,11 +116,12 @@ This is a synthetic shape template only:
 ```bash
 AEGIS_STRATEGIES_ROOT=/home/gggqqy/apps/aegis-strategies \
   python scripts/run_hypothesis.py \
-  /home/gggqqy/apps/aegis-strategies/incubating/olympus59/specs/example.json
+  /home/gggqqy/apps/aegis-strategies/incubating/olympus60/specs/example.json
 ```
 
 Outputs are written only under
-`${AEGIS_STRATEGIES_ROOT}/incubating/olympus59/`:
+the same private task directory as the spec, for example
+`${AEGIS_STRATEGIES_ROOT}/incubating/olympus60/`:
 
 - `results/<spec-id>-<timestamp>.json`
 - `hypothesis_registry.jsonl`
@@ -125,3 +130,34 @@ Each registry row records `spec_id`, `trial_n`, verdict, timestamp, spec path,
 and result path. The CLI prints `global_trial_n`, the cumulative trial count
 across the private registry, so reviewers can decide whether a broader global
 FDR/PBO correction is now required.
+
+## Registered Runners
+
+### `validation_only`
+
+Default. Validates the file seam and returns `INSUFFICIENT`; useful for schema
+handoff tests and gated registry accounting.
+
+### `microstructure_perp`
+
+Offline perpetual microstructure runner for #60. It consumes private,
+already-aggregated observations from `params.observations`; it does not fetch
+ccxt, connect to a venue, read accounts, or subscribe to order books.
+
+Required observation fields:
+
+- `symbol`
+- `timestamp`
+- `close`
+- `open_interest`
+- `funding_rate`
+- `buy_volume`
+- `sell_volume`
+- optional `order_book_event_rate_per_hour`
+- optional `survivor_status`
+
+The signal combines funding sign, OI/price divergence, and order-flow imbalance
+into t+1 perp returns with fees, slippage, and funding debited. Any symbol with
+`order_book_event_rate_per_hour > 15000` is excluded as data-blocked for this
+round. Survivor-light specs must set `survivor_light=true` and
+`discipline.survivor_ceiling=true`.

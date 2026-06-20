@@ -197,6 +197,34 @@
         }
       }
     },
+    "runner": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "validation_only",
+            "microstructure_perp"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "enum": [
+                "validation_only",
+                "microstructure_perp"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "Optional local Aegis runner name. Omitted means validation_only. Runner code is registered in Aegis; JSON never carries executable code."
+    },
     "notes": {
       "type": "string",
       "maxLength": 2000,

@@ -11,12 +11,14 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from aegis.backtest_core import BacktestDiscipline, HypothesisSpec, StandardVerdict, run_backtest
+from aegis.microstructure_perp_runner import run_microstructure_perp_from_spec
 from aegis.private_paths import PrivatePathError, private_root_from_env, resolve_private_dir
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TASK_NAME = "olympus59"
 REGISTRY_NAME = "hypothesis_registry.jsonl"
 RESULTS_DIR_NAME = "results"
+VALIDATION_ONLY_RUNNER = "validation_only"
+NAMED_RUNNERS = {"microstructure_perp": run_microstructure_perp_from_spec}
 ALLOWED_TYPES = frozenset(
     {"factor", "combo", "carry", "event", "momentum", "risk", "price_action", "other"}
 )
@@ -42,8 +44,8 @@ class HypothesisCliError(ValueError):
 def run_cli(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate one private HypothesisSpec JSON file, run the local validation-only "
-            "backtest seam, and append the private olympus59 registry."
+            "Validate one private HypothesisSpec JSON file, run a registered local runner "
+            "when requested, and append the private task registry."
         )
     )
     parser.add_argument("spec_json", type=Path)
@@ -51,7 +53,10 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         "--private-dir",
         type=Path,
         default=None,
-        help="Private output dir, default ${AEGIS_STRATEGIES_ROOT}/incubating/olympus59.",
+        help=(
+            "Private output dir, default to the spec's "
+            "${AEGIS_STRATEGIES_ROOT}/incubating/<task>."
+        ),
     )
     try:
         return _run(parser.parse_args(argv))
@@ -62,8 +67,9 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
 def _run(args: argparse.Namespace) -> int:
     private_root = private_root_from_env(repo_root=REPO_ROOT)
-    task_dir = _task_dir(args.private_dir, private_root=private_root)
     spec_path = _private_task_file(args.spec_json, private_root=private_root)
+    task_name = _task_name_from_private_path(spec_path, private_root=private_root)
+    task_dir = _task_dir(args.private_dir, private_root=private_root, task_name=task_name)
     raw = _load_spec(spec_path)
     _validate_json_contract(raw)
     spec = _build_spec(raw)
@@ -97,13 +103,13 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _task_dir(value: Path | None, *, private_root: Path) -> Path:
-    path = private_root / "incubating" / TASK_NAME if value is None else value
+def _task_dir(value: Path | None, *, private_root: Path, task_name: str) -> Path:
+    path = private_root / "incubating" / task_name if value is None else value
     resolved = resolve_private_dir(path, private_root=private_root, repo_root=REPO_ROOT)
-    if resolved.relative_to(private_root).parts[:2] != ("incubating", TASK_NAME):
+    if resolved.relative_to(private_root).parts[:2] != ("incubating", task_name):
         raise HypothesisCliError(
             "run_hypothesis.py may only write under "
-            "${AEGIS_STRATEGIES_ROOT}/incubating/olympus59/"
+            "the same ${AEGIS_STRATEGIES_ROOT}/incubating/<task>/ as the spec"
         )
     return resolved
 
@@ -111,13 +117,18 @@ def _task_dir(value: Path | None, *, private_root: Path) -> Path:
 def _private_task_file(path: Path, *, private_root: Path) -> Path:
     resolved = path.expanduser().resolve(strict=False)
     resolve_private_dir(resolved.parent, private_root=private_root, repo_root=REPO_ROOT)
-    if resolved.parent.relative_to(private_root).parts[:2] != ("incubating", TASK_NAME):
-        raise HypothesisCliError(
-            "spec JSON must live under ${AEGIS_STRATEGIES_ROOT}/incubating/olympus59/"
-        )
     if not resolved.exists() or not resolved.is_file():
         raise HypothesisCliError(f"spec JSON does not exist: {resolved}")
     return resolved
+
+
+def _task_name_from_private_path(path: Path, *, private_root: Path) -> str:
+    parts = path.relative_to(private_root).parts
+    if len(parts) < 3 or parts[0] != "incubating":
+        raise HypothesisCliError(
+            "spec JSON must live under ${AEGIS_STRATEGIES_ROOT}/incubating/<task>/"
+        )
+    return parts[1]
 
 
 def _load_spec(path: Path) -> dict[str, Any]:
@@ -144,9 +155,10 @@ def _validate_json_contract(raw: Mapping[str, Any]) -> None:
         "survivor_light",
         "trust",
         "discipline",
+        "runner",
         "notes",
     }
-    for key in supported - {"notes"}:
+    for key in supported - {"notes", "runner"}:
         if key not in raw:
             raise HypothesisCliError(f"{key} is required")
     if set(raw) - supported:
@@ -155,6 +167,7 @@ def _validate_json_contract(raw: Mapping[str, Any]) -> None:
         raise HypothesisCliError("type must be one of the predeclared HypothesisSpec types")
     if not isinstance(raw["survivor_light"], bool):
         raise HypothesisCliError("survivor_light must be boolean")
+    _validate_runner(raw.get("runner", VALIDATION_ONLY_RUNNER))
     _validate_trust(_mapping(raw["trust"], "trust"))
     _validate_discipline(_mapping(raw["discipline"], "discipline"), bool(raw["survivor_light"]))
     _reject_forbidden_text(raw, context="spec")
@@ -210,8 +223,60 @@ def _build_spec(raw: Mapping[str, Any]) -> HypothesisSpec:
         trial_count_n=_positive_int(raw["trial_n"], "trial_n"),
         discipline=discipline,
         survivor_light=bool(raw["survivor_light"]),
-        runner=lambda: _validation_only_payload(raw),
+        runner=_runner_for(raw),
     )
+
+
+def _validate_runner(raw: object) -> None:
+    name = _runner_name(raw)
+    if name != VALIDATION_ONLY_RUNNER and name not in NAMED_RUNNERS:
+        allowed = ", ".join(sorted((*NAMED_RUNNERS, VALIDATION_ONLY_RUNNER)))
+        raise HypothesisCliError(f"runner must be one of: {allowed}")
+
+
+def _runner_for(raw: Mapping[str, Any]) -> Any:
+    name = _runner_name(raw.get("runner", VALIDATION_ONLY_RUNNER))
+    if name == VALIDATION_ONLY_RUNNER:
+        return lambda: _validation_only_payload(raw)
+
+    def _run_named() -> Mapping[str, Any]:
+        return NAMED_RUNNERS[name](_build_spec_without_runner(raw))
+
+    return _run_named
+
+
+def _build_spec_without_runner(raw: Mapping[str, Any]) -> HypothesisSpec:
+    discipline_raw = _mapping(raw["discipline"], "discipline")
+    return HypothesisSpec(
+        key=_required_str(raw, "id"),
+        hypothesis_type=_required_str(raw, "type"),  # type: ignore[arg-type]
+        universe=_str_tuple(raw["universe"], "universe"),
+        predeclared_signals=_str_tuple(raw["predeclared_signals"], "predeclared_signals"),
+        params=_mapping(raw["params"], "params"),
+        cost_model=_mapping(raw["cost_model"], "cost_model"),
+        benchmark=_required_str(raw, "benchmark"),
+        data_source=_required_str(raw, "data_source"),
+        trial_count_n=_positive_int(raw["trial_n"], "trial_n"),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=bool(discipline_raw["survivor_ceiling"]),
+        ),
+        survivor_light=bool(raw["survivor_light"]),
+    )
+
+
+def _runner_name(raw: object) -> str:
+    if isinstance(raw, str):
+        return raw.strip() or VALIDATION_ONLY_RUNNER
+    if isinstance(raw, Mapping):
+        value = raw.get("name", VALIDATION_ONLY_RUNNER)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise HypothesisCliError("runner must be a string or an object with a name")
 
 
 def _validation_only_payload(raw: Mapping[str, Any]) -> Mapping[str, Any]:
