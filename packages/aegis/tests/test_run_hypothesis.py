@@ -67,6 +67,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def _microstructure_observations() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     closes = [100.0, 101.0, 103.0, 105.0, 100.0, 96.0, 98.0, 101.0, 97.0, 94.0]
+    btc_closes = [100.0, 101.0, 102.0, 106.0, 109.0, 104.0, 100.0, 103.0, 106.0, 101.0]
     for symbol, scale, survivor_status in (
         ("BTC/USDT:USDT", 1.0, "active"),
         ("DELISTED/USDT:USDT", 0.2, "delisted"),
@@ -77,10 +78,14 @@ def _microstructure_observations() -> list[dict[str, Any]]:
                     "symbol": symbol,
                     "timestamp": 1_700_000_000 + index * 14_400,
                     "close": max(1.0, close * scale),
+                    "btc_close": btc_closes[index],
                     "open_interest": max(1.0, 1_000.0 - index * 35.0),
                     "funding_rate": 0.0002,
                     "buy_volume": 10.0,
                     "sell_volume": 30.0,
+                    "bid_ask_spread_bps": 5.0,
+                    "top_depth_usd": 100_000.0,
+                    "quote_volume_usd": 2_000_000.0,
                     "order_book_event_rate_per_hour": 0.0,
                     "survivor_status": survivor_status,
                 }
