@@ -62,7 +62,7 @@ class FakeBinanceUsdm:
                 str(100 + index),
                 "40",
                 start + index * 14_400_000 + 1,
-                "0",
+                "4000",
                 "0",
                 "15",
             ]
@@ -96,12 +96,28 @@ def test_alignment_uses_funding_price_flow_and_open_interest() -> None:
             {"timestamp": 2000, "funding_rate": -0.0002},
         ],
         price_flow=[
-            {"timestamp": 900, "close": 100.0, "buy_volume": 10.0, "sell_volume": 20.0},
-            {"timestamp": 1900, "close": 101.0, "buy_volume": 30.0, "sell_volume": 10.0},
+            {
+                "timestamp": 900,
+                "close": 100.0,
+                "buy_volume": 10.0,
+                "sell_volume": 20.0,
+                "quote_volume_usd": 3000.0,
+            },
+            {
+                "timestamp": 1900,
+                "close": 101.0,
+                "buy_volume": 30.0,
+                "sell_volume": 10.0,
+                "quote_volume_usd": 4000.0,
+            },
         ],
         open_interest=[
             {"timestamp": 800, "open_interest": 1000.0},
             {"timestamp": 1800, "open_interest": 900.0},
+        ],
+        btc_reference=[
+            {"timestamp": 850, "close": 99.0},
+            {"timestamp": 1850, "close": 102.0},
         ],
         survivor_status="active",
     )
@@ -110,6 +126,8 @@ def test_alignment_uses_funding_price_flow_and_open_interest() -> None:
     assert rows[0]["close"] == 100.0
     assert rows[1]["open_interest"] == 900.0
     assert rows[1]["buy_volume"] == 30.0
+    assert rows[1]["btc_close"] == 102.0
+    assert rows[1]["quote_volume_usd"] == 4000.0
 
 
 def test_main_with_fake_ccxt_writes_private_evidence(
@@ -135,3 +153,4 @@ def test_main_with_fake_ccxt_writes_private_evidence(
     assert payload["coverage"]["funding_rows"] > 0
     assert payload["report"]["multiple_testing"]["method"] == "BH-FDR + CSCV_PBO"
     assert payload["verdict"]["survivor_ceiling_applied"] is True
+    assert payload["input"]["btc_reference_symbol"] == "BTC/USDT:USDT"

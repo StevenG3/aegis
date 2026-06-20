@@ -47,6 +47,7 @@ class EvidenceRun:
     output_dir: Path
     high_liquidity_symbols: tuple[str, ...]
     delisted_crash_symbols: tuple[str, ...]
+    btc_reference_symbol: str
 
 
 def main() -> int:
@@ -56,9 +57,10 @@ def main() -> int:
     observations: list[dict[str, Any]] = []
     coverage: list[dict[str, Any]] = []
     fetch_failures: list[dict[str, str]] = []
+    btc_reference = _load_btc_reference(run, fetch_failures)
     for symbol in run.symbols:
         try:
-            symbol_rows = load_symbol_observations(run, symbol)
+            symbol_rows = load_symbol_observations(run, symbol, btc_reference=btc_reference)
             if not symbol_rows:
                 raise EvidenceDataError(f"no aligned rows for {symbol}")
             observations.extend(symbol_rows)
@@ -128,7 +130,12 @@ def main() -> int:
     return 0
 
 
-def load_symbol_observations(run: EvidenceRun, symbol: str) -> list[dict[str, Any]]:
+def load_symbol_observations(
+    run: EvidenceRun,
+    symbol: str,
+    *,
+    btc_reference: Sequence[Mapping[str, float | int]],
+) -> list[dict[str, Any]]:
     start_dt = _parse_date(run.start)
     end_dt = _parse_date(run.end)
     funding = _load_funding_history(
@@ -154,9 +161,29 @@ def load_symbol_observations(run: EvidenceRun, symbol: str) -> list[dict[str, An
         symbol=symbol,
         funding=funding,
         price_flow=price_flow,
+        btc_reference=btc_reference,
         open_interest=oi,
         survivor_status=_survivor_status(run, symbol),
     )
+
+
+def _load_btc_reference(
+    run: EvidenceRun, fetch_failures: list[dict[str, str]]
+) -> list[dict[str, float | int]]:
+    try:
+        return _load_price_flow(
+            run.source,
+            run.btc_reference_symbol,
+            run.timeframe,
+            _parse_date(run.start),
+            _parse_date(run.end),
+            max_rows=run.max_bars_per_symbol,
+        )
+    except Exception as exc:  # noqa: BLE001
+        fetch_failures.append(
+            {"symbol": run.btc_reference_symbol, "error": f"btc_reference: {exc}"}
+        )
+        return []
 
 
 def _hypothesis_spec(run: EvidenceRun, observations: Sequence[Mapping[str, Any]]) -> HypothesisSpec:
@@ -320,6 +347,7 @@ def _load_binance_futures_klines(
             ts = _int_value(raw[0])
             close = _float_scalar(raw[4])
             volume = _float_scalar(raw[5])
+            quote_volume = _float_scalar(raw[7]) if len(raw) > 7 else None
             taker_buy = _float_scalar(raw[9])
             if ts is None or close is None or volume is None or taker_buy is None:
                 continue
@@ -334,6 +362,7 @@ def _load_binance_futures_klines(
                     "close": close,
                     "buy_volume": buy_volume,
                     "sell_volume": sell_volume,
+                    "quote_volume_usd": max(quote_volume or 0.0, 0.0),
                 }
             )
         if last_open is None:
@@ -466,13 +495,16 @@ def _align_observations(
     price_flow: Sequence[Mapping[str, float | int]],
     open_interest: Sequence[Mapping[str, float | int]],
     survivor_status: str,
+    btc_reference: Sequence[Mapping[str, float | int]] = (),
 ) -> list[dict[str, Any]]:
     price_sorted = sorted(price_flow, key=lambda item: int(item["timestamp"]))
+    btc_sorted = sorted(btc_reference, key=lambda item: int(item["timestamp"]))
     oi_sorted = sorted(open_interest, key=lambda item: int(item["timestamp"]))
     rows: list[dict[str, Any]] = []
     for event in sorted(funding, key=lambda item: int(item["timestamp"])):
         ts = int(event["timestamp"])
         price = _last_at_or_before(price_sorted, ts)
+        btc_price = _last_at_or_before(btc_sorted, ts)
         oi = _last_at_or_before(oi_sorted, ts)
         if price is None or oi is None:
             continue
@@ -481,11 +513,12 @@ def _align_observations(
                 "symbol": symbol,
                 "timestamp": ts,
                 "close": float(price["close"]),
+                "btc_close": float(btc_price["close"]) if btc_price is not None else None,
                 "open_interest": float(oi["open_interest"]),
                 "funding_rate": float(event["funding_rate"]),
                 "buy_volume": float(price["buy_volume"]),
                 "sell_volume": float(price["sell_volume"]),
-                "order_book_event_rate_per_hour": 0.0,
+                "quote_volume_usd": float(price.get("quote_volume_usd", 0.0)),
                 "survivor_status": survivor_status,
             }
         )
@@ -568,6 +601,10 @@ def _run_from_env() -> EvidenceRun:
         delisted_crash_symbols=tuple(
             _env_csv("MICROSTRUCTURE_EVIDENCE_DELISTED_CRASH", tuple(DELISTED_CRASH_DEFAULTS))
         ),
+        btc_reference_symbol=(
+            os.getenv("MICROSTRUCTURE_EVIDENCE_BTC_REFERENCE_SYMBOL", "BTC/USDT:USDT").strip()
+            or "BTC/USDT:USDT"
+        ),
     )
 
 
@@ -583,6 +620,7 @@ def _run_to_dict(run: EvidenceRun) -> dict[str, Any]:
         "slippage_bps": run.slippage_bps,
         "high_liquidity_symbols": list(run.high_liquidity_symbols),
         "delisted_crash_symbols": list(run.delisted_crash_symbols),
+        "btc_reference_symbol": run.btc_reference_symbol,
     }
 
 

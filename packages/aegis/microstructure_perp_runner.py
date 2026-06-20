@@ -24,11 +24,15 @@ class MicrostructureBar:
     symbol: str
     timestamp: int
     close: float
+    btc_close: float | None
     open_interest: float
     funding_rate: float
     buy_volume: float
     sell_volume: float
-    order_book_event_rate_per_hour: float = 0.0
+    bid_ask_spread_bps: float | None
+    top_depth_usd: float | None
+    quote_volume_usd: float | None
+    order_book_event_rate_per_hour: float | None = None
     survivor_status: str = "active"
 
 
@@ -52,6 +56,35 @@ class CandidateResult:
     p_value: float
     turnover: float
     net_cost: float
+    event_log: tuple[Mapping[str, object], ...]
+
+
+@dataclass(frozen=True)
+class BtcImpulseConfig:
+    enabled: bool
+    lookback_bars: int
+    return_threshold: float
+    zscore_threshold: float
+
+
+@dataclass(frozen=True)
+class LiquidityGuardConfig:
+    enabled: bool
+    max_spread_bps: float
+    min_top_depth_usd: float
+    min_quote_volume_usd: float
+
+
+@dataclass(frozen=True)
+class LiquidityDataAvailability:
+    spread_data_blocked: bool
+    top_depth_data_blocked: bool
+
+
+@dataclass(frozen=True)
+class EntryWindow:
+    start_timestamp: int | None
+    end_timestamp: int | None
 
 
 def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
@@ -61,11 +94,12 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
     if not bars:
         return _insufficient_payload("params.observations is empty")
 
-    filtered, excluded_symbols = _exclude_data_blocked_symbols(bars)
+    filtered, excluded_symbols, data_blocked_log = _exclude_data_blocked_symbols(bars)
     if not filtered:
         return _insufficient_payload(
             "all symbols excluded by order_book_event_rate_per_hour data-block",
             excluded_symbols=excluded_symbols,
+            event_log=data_blocked_log,
         )
 
     by_symbol = _group_bars(filtered)
@@ -84,6 +118,10 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
     fdr_alpha = _float_param(params, "fdr_alpha", 0.10)
     pbo_splits = _int_param(params, "pbo_splits", 4)
     pbo_threshold = _float_param(params, "pbo_threshold", 0.20)
+    btc_impulse = _btc_impulse_config(params)
+    liquidity_guard = _liquidity_guard_config(params)
+    liquidity_availability = _liquidity_data_availability(filtered)
+    entry_window = _entry_window(params)
 
     results = tuple(
         _evaluate_candidate(
@@ -93,16 +131,24 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
             costs=costs,
             locked_oos_fraction=locked_oos_fraction,
             fold_count=fold_count,
+            btc_impulse=btc_impulse,
+            liquidity_guard=liquidity_guard,
+            liquidity_availability=liquidity_availability,
+            entry_window=entry_window,
         )
         for symbol, bars in sorted(by_symbol.items())
         for candidate in grid
     )
     valid_results = tuple(result for result in results if result.returns)
     if not valid_results:
+        event_log = tuple(data_blocked_log) + tuple(
+            entry for result in results for entry in result.event_log
+        )
         return _insufficient_payload(
             "insufficient locked-OOS t+1 samples after applying grid",
             excluded_symbols=excluded_symbols,
             candidate_count=max(_spec_trial_count(spec), len(grid) * len(by_symbol)),
+            event_log=event_log,
         )
 
     p_values = [result.p_value for result in valid_results]
@@ -177,10 +223,20 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
             "excluded_data_blocked_symbols": excluded_symbols,
         },
         "best_candidate": _best_candidate_to_dict(best),
+        "event_log": tuple(data_blocked_log)
+        + tuple(entry for result in valid_results for entry in result.event_log),
         "universe": {
             "usable_symbols": usable_symbols,
             "excluded_data_blocked_symbols": excluded_symbols,
             "survivor_light": True,
+        },
+        "research_controls": {
+            "btc_impulse": _btc_impulse_to_dict(btc_impulse),
+            "entry_window": _entry_window_to_dict(entry_window),
+            "liquidity_guard": _liquidity_guard_to_dict(liquidity_guard),
+            "liquidity_data_availability": _liquidity_availability_to_dict(
+                liquidity_availability
+            ),
         },
     }
 
@@ -197,12 +253,16 @@ def _bar_from_mapping(item: Mapping[str, object]) -> MicrostructureBar:
         symbol=_required_str(item, "symbol"),
         timestamp=_required_int(item, "timestamp"),
         close=_positive_float(item, "close"),
+        btc_close=_optional_positive_float(item, "btc_close"),
         open_interest=_nonnegative_float(item, "open_interest"),
         funding_rate=_float_value(item, "funding_rate"),
         buy_volume=_nonnegative_float(item, "buy_volume"),
         sell_volume=_nonnegative_float(item, "sell_volume"),
-        order_book_event_rate_per_hour=_nonnegative_float(
-            item, "order_book_event_rate_per_hour", default=0.0
+        bid_ask_spread_bps=_optional_nonnegative_float(item, "bid_ask_spread_bps"),
+        top_depth_usd=_optional_nonnegative_float(item, "top_depth_usd"),
+        quote_volume_usd=_optional_nonnegative_float(item, "quote_volume_usd"),
+        order_book_event_rate_per_hour=_optional_nonnegative_float(
+            item, "order_book_event_rate_per_hour"
         ),
         survivor_status=_str_value(item.get("survivor_status", "active")),
     )
@@ -210,14 +270,22 @@ def _bar_from_mapping(item: Mapping[str, object]) -> MicrostructureBar:
 
 def _exclude_data_blocked_symbols(
     bars: Sequence[MicrostructureBar],
-) -> tuple[tuple[MicrostructureBar, ...], tuple[str, ...]]:
+) -> tuple[tuple[MicrostructureBar, ...], tuple[str, ...], tuple[Mapping[str, object], ...]]:
     blocked = {
         bar.symbol
         for bar in bars
-        if bar.order_book_event_rate_per_hour > MAX_ORDER_BOOK_EVENT_RATE_PER_HOUR
+        if bar.order_book_event_rate_per_hour is not None
+        and bar.order_book_event_rate_per_hour > MAX_ORDER_BOOK_EVENT_RATE_PER_HOUR
     }
     kept = tuple(bar for bar in bars if bar.symbol not in blocked)
-    return kept, tuple(sorted(blocked))
+    log = tuple(
+        _data_blocked_log_entry(bar)
+        for bar in bars
+        if bar.symbol in blocked
+        and bar.order_book_event_rate_per_hour is not None
+        and bar.order_book_event_rate_per_hour > MAX_ORDER_BOOK_EVENT_RATE_PER_HOUR
+    )
+    return kept, tuple(sorted(blocked)), log
 
 
 def _group_bars(
@@ -265,6 +333,10 @@ def _evaluate_candidate(
     costs: Mapping[str, float],
     locked_oos_fraction: float,
     fold_count: int,
+    btc_impulse: BtcImpulseConfig,
+    liquidity_guard: LiquidityGuardConfig,
+    liquidity_availability: LiquidityDataAvailability,
+    entry_window: EntryWindow,
 ) -> CandidateResult:
     (
         strategy_returns,
@@ -272,11 +344,16 @@ def _evaluate_candidate(
         trade_returns,
         total_turnover,
         total_cost,
+        event_log,
     ) = _symbol_returns(
         candidate,
         bars=bars,
         costs=costs,
         locked_oos_fraction=locked_oos_fraction,
+        btc_impulse=btc_impulse,
+        liquidity_guard=liquidity_guard,
+        liquidity_availability=liquidity_availability,
+        entry_window=entry_window,
     )
     fold_excess = _fold_excess(strategy_returns, benchmark_returns, fold_count)
     return CandidateResult(
@@ -289,6 +366,7 @@ def _evaluate_candidate(
         p_value=sign_test_p_value(fold_excess, alternative="greater"),
         turnover=total_turnover,
         net_cost=total_cost,
+        event_log=tuple(event_log),
     )
 
 
@@ -298,33 +376,73 @@ def _symbol_returns(
     bars: Sequence[MicrostructureBar],
     costs: Mapping[str, float],
     locked_oos_fraction: float,
-) -> tuple[list[float], list[float], list[float], float, float]:
+    btc_impulse: BtcImpulseConfig,
+    liquidity_guard: LiquidityGuardConfig,
+    liquidity_availability: LiquidityDataAvailability,
+    entry_window: EntryWindow,
+) -> tuple[list[float], list[float], list[float], float, float, list[Mapping[str, object]]]:
     if len(bars) < 6:
-        return [], [], [], 0.0, 0.0
-    start = max(1, int(len(bars) * (1.0 - locked_oos_fraction)))
+        return [], [], [], 0.0, 0.0, []
+    start = max(btc_impulse.lookback_bars, int(len(bars) * (1.0 - locked_oos_fraction)))
     strategy: list[float] = []
     benchmark: list[float] = []
     trades: list[float] = []
+    event_log: list[Mapping[str, object]] = []
     turnover = 0.0
     net_cost = 0.0
     previous_position = 0
     for index in range(start, len(bars) - 2):
-        signal = _signal(candidate, previous=bars[index - 1], current=bars[index])
+        previous = bars[index - 1]
+        current = bars[index]
         entry = bars[index + 1]
         exit_bar = bars[index + 2]
+        signal = _signal(candidate, previous=previous, current=current)
+        btc_pass, btc_reason = _btc_impulse_pass(bars, index=index, config=btc_impulse)
+        liquidity_pass, liquidity_reason = _liquidity_guard_pass(
+            current, liquidity_guard, liquidity_availability
+        )
+        entry_window_pass = _entry_window_pass(current.timestamp, entry_window)
+        orderbook_missing = current.order_book_event_rate_per_hour is None
+        excluded_reason = _excluded_reason(
+            btc_reason=btc_reason,
+            liquidity_reason=liquidity_reason,
+            entry_window_pass=entry_window_pass,
+        )
+        if not btc_pass or not liquidity_pass or not entry_window_pass:
+            signal = 0
         gross = signal * (exit_bar.close / entry.close - 1.0)
         position_change = abs(signal - previous_position)
-        trade_cost = position_change * costs["one_way_cost"]
+        fee_cost = position_change * costs["fee_cost"]
+        slippage_cost = position_change * costs["slippage_cost"]
         funding_cost = signal * entry.funding_rate
-        net = gross - trade_cost - funding_cost
+        net = gross - fee_cost - slippage_cost - funding_cost
         strategy.append(net)
         benchmark.append(exit_bar.close / entry.close - 1.0)
         turnover += float(position_change)
-        net_cost += trade_cost + abs(funding_cost)
+        net_cost += fee_cost + slippage_cost + abs(funding_cost)
         if signal != 0:
             trades.append(net)
+        event_log.append(
+            _event_log_entry(
+                candidate=candidate,
+                current=current,
+                previous=previous,
+                signal=signal,
+                btc_impulse_pass=btc_pass,
+                liquidity_guard_pass=liquidity_pass,
+                liquidity_data_blocked=_liquidity_data_blocked_fields(liquidity_availability),
+                excluded_reason=excluded_reason,
+                entry_timestamp=entry.timestamp,
+                exit_timestamp=exit_bar.timestamp,
+                net_return_after_costs=net,
+                funding_cost=funding_cost,
+                fee_cost=fee_cost,
+                slippage_cost=slippage_cost,
+                orderbook_event_rate_missing=orderbook_missing,
+            )
+        )
         previous_position = signal
-    return strategy, benchmark, trades, turnover, net_cost
+    return strategy, benchmark, trades, turnover, net_cost, event_log
 
 
 def _signal(
@@ -363,6 +481,210 @@ def _signal(
     if score >= candidate.score_threshold:
         return 1
     if score <= -candidate.score_threshold:
+        return -1
+    return 0
+
+
+def _btc_impulse_pass(
+    bars: Sequence[MicrostructureBar],
+    *,
+    index: int,
+    config: BtcImpulseConfig,
+) -> tuple[bool, str]:
+    if not config.enabled:
+        return True, ""
+    current = bars[index]
+    if current.btc_close is None:
+        return False, "btc_close_missing"
+    lookback_index = index - config.lookback_bars
+    if lookback_index < 0:
+        return False, "btc_impulse_lookback_insufficient"
+    reference = bars[lookback_index]
+    if reference.btc_close is None:
+        return False, "btc_close_missing"
+    impulse_return = current.btc_close / reference.btc_close - 1.0
+    abs_return_pass = abs(impulse_return) >= config.return_threshold
+    zscore_pass = True
+    if config.zscore_threshold > 0.0:
+        btc_returns = _btc_returns(bars[max(0, lookback_index) : index + 1])
+        if len(btc_returns) < 2:
+            return False, "btc_impulse_zscore_insufficient"
+        stdev = statistics.pstdev(btc_returns)
+        zscore = 0.0 if stdev == 0.0 else (btc_returns[-1] - statistics.fmean(btc_returns)) / stdev
+        zscore_pass = abs(zscore) >= config.zscore_threshold
+    if abs_return_pass and zscore_pass:
+        return True, ""
+    return False, "btc_impulse_not_triggered"
+
+
+def _btc_returns(bars: Sequence[MicrostructureBar]) -> tuple[float, ...]:
+    values: list[float] = []
+    for previous, current in zip(bars, bars[1:], strict=False):
+        if previous.btc_close is None or current.btc_close is None:
+            continue
+        values.append(current.btc_close / previous.btc_close - 1.0)
+    return tuple(values)
+
+
+def _liquidity_guard_pass(
+    current: MicrostructureBar,
+    config: LiquidityGuardConfig,
+    availability: LiquidityDataAvailability,
+) -> tuple[bool, str]:
+    if not config.enabled:
+        return True, ""
+    if current.bid_ask_spread_bps is None and not availability.spread_data_blocked:
+        return False, "bid_ask_spread_bps_missing"
+    if current.top_depth_usd is None and not availability.top_depth_data_blocked:
+        return False, "top_depth_usd_missing"
+    if current.quote_volume_usd is None:
+        return False, "quote_volume_usd_missing"
+    if (
+        current.bid_ask_spread_bps is not None
+        and current.bid_ask_spread_bps > config.max_spread_bps
+    ):
+        return False, "spread_guard_fail"
+    if current.top_depth_usd is not None and current.top_depth_usd < config.min_top_depth_usd:
+        return False, "top_depth_guard_fail"
+    if current.quote_volume_usd < config.min_quote_volume_usd:
+        return False, "quote_volume_guard_fail"
+    return True, ""
+
+
+def _liquidity_data_availability(
+    bars: Sequence[MicrostructureBar],
+) -> LiquidityDataAvailability:
+    return LiquidityDataAvailability(
+        spread_data_blocked=all(bar.bid_ask_spread_bps is None for bar in bars),
+        top_depth_data_blocked=all(bar.top_depth_usd is None for bar in bars),
+    )
+
+
+def _liquidity_data_blocked_fields(
+    availability: LiquidityDataAvailability,
+) -> tuple[str, ...]:
+    fields: list[str] = []
+    if availability.spread_data_blocked:
+        fields.append("bid_ask_spread_bps")
+    if availability.top_depth_data_blocked:
+        fields.append("top_depth_usd")
+    return tuple(fields)
+
+
+def _entry_window_pass(timestamp: int, window: EntryWindow) -> bool:
+    if window.start_timestamp is not None and timestamp < window.start_timestamp:
+        return False
+    return not (window.end_timestamp is not None and timestamp > window.end_timestamp)
+
+
+def _excluded_reason(
+    *,
+    btc_reason: str,
+    liquidity_reason: str,
+    entry_window_pass: bool,
+) -> str:
+    if not entry_window_pass:
+        return "outside_predeclared_entry_window"
+    if btc_reason:
+        return btc_reason
+    if liquidity_reason:
+        return liquidity_reason
+    return ""
+
+
+def _event_log_entry(
+    *,
+    candidate: MicrostructureCandidate,
+    current: MicrostructureBar,
+    previous: MicrostructureBar,
+    signal: int,
+    btc_impulse_pass: bool,
+    liquidity_guard_pass: bool,
+    liquidity_data_blocked: Sequence[str],
+    excluded_reason: str,
+    entry_timestamp: int,
+    exit_timestamp: int,
+    net_return_after_costs: float,
+    funding_cost: float,
+    fee_cost: float,
+    slippage_cost: float,
+    orderbook_event_rate_missing: bool,
+) -> Mapping[str, object]:
+    return {
+        "candidate": candidate.name,
+        "symbol": current.symbol,
+        "timestamp": current.timestamp,
+        "btc_impulse_pass": btc_impulse_pass,
+        "funding_rate": current.funding_rate,
+        "funding_sign": _sign(current.funding_rate),
+        "open_interest": current.open_interest,
+        "oi_price_divergence": _oi_price_divergence(previous, current),
+        "order_flow_imbalance": _order_flow_imbalance(current),
+        "bid_ask_spread_bps": current.bid_ask_spread_bps,
+        "top_depth_usd": current.top_depth_usd,
+        "quote_volume_usd": current.quote_volume_usd,
+        "liquidity_guard_pass": liquidity_guard_pass,
+        "liquidity_data_blocked": tuple(liquidity_data_blocked),
+        "excluded_reason": excluded_reason,
+        "entry_timestamp": entry_timestamp,
+        "exit_timestamp": exit_timestamp,
+        "net_return_after_costs": net_return_after_costs,
+        "funding_cost": funding_cost,
+        "fee_cost": fee_cost,
+        "slippage_cost": slippage_cost,
+        "orderbook_event_rate_missing": orderbook_event_rate_missing,
+        "signal": signal,
+    }
+
+
+def _data_blocked_log_entry(bar: MicrostructureBar) -> Mapping[str, object]:
+    return {
+        "candidate": "",
+        "symbol": bar.symbol,
+        "timestamp": bar.timestamp,
+        "btc_impulse_pass": False,
+        "funding_rate": bar.funding_rate,
+        "funding_sign": _sign(bar.funding_rate),
+        "open_interest": bar.open_interest,
+        "oi_price_divergence": False,
+        "order_flow_imbalance": _order_flow_imbalance(bar),
+        "bid_ask_spread_bps": bar.bid_ask_spread_bps,
+        "top_depth_usd": bar.top_depth_usd,
+        "quote_volume_usd": bar.quote_volume_usd,
+        "liquidity_guard_pass": False,
+        "liquidity_data_blocked": (),
+        "excluded_reason": "orderbook_event_rate_data_blocked",
+        "entry_timestamp": None,
+        "exit_timestamp": None,
+        "net_return_after_costs": 0.0,
+        "funding_cost": 0.0,
+        "fee_cost": 0.0,
+        "slippage_cost": 0.0,
+        "orderbook_event_rate_missing": False,
+    }
+
+
+def _oi_price_divergence(previous: MicrostructureBar, current: MicrostructureBar) -> bool:
+    price_change = current.close / previous.close - 1.0
+    oi_change = (
+        current.open_interest / previous.open_interest - 1.0
+        if previous.open_interest > 0
+        else 0.0
+    )
+    return (price_change > 0.0 and oi_change < 0.0) or (
+        price_change < 0.0 and oi_change < 0.0
+    )
+
+
+def _order_flow_imbalance(current: MicrostructureBar) -> float:
+    total_volume = current.buy_volume + current.sell_volume
+    return (current.buy_volume - current.sell_volume) / total_volume if total_volume > 0 else 0.0
+
+
+def _sign(value: float) -> int:
+    if value > 0.0:
+        return 1
+    if value < 0.0:
         return -1
     return 0
 
@@ -436,7 +758,73 @@ def _costs(cost_model: object) -> Mapping[str, float]:
     model = _mapping(cost_model, "cost_model")
     fee_bps = _float_value(model, "fee_bps")
     slippage_bps = _float_value(model, "slippage_bps")
-    return {"one_way_cost": (fee_bps + slippage_bps) / 10_000.0}
+    return {
+        "fee_cost": fee_bps / 10_000.0,
+        "slippage_cost": slippage_bps / 10_000.0,
+        "one_way_cost": (fee_bps + slippage_bps) / 10_000.0,
+    }
+
+
+def _btc_impulse_config(params: Mapping[str, object]) -> BtcImpulseConfig:
+    raw = _mapping(params.get("btc_impulse", {}), "params.btc_impulse")
+    return BtcImpulseConfig(
+        enabled=_bool_param(raw, "enabled", True),
+        lookback_bars=max(1, _int_param(raw, "lookback_bars", 3)),
+        return_threshold=_float_param(raw, "return_threshold", 0.02),
+        zscore_threshold=_float_param(raw, "zscore_threshold", 0.0),
+    )
+
+
+def _liquidity_guard_config(params: Mapping[str, object]) -> LiquidityGuardConfig:
+    raw = _mapping(params.get("liquidity_guard", {}), "params.liquidity_guard")
+    return LiquidityGuardConfig(
+        enabled=_bool_param(raw, "enabled", True),
+        max_spread_bps=_float_param(raw, "max_spread_bps", 25.0),
+        min_top_depth_usd=_float_param(raw, "min_top_depth_usd", 50_000.0),
+        min_quote_volume_usd=_float_param(raw, "min_quote_volume_usd", 1_000_000.0),
+    )
+
+
+def _entry_window(params: Mapping[str, object]) -> EntryWindow:
+    raw = _mapping(params.get("entry_window", {}), "params.entry_window")
+    return EntryWindow(
+        start_timestamp=_optional_int(raw, "start_timestamp"),
+        end_timestamp=_optional_int(raw, "end_timestamp"),
+    )
+
+
+def _btc_impulse_to_dict(config: BtcImpulseConfig) -> dict[str, float | int | bool]:
+    return {
+        "enabled": config.enabled,
+        "lookback_bars": config.lookback_bars,
+        "return_threshold": config.return_threshold,
+        "zscore_threshold": config.zscore_threshold,
+    }
+
+
+def _liquidity_guard_to_dict(config: LiquidityGuardConfig) -> dict[str, float | bool]:
+    return {
+        "enabled": config.enabled,
+        "max_spread_bps": config.max_spread_bps,
+        "min_top_depth_usd": config.min_top_depth_usd,
+        "min_quote_volume_usd": config.min_quote_volume_usd,
+    }
+
+
+def _liquidity_availability_to_dict(
+    availability: LiquidityDataAvailability,
+) -> dict[str, bool]:
+    return {
+        "spread_data_blocked": availability.spread_data_blocked,
+        "top_depth_data_blocked": availability.top_depth_data_blocked,
+    }
+
+
+def _entry_window_to_dict(config: EntryWindow) -> dict[str, int | None]:
+    return {
+        "start_timestamp": config.start_timestamp,
+        "end_timestamp": config.end_timestamp,
+    }
 
 
 def _metrics_to_dict(metrics: Any) -> dict[str, float]:
@@ -482,6 +870,7 @@ def _insufficient_payload(
     *,
     excluded_symbols: Sequence[str] = (),
     candidate_count: int = 0,
+    event_log: Sequence[Mapping[str, object]] = (),
 ) -> Mapping[str, Any]:
     return {
         "status": "INSUFFICIENT",
@@ -500,6 +889,7 @@ def _insufficient_payload(
             "live": False,
             "excluded_data_blocked_symbols": tuple(excluded_symbols),
         },
+        "event_log": tuple(event_log),
     }
 
 
@@ -575,6 +965,33 @@ def _int_param(params: Mapping[str, object], key: str, default: int) -> int:
     if key not in params:
         return default
     return _required_int(params, key)
+
+
+def _bool_param(params: Mapping[str, object], key: str, default: bool) -> bool:
+    if key not in params:
+        return default
+    value = params[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be boolean")
+    return value
+
+
+def _optional_int(raw: Mapping[str, object], key: str) -> int | None:
+    if key not in raw or raw[key] is None:
+        return None
+    return _required_int(raw, key)
+
+
+def _optional_positive_float(raw: Mapping[str, object], key: str) -> float | None:
+    if key not in raw or raw[key] is None:
+        return None
+    return _positive_float(raw, key)
+
+
+def _optional_nonnegative_float(raw: Mapping[str, object], key: str) -> float | None:
+    if key not in raw or raw[key] is None:
+        return None
+    return _nonnegative_float(raw, key)
 
 
 def _float_list(raw: object) -> tuple[float, ...]:
