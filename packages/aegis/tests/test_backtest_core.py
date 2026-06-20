@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
 
@@ -12,6 +13,7 @@ from aegis.backtest_core import (
     benjamini_hochberg,
     metrics_from_returns,
     paired_block_bootstrap_risk_difference_test,
+    pbo,
     run_backtest,
     sign_test_p_value,
     trade_scorecard,
@@ -185,3 +187,64 @@ def test_run_backtest_accepts_custom_verdict_adapter() -> None:
 
     assert result.verdict.state == "INSUFFICIENT"
     assert result.verdict.candidate_count_n == 3
+
+
+def _slice_memorizing_trials(*, n_splits: int = 8, segment_len: int = 8) -> list[list[float]]:
+    trials: list[list[float]] = []
+    for winner_slice in range(n_splits):
+        values: list[float] = []
+        for split in range(n_splits):
+            level = 0.04 if split == winner_slice else -0.01
+            values.extend(
+                level + (0.0001 if index % 2 else -0.0001) for index in range(segment_len)
+            )
+        trials.append(values)
+    return trials
+
+
+def _robust_trials(*, n_splits: int = 8, segment_len: int = 8) -> list[list[float]]:
+    observations = n_splits * segment_len
+    robust = [0.004 + (0.0005 if index % 2 else -0.0005) for index in range(observations)]
+    trials = [robust]
+    for weak_slice in range(1, n_splits):
+        values: list[float] = []
+        for split in range(n_splits):
+            level = 0.003 if split == weak_slice else -0.002
+            values.extend(
+                level + (0.0002 if index % 2 else -0.0002) for index in range(segment_len)
+            )
+        trials.append(values)
+    return trials
+
+
+def test_pbo_detects_known_overfit_synthetic_trials() -> None:
+    result = pbo(_slice_memorizing_trials(), n_splits=8)
+    logits = cast(list[float], result["logits"])
+
+    assert result["method"] == "CSCV_PBO"
+    assert result["split_count"] == 70
+    assert cast(float, result["pbo"]) > 0.75
+    assert min(logits) < 0
+
+
+def test_pbo_stays_low_for_robust_synthetic_trials() -> None:
+    result = pbo(_robust_trials(), n_splits=8)
+
+    assert cast(float, result["pbo"]) < 0.25
+    assert result["trial_count"] == 8
+    assert cast(float, result["dsr_sharpe_threshold"]) > 0
+
+
+def test_pbo_validates_split_boundaries() -> None:
+    with pytest.raises(ValueError, match="even"):
+        pbo([[0.1] * 8, [0.2] * 8], n_splits=5)
+    with pytest.raises(ValueError, match="at least n_splits"):
+        pbo([[0.1] * 3, [0.2] * 3], n_splits=4)
+    with pytest.raises(ValueError, match="same observation count"):
+        pbo([[0.1] * 8, [0.2] * 7], n_splits=4)
+
+
+def test_pbo_is_deterministic() -> None:
+    trials = _slice_memorizing_trials()
+
+    assert pbo(trials, n_splits=8) == pbo(trials, n_splits=8)

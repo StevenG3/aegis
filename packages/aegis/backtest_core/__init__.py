@@ -5,6 +5,7 @@ import random
 import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from itertools import combinations
 from typing import Any, Literal
 
 BhTiePolicy = Literal["p_value_cutoff", "rank"]
@@ -435,6 +436,117 @@ def bootstrap_mean_ci(
     if include_iterations:
         result["iterations"] = iterations
     return result
+
+
+def pbo(
+    returns_or_trials: Sequence[Sequence[float]],
+    *,
+    n_splits: int = 16,
+) -> dict[str, float | int | str | list[float] | list[int]]:
+    """Estimate Probability of Backtest Overfitting via deterministic CSCV."""
+    trials = _validate_pbo_trials(returns_or_trials, n_splits)
+    trial_count = len(trials)
+    observation_count = len(trials[0])
+    split_ranges = _cscv_split_ranges(observation_count, n_splits)
+    split_ids = tuple(range(n_splits))
+    half = n_splits // 2
+    logits: list[float] = []
+    oos_rank_percentiles: list[float] = []
+    selected_trial_indices: list[int] = []
+    for train_splits in combinations(split_ids, half):
+        train_set = frozenset(train_splits)
+        test_splits = tuple(split for split in split_ids if split not in train_set)
+        train_indices = _indices_for_splits(split_ranges, train_splits)
+        test_indices = _indices_for_splits(split_ranges, test_splits)
+        train_scores = [_sharpe_for_indices(trial, train_indices) for trial in trials]
+        selected_index = max(range(trial_count), key=lambda index: (train_scores[index], -index))
+        test_scores = [_sharpe_for_indices(trial, test_indices) for trial in trials]
+        percentile = _oos_rank_percentile(test_scores, selected_index)
+        selected_trial_indices.append(selected_index)
+        oos_rank_percentiles.append(percentile)
+        logits.append(_logit(percentile))
+    pbo_value = sum(1 for value in logits if value < 0.0) / len(logits)
+    return {
+        "method": "CSCV_PBO",
+        "pbo": pbo_value,
+        "n_splits": n_splits,
+        "split_count": len(logits),
+        "trial_count": trial_count,
+        "observation_count": observation_count,
+        "logits": logits,
+        "oos_rank_percentiles": oos_rank_percentiles,
+        "selected_trial_indices": selected_trial_indices,
+        "dsr_sharpe_threshold": deflated_sharpe_threshold(
+            trial_count=trial_count, observations=observation_count
+        ),
+    }
+
+
+def _validate_pbo_trials(
+    returns_or_trials: Sequence[Sequence[float]], n_splits: int
+) -> tuple[tuple[float, ...], ...]:
+    if n_splits < 4:
+        raise ValueError("n_splits must be at least 4")
+    if n_splits % 2 != 0:
+        raise ValueError("n_splits must be even for CSCV")
+    if len(returns_or_trials) < 2:
+        raise ValueError("PBO requires at least two trials")
+    trials = tuple(tuple(float(value) for value in trial) for trial in returns_or_trials)
+    observation_count = len(trials[0]) if trials else 0
+    if observation_count < n_splits:
+        raise ValueError("each trial must have at least n_splits observations")
+    for trial in trials:
+        if len(trial) != observation_count:
+            raise ValueError("all PBO trials must have the same observation count")
+        if any(not math.isfinite(value) for value in trial):
+            raise ValueError("PBO trial returns must be finite")
+    return trials
+
+
+def _cscv_split_ranges(observation_count: int, n_splits: int) -> tuple[range, ...]:
+    base_size = observation_count // n_splits
+    remainder = observation_count % n_splits
+    ranges: list[range] = []
+    start = 0
+    for split in range(n_splits):
+        size = base_size + (1 if split < remainder else 0)
+        stop = start + size
+        ranges.append(range(start, stop))
+        start = stop
+    return tuple(ranges)
+
+
+def _indices_for_splits(split_ranges: Sequence[range], split_ids: Sequence[int]) -> tuple[int, ...]:
+    return tuple(index for split_id in split_ids for index in split_ranges[split_id])
+
+
+def _sharpe_for_indices(values: Sequence[float], indices: Sequence[int]) -> float:
+    selected = tuple(values[index] for index in indices)
+    if not selected:
+        return 0.0
+    mean = statistics.fmean(selected)
+    stdev = statistics.pstdev(selected) if len(selected) > 1 else 0.0
+    if stdev == 0.0:
+        if mean > 0:
+            return math.inf
+        if mean < 0:
+            return -math.inf
+        return 0.0
+    return mean / stdev
+
+
+def _oos_rank_percentile(scores: Sequence[float], selected_index: int) -> float:
+    selected_score = scores[selected_index]
+    better_count = sum(1 for score in scores if score > selected_score)
+    equal_count = sum(1 for score in scores if score == selected_score)
+    average_descending_rank = better_count + (equal_count + 1) / 2.0
+    rank_from_worst = len(scores) + 1.0 - average_descending_rank
+    return rank_from_worst / (len(scores) + 1.0)
+
+
+def _logit(value: float) -> float:
+    clipped = min(max(value, 1e-12), 1.0 - 1e-12)
+    return math.log(clipped / (1.0 - clipped))
 
 
 def trade_scorecard(trade_returns: Sequence[float]) -> TradeScorecard:
