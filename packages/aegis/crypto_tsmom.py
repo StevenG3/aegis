@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import statistics
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from aegis.backtest_core import (
+    BacktestDiscipline,
     CostModel,
+    HypothesisSpec,
     benjamini_hochberg,
     bootstrap_mean_ci,
     equity_curve,
     metrics_from_returns,
+    run_backtest,
     sign_test_p_value,
 )
 from aegis.backtest_core import (
@@ -22,6 +26,7 @@ __all__ = [
     "CryptoBar",
     "TsmomConfig",
     "benjamini_hochberg",
+    "crypto_tsmom_hypothesis_spec",
     "report_to_dict",
     "run_crypto_tsmom_walk_forward",
     "sign_test_p_value",
@@ -98,6 +103,59 @@ DEFAULT_COST_MODEL = CostModel(funding_label="N/A for spot long-only")
 
 
 def run_crypto_tsmom_walk_forward(
+    bars_by_symbol: dict[str, Sequence[CryptoBar]],
+    *,
+    config: TsmomConfig = DEFAULT_TSMOM_CONFIG,
+    cost_model: CostModel = DEFAULT_COST_MODEL,
+) -> WalkForwardReport:
+    spec = crypto_tsmom_hypothesis_spec(
+        bars_by_symbol,
+        config=config,
+        cost_model=cost_model,
+        runner=lambda: _run_crypto_tsmom_walk_forward_impl(
+            bars_by_symbol, config=config, cost_model=cost_model
+        ),
+    )
+    return cast(WalkForwardReport, run_backtest(spec).payload)
+
+
+def crypto_tsmom_hypothesis_spec(
+    bars_by_symbol: dict[str, Sequence[CryptoBar]],
+    *,
+    config: TsmomConfig = DEFAULT_TSMOM_CONFIG,
+    cost_model: CostModel = DEFAULT_COST_MODEL,
+    runner: Callable[[], object] | None = None,
+) -> HypothesisSpec:
+    symbols = tuple(sorted(bars_by_symbol)) or ("<empty>",)
+    return HypothesisSpec(
+        key="crypto_tsmom_walk_forward",
+        hypothesis_type="momentum",
+        universe=symbols,
+        predeclared_signals=tuple(f"tsmom_{lookback}" for lookback in config.lookbacks),
+        params={
+            "lookbacks": tuple(config.lookbacks),
+            "train_bars": config.train_bars,
+            "test_bars": config.test_bars,
+            "step_bars": config.step_bars,
+            "allow_short": config.allow_short,
+        },
+        cost_model=cost_model,
+        benchmark="buy_and_hold",
+        data_source="caller_supplied_crypto_ohlcv_bars",
+        trial_count_n=max(1, len(symbols) * len(config.lookbacks)),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=False,
+        ),
+        runner=runner,
+    )
+
+
+def _run_crypto_tsmom_walk_forward_impl(
     bars_by_symbol: dict[str, Sequence[CryptoBar]],
     *,
     config: TsmomConfig = DEFAULT_TSMOM_CONFIG,

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import math
 import statistics
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from aegis.backtest_core import (
+    BacktestDiscipline,
+    HypothesisSpec,
     benjamini_hochberg,
     risk_return_metrics,
+    run_backtest,
 )
 from aegis.backtest_core import (
     paired_block_bootstrap_risk_difference_test as _paired_block_bootstrap_risk_difference_test,
@@ -21,6 +25,7 @@ __all__ = [
     "_paired_block_bootstrap_risk_difference_test",
     "predeclared_risk_candidates",
     "report_to_dict",
+    "risk_beta_hypothesis_spec",
     "risk_metrics",
     "run_risk_disciplined_beta",
 ]
@@ -193,6 +198,65 @@ def predeclared_risk_candidates() -> tuple[RiskCandidate, ...]:
 
 
 def run_risk_disciplined_beta(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    config: RiskBetaConfig = DEFAULT_RISK_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_RISK_COST_MODEL,
+) -> RiskBetaReport:
+    spec = risk_beta_hypothesis_spec(
+        bars_by_symbol,
+        config=config,
+        cost_model=cost_model,
+        runner=lambda: _run_risk_disciplined_beta_impl(
+            bars_by_symbol, config=config, cost_model=cost_model
+        ),
+    )
+    return cast(RiskBetaReport, run_backtest(spec).payload)
+
+
+def risk_beta_hypothesis_spec(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    config: RiskBetaConfig = DEFAULT_RISK_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_RISK_COST_MODEL,
+    runner: Callable[[], object] | None = None,
+) -> HypothesisSpec:
+    symbols = tuple(sorted(bars_by_symbol)) or ("<empty>",)
+    candidates = tuple(
+        candidate
+        for candidate in predeclared_risk_candidates()
+        if all(symbol in bars_by_symbol for symbol in candidate.symbols)
+    )
+    return HypothesisSpec(
+        key="risk_disciplined_beta",
+        hypothesis_type="risk",
+        universe=symbols,
+        predeclared_signals=tuple(candidate.key for candidate in candidates),
+        params={
+            "train_bars": config.train_bars,
+            "test_bars": config.test_bars,
+            "step_bars": config.step_bars,
+            "locked_oos_fraction": config.locked_oos_fraction,
+            "drawdown_reduction_threshold": config.drawdown_reduction_threshold,
+            "target_vol_tolerance": config.target_vol_tolerance,
+        },
+        cost_model=cost_model,
+        benchmark="primary_buy_hold/equal_weight/static_60_40",
+        data_source="caller_supplied_crypto_ohlcv_bars",
+        trial_count_n=max(1, len(candidates)),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=False,
+        ),
+        runner=runner,
+    )
+
+
+def _run_risk_disciplined_beta_impl(
     bars_by_symbol: dict[str, Sequence[ComboBar]],
     *,
     config: RiskBetaConfig = DEFAULT_RISK_CONFIG,

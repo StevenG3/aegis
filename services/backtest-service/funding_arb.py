@@ -13,6 +13,11 @@ from typing import Any, Literal, Protocol, cast
 
 import pandas as pd  # type: ignore[import-untyped]
 from aegis.backtest_core import (
+    BacktestDiscipline,
+    HypothesisSpec,
+    run_backtest,
+)
+from aegis.backtest_core import (
     benjamini_hochberg as _core_benjamini_hochberg,
 )
 from aegis.backtest_core import (
@@ -162,6 +167,82 @@ def run_funding_arb_research(
     research_config: FundingResearchConfig | None = None,
 ) -> dict[str, Any]:
     research_config = research_config or FundingResearchConfig()
+    spec = funding_arb_hypothesis_spec(
+        events_by_symbol,
+        source=source,
+        start=start,
+        end=end,
+        cash=cash,
+        base_config=base_config,
+        research_config=research_config,
+        runner=lambda: _run_funding_arb_research_impl(
+            events_by_symbol,
+            source=source,
+            start=start,
+            end=end,
+            cash=cash,
+            base_config=base_config,
+            research_config=research_config,
+        ),
+    )
+    return cast(dict[str, Any], run_backtest(spec).payload)
+
+
+def funding_arb_hypothesis_spec(
+    events_by_symbol: dict[str, list[dict[str, Any]]],
+    *,
+    source: FundingSource,
+    start: date | datetime | str,
+    end: date | datetime | str,
+    cash: float,
+    base_config: FundingArbConfig | None,
+    research_config: FundingResearchConfig,
+    runner: Callable[[], object] | None = None,
+) -> HypothesisSpec:
+    search_space = predeclared_funding_grid()
+    symbols = tuple(sorted(events_by_symbol)) or ("<empty>",)
+    return HypothesisSpec(
+        key="funding_arb_research",
+        hypothesis_type="carry",
+        universe=symbols,
+        predeclared_signals=tuple(params.key for params in search_space),
+        params={
+            "source": source,
+            "start": str(start),
+            "end": str(end),
+            "cash": cash,
+            "locked_oos_fraction": research_config.locked_oos_fraction,
+            "train_events": research_config.train_events,
+            "test_events": research_config.test_events,
+            "step_events": research_config.step_events,
+            "base_symbol": base_config.symbol if base_config else None,
+        },
+        cost_model="funding_arb_configured_dual_leg_cost_model",
+        benchmark="risk_free_cash",
+        data_source=f"{source}_aligned_funding_events",
+        trial_count_n=max(1, len(symbols) * len(search_space)),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=False,
+        ),
+        runner=runner,
+    )
+
+
+def _run_funding_arb_research_impl(
+    events_by_symbol: dict[str, list[dict[str, Any]]],
+    *,
+    source: FundingSource,
+    start: date | datetime | str,
+    end: date | datetime | str,
+    cash: float = 10_000.0,
+    base_config: FundingArbConfig | None = None,
+    research_config: FundingResearchConfig,
+) -> dict[str, Any]:
     if not events_by_symbol:
         return _research_insufficient("no aligned funding events supplied", source, start, end)
 
