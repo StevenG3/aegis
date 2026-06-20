@@ -6,9 +6,13 @@ from dataclasses import dataclass
 import pytest
 
 from aegis.backtest_core import (
+    BacktestDiscipline,
+    HypothesisSpec,
+    StandardVerdict,
     benjamini_hochberg,
     metrics_from_returns,
     paired_block_bootstrap_risk_difference_test,
+    run_backtest,
     sign_test_p_value,
     trade_scorecard,
 )
@@ -87,3 +91,97 @@ def test_paired_block_bootstrap_risk_difference_smoke() -> None:
     assert result["method"] == "paired_block_bootstrap"
     assert result["sample_count"] == 20
     assert "p_value" in result
+
+
+def test_run_backtest_standardizes_payload_and_injects_trial_count() -> None:
+    spec = HypothesisSpec(
+        key="unit_combo",
+        hypothesis_type="combo",
+        universe=("BTC/USDT",),
+        predeclared_signals=("a", "b"),
+        params={"lookback": 20},
+        cost_model={"fee_bps": 1.0},
+        benchmark="buy_and_hold",
+        data_source="synthetic",
+        trial_count_n=2,
+        runner=lambda: {
+            "status": "OK",
+            "verdict": "NO_EDGE",
+            "reason": "failed gates",
+            "multiple_testing": {"method": "BH-FDR"},
+            "safety": {"paper_only": True},
+        },
+    )
+
+    result = run_backtest(spec)
+
+    assert isinstance(result.payload, dict)
+    assert result.payload["verdict"] == "NO_EDGE"
+    assert result.verdict.state == "NO_EDGE"
+    assert result.verdict.candidate_count_n == 2
+    assert result.verdict.multiple_testing["hypothesis_trial_count_n"] == 2
+
+
+def test_run_backtest_rejects_missing_discipline() -> None:
+    spec = HypothesisSpec(
+        key="bad",
+        hypothesis_type="factor",
+        universe=("AAPL",),
+        predeclared_signals=("value",),
+        params={},
+        cost_model={},
+        benchmark="equal_weight",
+        data_source="synthetic",
+        trial_count_n=1,
+        discipline=BacktestDiscipline(t_plus_1_execution=False),
+        runner=lambda: {"status": "OK", "verdict": "NO_EDGE"},
+    )
+
+    with pytest.raises(ValueError, match="t_plus_1_execution"):
+        run_backtest(spec)
+
+
+def test_run_backtest_applies_survivor_light_standard_ceiling() -> None:
+    spec = HypothesisSpec(
+        key="survivor_factor",
+        hypothesis_type="factor",
+        universe=("AAPL",),
+        predeclared_signals=("value",),
+        params={},
+        cost_model={},
+        benchmark="equal_weight",
+        data_source="synthetic",
+        trial_count_n=1,
+        survivor_light=True,
+        runner=lambda: {"status": "OK", "verdict": "EDGE", "reason": "positive"},
+    )
+
+    result = run_backtest(spec)
+
+    assert result.verdict.verdict == "SUGGESTIVE_NEEDS_PAID_CONFIRM"
+    assert result.verdict.survivor_ceiling_applied is True
+
+
+def test_run_backtest_accepts_custom_verdict_adapter() -> None:
+    spec = HypothesisSpec(
+        key="custom",
+        hypothesis_type="event",
+        universe=("BTC/USDT",),
+        predeclared_signals=("event",),
+        params={},
+        cost_model={},
+        benchmark="cash",
+        data_source="synthetic",
+        trial_count_n=3,
+        runner=lambda: object(),
+        verdict_adapter=lambda _payload, _spec: StandardVerdict(
+            state="INSUFFICIENT",
+            verdict="INSUFFICIENT",
+            reason="too few events",
+        ),
+    )
+
+    result = run_backtest(spec)
+
+    assert result.verdict.state == "INSUFFICIENT"
+    assert result.verdict.candidate_count_n == 3

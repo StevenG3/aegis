@@ -4,9 +4,13 @@ import math
 import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from aegis.backtest_core import (
+    BacktestDiscipline,
+    HypothesisSpec,
     TradeScorecard,
+    run_backtest,
     trade_scorecard,
     trade_scorecard_to_dict,
 )
@@ -25,6 +29,7 @@ from aegis.combo_indicator_search import (
 __all__ = [
     "ScorecardConfig",
     "TradeScorecard",
+    "combo_scorecard_hypothesis_spec",
     "predeclared_scorecard_combos",
     "report_to_dict",
     "run_combo_scorecard",
@@ -201,6 +206,61 @@ def predeclared_scorecard_combos() -> tuple[PredeclaredCombo, ...]:
 
 
 def run_combo_scorecard(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    config: ScorecardConfig = DEFAULT_SCORECARD_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_SCORECARD_COST_MODEL,
+) -> ComboScorecardReport:
+    spec = combo_scorecard_hypothesis_spec(
+        bars_by_symbol,
+        config=config,
+        cost_model=cost_model,
+        runner=lambda: _run_combo_scorecard_impl(
+            bars_by_symbol, config=config, cost_model=cost_model
+        ),
+    )
+    return cast(ComboScorecardReport, run_backtest(spec).payload)
+
+
+def combo_scorecard_hypothesis_spec(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    config: ScorecardConfig = DEFAULT_SCORECARD_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_SCORECARD_COST_MODEL,
+    runner: Callable[[], object] | None = None,
+) -> HypothesisSpec:
+    symbols = tuple(sorted(bars_by_symbol)) or ("<empty>",)
+    combos = predeclared_scorecard_combos()
+    return HypothesisSpec(
+        key="combo_scorecard",
+        hypothesis_type="combo",
+        universe=symbols,
+        predeclared_signals=tuple(combo.key for combo in combos),
+        params={
+            "train_bars": config.train_bars,
+            "test_bars": config.test_bars,
+            "step_bars": config.step_bars,
+            "locked_oos_fraction": config.locked_oos_fraction,
+            "min_trades": config.min_trades,
+            "profit_factor_threshold": config.profit_factor_threshold,
+        },
+        cost_model=cost_model,
+        benchmark="buy_and_hold",
+        data_source="caller_supplied_ohlcv_bars",
+        trial_count_n=max(1, len(symbols) * len(combos)),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=False,
+        ),
+        runner=runner,
+    )
+
+
+def _run_combo_scorecard_impl(
     bars_by_symbol: dict[str, Sequence[ComboBar]],
     *,
     config: ScorecardConfig = DEFAULT_SCORECARD_CONFIG,

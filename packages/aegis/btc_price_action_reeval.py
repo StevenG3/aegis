@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import statistics
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import cast
 
+from aegis.backtest_core import BacktestDiscipline, HypothesisSpec, run_backtest
 from aegis.combo_indicator_search import (
     ComboBar,
     ComboCostModel,
@@ -232,6 +233,67 @@ def run_btc_price_action_reeval(
     hermes_total_return_pct: float = 17.93072784238161,
     hermes_buy_hold_pct: float = 134.90259013211917,
 ) -> PriceActionReport:
+    spec = price_action_reeval_hypothesis_spec(
+        bars,
+        config=config,
+        cost_model=cost_model,
+        runner=lambda: _run_btc_price_action_reeval_impl(
+            bars,
+            external=external,
+            config=config,
+            cost_model=cost_model,
+            hermes_total_return_pct=hermes_total_return_pct,
+            hermes_buy_hold_pct=hermes_buy_hold_pct,
+        ),
+    )
+    return cast(PriceActionReport, run_backtest(spec).payload)
+
+
+def price_action_reeval_hypothesis_spec(
+    bars: Sequence[ComboBar],
+    *,
+    config: PriceActionConfig = DEFAULT_PRICE_ACTION_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_PRICE_ACTION_COST_MODEL,
+    runner: Callable[[], object] | None = None,
+) -> HypothesisSpec:
+    params_grid = predeclared_price_action_params(config)
+    return HypothesisSpec(
+        key="btc_price_action_reeval",
+        hypothesis_type="price_action",
+        universe=("BTC/USDT",),
+        predeclared_signals=tuple(params.key for params in params_grid),
+        params={
+            "bar_count": len(bars),
+            "train_bars": config.train_bars,
+            "test_bars": config.test_bars,
+            "step_bars": config.step_bars,
+            "locked_oos_fraction": config.locked_oos_fraction,
+        },
+        cost_model=cost_model,
+        benchmark="buy_and_hold_absolute_and_risk_adjusted",
+        data_source="caller_supplied_btc_4h_bars",
+        trial_count_n=max(1, len(params_grid)),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=False,
+        ),
+        runner=runner,
+    )
+
+
+def _run_btc_price_action_reeval_impl(
+    bars: Sequence[ComboBar],
+    *,
+    external: ExternalContext = EMPTY_EXTERNAL_CONTEXT,
+    config: PriceActionConfig = DEFAULT_PRICE_ACTION_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_PRICE_ACTION_COST_MODEL,
+    hermes_total_return_pct: float = 17.93072784238161,
+    hermes_buy_hold_pct: float = 134.90259013211917,
+) -> PriceActionReport:
     if not bars:
         return _insufficient_report("no BTC bars supplied", config, hermes_total_return_pct)
     locked_oos_start = int(len(bars) * (1.0 - config.locked_oos_fraction))
@@ -371,6 +433,69 @@ def run_btc_price_action_reeval(
 
 
 def run_price_action_definitive(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    external_by_symbol: dict[str, ExternalContext] | None = None,
+    config: PriceActionConfig = DEFAULT_PRICE_ACTION_CONFIG,
+    definitive_config: PriceActionDefinitiveConfig | None = None,
+    cost_model: ComboCostModel = DEFAULT_PRICE_ACTION_COST_MODEL,
+    hermes_total_return_pct: float = 17.93072784238161,
+    hermes_buy_hold_pct: float = 134.90259013211917,
+) -> PriceActionDefinitiveReport:
+    spec = price_action_definitive_hypothesis_spec(
+        bars_by_symbol,
+        config=config,
+        cost_model=cost_model,
+        runner=lambda: _run_price_action_definitive_impl(
+            bars_by_symbol,
+            external_by_symbol=external_by_symbol,
+            config=config,
+            definitive_config=definitive_config,
+            cost_model=cost_model,
+            hermes_total_return_pct=hermes_total_return_pct,
+            hermes_buy_hold_pct=hermes_buy_hold_pct,
+        ),
+    )
+    return cast(PriceActionDefinitiveReport, run_backtest(spec).payload)
+
+
+def price_action_definitive_hypothesis_spec(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    config: PriceActionConfig = DEFAULT_PRICE_ACTION_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_PRICE_ACTION_COST_MODEL,
+    runner: Callable[[], object] | None = None,
+) -> HypothesisSpec:
+    symbols = tuple(sorted(bars_by_symbol)) or ("<empty>",)
+    params_grid = predeclared_price_action_params(config)
+    return HypothesisSpec(
+        key="price_action_definitive",
+        hypothesis_type="price_action",
+        universe=symbols,
+        predeclared_signals=tuple(params.key for params in params_grid),
+        params={
+            "train_bars": config.train_bars,
+            "test_bars": config.test_bars,
+            "step_bars": config.step_bars,
+            "locked_oos_fraction": config.locked_oos_fraction,
+        },
+        cost_model=cost_model,
+        benchmark="buy_and_hold_absolute_and_risk_adjusted",
+        data_source="caller_supplied_multi_asset_4h_bars",
+        trial_count_n=max(1, len(symbols) * len(params_grid)),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=False,
+        ),
+        runner=runner,
+    )
+
+
+def _run_price_action_definitive_impl(
     bars_by_symbol: dict[str, Sequence[ComboBar]],
     *,
     external_by_symbol: dict[str, ExternalContext] | None = None,

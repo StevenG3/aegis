@@ -5,17 +5,21 @@ import math
 import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from typing import cast
 
+from aegis.backtest_core import (
+    BacktestDiscipline,
+    HypothesisSpec,
+    benjamini_hochberg,
+    metrics_from_returns,
+    run_backtest,
+    sign_test_p_value,
+)
 from aegis.backtest_core import (
     CostModel as ComboCostModel,
 )
 from aegis.backtest_core import (
     ReturnMetrics as ComboMetrics,
-)
-from aegis.backtest_core import (
-    benjamini_hochberg,
-    metrics_from_returns,
-    sign_test_p_value,
 )
 
 __all__ = [
@@ -27,6 +31,7 @@ __all__ = [
     "buy_hold_simulation",
     "metrics_from_returns",
     "metrics_to_dict",
+    "combo_indicator_hypothesis_spec",
     "run_combo_indicator_search",
     "sign_test_p_value",
 ]
@@ -319,6 +324,60 @@ def predeclared_rules(config: ComboSearchConfig = DEFAULT_COMBO_CONFIG) -> tuple
 
 
 def run_combo_indicator_search(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    config: ComboSearchConfig = DEFAULT_COMBO_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_COMBO_COST_MODEL,
+) -> ComboSearchReport:
+    spec = combo_indicator_hypothesis_spec(
+        bars_by_symbol,
+        config=config,
+        cost_model=cost_model,
+        runner=lambda: _run_combo_indicator_search_impl(
+            bars_by_symbol, config=config, cost_model=cost_model
+        ),
+    )
+    return cast(ComboSearchReport, run_backtest(spec).payload)
+
+
+def combo_indicator_hypothesis_spec(
+    bars_by_symbol: dict[str, Sequence[ComboBar]],
+    *,
+    config: ComboSearchConfig = DEFAULT_COMBO_CONFIG,
+    cost_model: ComboCostModel = DEFAULT_COMBO_COST_MODEL,
+    runner: Callable[[], object] | None = None,
+) -> HypothesisSpec:
+    symbols = tuple(sorted(bars_by_symbol)) or ("<empty>",)
+    rules = predeclared_rules(config)
+    return HypothesisSpec(
+        key="combo_indicator_search",
+        hypothesis_type="combo",
+        universe=symbols,
+        predeclared_signals=tuple(rule.name for rule in rules),
+        params={
+            "train_bars": config.train_bars,
+            "test_bars": config.test_bars,
+            "step_bars": config.step_bars,
+            "locked_oos_fraction": config.locked_oos_fraction,
+            "top_k_oos": config.top_k_oos,
+        },
+        cost_model=cost_model,
+        benchmark="buy_and_hold",
+        data_source="caller_supplied_ohlcv_bars",
+        trial_count_n=max(1, len(symbols) * len(rules)),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=False,
+        ),
+        runner=runner,
+    )
+
+
+def _run_combo_indicator_search_impl(
     bars_by_symbol: dict[str, Sequence[ComboBar]],
     *,
     config: ComboSearchConfig = DEFAULT_COMBO_CONFIG,

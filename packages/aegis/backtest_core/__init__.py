@@ -3,12 +3,38 @@ from __future__ import annotations
 import math
 import random
 import statistics
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 BhTiePolicy = Literal["p_value_cutoff", "rank"]
 SignAlternative = Literal["greater", "two-sided"]
+HypothesisType = Literal[
+    "factor",
+    "combo",
+    "carry",
+    "event",
+    "momentum",
+    "risk",
+    "price_action",
+    "other",
+]
+StandardVerdictState = Literal["EDGE", "NO_EDGE", "INSUFFICIENT"]
+
+
+POSITIVE_VERDICTS = frozenset(
+    {
+        "EDGE",
+        "EDGE_CANDIDATE",
+        "GO",
+        "ROBUST",
+        "ROBUST_CARRY",
+        "RISK_IMPROVED",
+        "AGENT_EDGE",
+        "SUGGESTIVE_NEEDS_PAID_CONFIRM",
+    }
+)
+INSUFFICIENT_VERDICTS = frozenset({"INSUFFICIENT", "INSUFFICIENT_DATA"})
 
 
 @dataclass(frozen=True)
@@ -51,6 +77,216 @@ class TradeScorecard:
     expectancy_per_trade: float
     profit_factor: float
     max_consecutive_losses: int
+
+
+@dataclass(frozen=True)
+class BacktestDiscipline:
+    t_plus_1_execution: bool = True
+    locked_oos: bool = True
+    walk_forward: bool = True
+    full_costs: bool = True
+    multiple_testing: bool = True
+    survivor_ceiling: bool = False
+
+
+@dataclass(frozen=True)
+class StandardVerdict:
+    state: StandardVerdictState
+    verdict: str
+    reason: str
+    metrics: Mapping[str, object] = field(default_factory=dict)
+    benchmarks: Mapping[str, object] = field(default_factory=dict)
+    candidate_count_n: int = 0
+    raw_survivors: int = 0
+    fdr_survivors: int = 0
+    multiple_testing: Mapping[str, object] = field(default_factory=dict)
+    safety: Mapping[str, object] = field(default_factory=dict)
+    survivor_ceiling_applied: bool = False
+
+
+@dataclass(frozen=True)
+class HypothesisSpec:
+    key: str
+    hypothesis_type: HypothesisType
+    universe: tuple[str, ...]
+    predeclared_signals: tuple[str, ...]
+    params: Mapping[str, object]
+    cost_model: object
+    benchmark: str
+    data_source: str
+    trial_count_n: int
+    discipline: BacktestDiscipline = BacktestDiscipline()
+    survivor_light: bool = False
+    runner: Callable[[], object] | None = field(default=None, compare=False, repr=False)
+    verdict_adapter: Callable[[object, HypothesisSpec], StandardVerdict] | None = field(
+        default=None, compare=False, repr=False
+    )
+
+
+@dataclass(frozen=True)
+class BacktestRun:
+    spec: HypothesisSpec
+    verdict: StandardVerdict
+    payload: object
+
+
+def run_backtest(spec: HypothesisSpec) -> BacktestRun:
+    _validate_hypothesis_spec(spec)
+    if spec.runner is None:
+        raise ValueError(f"hypothesis spec {spec.key!r} has no runner")
+    payload = spec.runner()
+    adapter = spec.verdict_adapter or default_verdict_adapter
+    verdict = adapter(payload, spec)
+    verdict = _normalize_standard_verdict(verdict, spec)
+    return BacktestRun(spec=spec, verdict=verdict, payload=payload)
+
+
+def default_verdict_adapter(payload: object, spec: HypothesisSpec) -> StandardVerdict:
+    verdict = str(_payload_get(payload, "verdict", _payload_get(payload, "alpha_verdict", "OK")))
+    status = str(_payload_get(payload, "status", "OK"))
+    reason = str(_payload_get(payload, "reason", ""))
+    multiple_testing = _mapping_or_empty(_payload_get(payload, "multiple_testing", {}))
+    safety = _mapping_or_empty(_payload_get(payload, "safety", {}))
+    metrics = _mapping_or_empty(
+        _payload_get(payload, "standard_metrics", _payload_get(payload, "metrics", {}))
+    )
+    benchmarks = _mapping_or_empty(
+        _payload_get(payload, "benchmark_metrics", _payload_get(payload, "benchmarks", {}))
+    )
+    candidate_count_n = _int_from_payload(
+        payload,
+        "candidate_count_n",
+        _int_from_mapping(multiple_testing, "candidate_count_n", spec.trial_count_n),
+    )
+    raw_survivors = _int_from_payload(
+        payload,
+        "raw_is_survivors",
+        _int_from_mapping(
+            multiple_testing,
+            "raw_survivors",
+            _int_from_mapping(multiple_testing, "raw_is_survivors", 0),
+        ),
+    )
+    fdr_survivors = _int_from_payload(
+        payload,
+        "fdr_is_survivors",
+        _int_from_payload(
+            payload,
+            "alpha_fdr_survivors",
+            _int_from_mapping(
+                multiple_testing,
+                "fdr_survivors",
+                _int_from_mapping(multiple_testing, "alpha_fdr_survivors", 0),
+            ),
+        ),
+    )
+    return StandardVerdict(
+        state=_standard_state(verdict, status),
+        verdict=verdict,
+        reason=reason,
+        metrics=metrics,
+        benchmarks=benchmarks,
+        candidate_count_n=candidate_count_n,
+        raw_survivors=raw_survivors,
+        fdr_survivors=fdr_survivors,
+        multiple_testing=multiple_testing,
+        safety=safety,
+        survivor_ceiling_applied=False,
+    )
+
+
+def _validate_hypothesis_spec(spec: HypothesisSpec) -> None:
+    if not spec.key:
+        raise ValueError("hypothesis spec key is required")
+    if not spec.universe:
+        raise ValueError(f"hypothesis spec {spec.key!r} must declare a non-empty universe")
+    if spec.trial_count_n < 1:
+        raise ValueError(f"hypothesis spec {spec.key!r} must count at least one trial")
+    if not spec.benchmark:
+        raise ValueError(f"hypothesis spec {spec.key!r} must declare a benchmark")
+    if not spec.data_source:
+        raise ValueError(f"hypothesis spec {spec.key!r} must declare a data source")
+    missing = []
+    if not spec.discipline.t_plus_1_execution:
+        missing.append("t_plus_1_execution")
+    if not spec.discipline.locked_oos:
+        missing.append("locked_oos")
+    if not spec.discipline.walk_forward:
+        missing.append("walk_forward")
+    if not spec.discipline.full_costs:
+        missing.append("full_costs")
+    if not spec.discipline.multiple_testing:
+        missing.append("multiple_testing")
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(f"hypothesis spec {spec.key!r} failed discipline checks: {joined}")
+
+
+def _normalize_standard_verdict(verdict: StandardVerdict, spec: HypothesisSpec) -> StandardVerdict:
+    candidate_count_n = max(verdict.candidate_count_n, spec.trial_count_n)
+    multiple_testing = dict(verdict.multiple_testing)
+    multiple_testing.setdefault("candidate_count_n", candidate_count_n)
+    multiple_testing.setdefault("hypothesis_trial_count_n", spec.trial_count_n)
+    multiple_testing.setdefault("scope", "all predeclared trials in HypothesisSpec")
+    if spec.survivor_light and verdict.state == "EDGE" and verdict.verdict != (
+        "SUGGESTIVE_NEEDS_PAID_CONFIRM"
+    ):
+        return replace(
+            verdict,
+            state="EDGE",
+            verdict="SUGGESTIVE_NEEDS_PAID_CONFIRM",
+            reason=(
+                verdict.reason
+                + "; survivor-light data ceiling caps positive verdict below ROBUST"
+            ),
+            candidate_count_n=candidate_count_n,
+            multiple_testing=multiple_testing,
+            survivor_ceiling_applied=True,
+        )
+    return replace(
+        verdict,
+        candidate_count_n=candidate_count_n,
+        multiple_testing=multiple_testing,
+        survivor_ceiling_applied=verdict.survivor_ceiling_applied or spec.survivor_light,
+    )
+
+
+def _standard_state(verdict: str, status: str) -> StandardVerdictState:
+    if status in INSUFFICIENT_VERDICTS or verdict in INSUFFICIENT_VERDICTS:
+        return "INSUFFICIENT"
+    if verdict in POSITIVE_VERDICTS:
+        return "EDGE"
+    return "NO_EDGE"
+
+
+def _payload_get(payload: object, key: str, default: object) -> object:
+    if isinstance(payload, Mapping):
+        return payload.get(key, default)
+    return getattr(payload, key, default)
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, object]:
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items()}
+    return {}
+
+
+def _int_from_payload(payload: object, key: str, default: int) -> int:
+    return _coerce_int(_payload_get(payload, key, default), default)
+
+
+def _int_from_mapping(payload: Mapping[str, object], key: str, default: int) -> int:
+    return _coerce_int(payload.get(key, default), default)
+
+
+def _coerce_int(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return default
 
 
 def equity_curve(returns: Iterable[float], *, include_initial: bool = True) -> tuple[float, ...]:

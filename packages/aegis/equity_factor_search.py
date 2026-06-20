@@ -11,12 +11,12 @@ from __future__ import annotations
 import math
 import statistics
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from aegis.backtest_core import benjamini_hochberg
+from aegis.backtest_core import BacktestDiscipline, HypothesisSpec, benjamini_hochberg, run_backtest
 from aegis.backtest_core import normal_two_sided_p as _normal_two_sided_p
 from aegis.edgar_pit import EdgarFact, derive_fcf, derive_net_debt
 
@@ -26,6 +26,7 @@ __all__ = [
     "PriceObservation",
     "SearchConfig",
     "benjamini_hochberg",
+    "equity_factor_hypothesis_spec",
     "run_equity_factor_search",
     "sanitized_report",
 ]
@@ -152,6 +153,67 @@ def run_equity_factor_search(
     config: SearchConfig | None = None,
 ) -> dict[str, Any]:
     config = config or SearchConfig()
+    spec = equity_factor_hypothesis_spec(
+        price_observations,
+        fundamentals_by_symbol,
+        config=config,
+        runner=lambda: _run_equity_factor_search_impl(
+            price_observations, fundamentals_by_symbol, config=config
+        ),
+    )
+    return cast(dict[str, Any], run_backtest(spec).payload)
+
+
+def equity_factor_hypothesis_spec(
+    price_observations: Sequence[PriceObservation],
+    fundamentals_by_symbol: Mapping[str, Mapping[date, Mapping[str, EdgarFact]]],
+    *,
+    config: SearchConfig,
+    runner: Callable[[], object] | None = None,
+) -> HypothesisSpec:
+    universe = tuple(sorted({observation.symbol for observation in price_observations}))
+    if not universe:
+        universe = tuple(sorted(fundamentals_by_symbol)) or ("<empty>",)
+    declarations = PREDECLARED_FACTORS + PREDECLARED_COMPOSITES
+    return HypothesisSpec(
+        key="equity_factor_search",
+        hypothesis_type="factor",
+        universe=universe,
+        predeclared_signals=tuple(declaration.name for declaration in declarations),
+        params={
+            "locked_oos_fraction": config.locked_oos_fraction,
+            "groups": config.groups,
+            "winsorize_pct": config.winsorize_pct,
+            "forward_periods": config.forward_periods,
+            "commission_bps": config.commission_bps,
+            "slippage_bps": config.slippage_bps,
+        },
+        cost_model={
+            "commission_bps": config.commission_bps,
+            "slippage_bps": config.slippage_bps,
+        },
+        benchmark="equal_weight_and_market_cap_weight",
+        data_source="EDGAR_PIT_fundamentals_plus_free_price_layer",
+        trial_count_n=max(1, len(declarations)),
+        discipline=BacktestDiscipline(
+            t_plus_1_execution=True,
+            locked_oos=True,
+            walk_forward=True,
+            full_costs=True,
+            multiple_testing=True,
+            survivor_ceiling=True,
+        ),
+        survivor_light=True,
+        runner=runner,
+    )
+
+
+def _run_equity_factor_search_impl(
+    price_observations: Sequence[PriceObservation],
+    fundamentals_by_symbol: Mapping[str, Mapping[date, Mapping[str, EdgarFact]]],
+    *,
+    config: SearchConfig,
+) -> dict[str, Any]:
     _validate_config(config)
     if not price_observations:
         return _insufficient_report(config, "price_observations is empty")
