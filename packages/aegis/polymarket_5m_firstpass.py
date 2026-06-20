@@ -10,6 +10,7 @@ from aegis.backtest_core import benjamini_hochberg, pbo, sign_test_p_value
 
 Direction = Literal["Up", "Down"]
 ExitMode = Literal["settlement", "preclose_30s"]
+PriceSource = Literal["observed_price", "onchain_fill"]
 
 MOVE_THRESHOLDS = (50.0, 70.0, 100.0, 150.0)
 ENTRY_WINDOWS = ((150, 90), (120, 60))
@@ -43,6 +44,8 @@ class Polymarket5mObservation:
     btc_direction: Direction
     up_prices: tuple[PricePoint, ...]
     down_prices: tuple[PricePoint, ...]
+    up_onchain_fills: tuple[PricePoint, ...]
+    down_onchain_fills: tuple[PricePoint, ...]
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,7 @@ class FirstpassCandidate:
     min_price: float
     max_price: float
     exit_mode: ExitMode
+    price_source: PriceSource
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,7 @@ class FirstpassTrade:
     seconds_to_close: int
     entry_price: float
     exit_price: float
+    price_source: PriceSource
     settlement_direction: Direction
     btc_move_usd: float
     net_return: float
@@ -83,7 +88,11 @@ def run_polymarket_5m_firstpass(observations: Sequence[Mapping[str, object]]) ->
     parsed = tuple(_observation_from_mapping(row) for row in observations)
     if not parsed:
         return _insufficient("no aligned BTC 5m Polymarket observations")
-    candidates = _candidate_grid()
+    onchain_available = any(row.up_onchain_fills or row.down_onchain_fills for row in parsed)
+    onchain_grid_enabled = onchain_available or any(
+        row.get("enable_onchain_price_source") is True for row in observations
+    )
+    candidates = _candidate_grid(include_onchain=onchain_grid_enabled)
     results = tuple(_evaluate_candidate(candidate, parsed) for candidate in candidates)
     valid_results = tuple(result for result in results if result.trades)
     if not valid_results:
@@ -105,16 +114,17 @@ def run_polymarket_5m_firstpass(observations: Sequence[Mapping[str, object]]) ->
     best = max(valid_results, key=lambda result: statistics.fmean(result.fold_excess))
     verdict = "SUGGESTIVE_NEEDS_EXECUTION_VALIDATION" if survivors else "NO_EDGE"
     reason = (
-        "optimistic observed-price first pass survived FDR/PBO but execution costs are unmodeled"
+        "Polymarket 5m first pass survived FDR/PBO but execution costs are unmodeled"
         if survivors
-        else "no optimistic observed-price candidate survived FDR/PBO with positive mean return"
+        else "no Polymarket 5m candidate survived FDR/PBO with positive mean return"
     )
     threshold_counts = _threshold_entry_counts(valid_results)
+    price_source_counts = _price_source_entry_counts(valid_results)
     return {
         "status": "OK",
         "verdict": verdict,
         "reason": reason,
-        "strategy": "polymarket_btc_5m_firstpass_optimistic",
+        "strategy": "polymarket_btc_5m_firstpass_observed_and_onchain",
         "candidate_count_n": len(candidates),
         "raw_is_survivors": sum(
             1 for result in valid_results if _mean_return(result.trades) > 0.0
@@ -138,14 +148,26 @@ def run_polymarket_5m_firstpass(observations: Sequence[Mapping[str, object]]) ->
             "date_range": _date_range(parsed),
             "entry_count": sum(len(result.trades) for result in valid_results),
             "entry_count_by_move_threshold": threshold_counts,
+            "entry_count_by_price_source": price_source_counts,
+            "onchain_fill_observation_count": sum(
+                1 for row in parsed if row.up_onchain_fills or row.down_onchain_fills
+            ),
         },
         "best_candidate": _candidate_to_dict(best.candidate),
         "optimistic_boundary": {
-            "optimistic_only": True,
+            "optimistic_only": not onchain_available,
+            "price_sources": ("observed_price", "onchain_fill")
+            if onchain_grid_enabled
+            else ("observed_price",),
+            "onchain_fill_note": (
+                "Onchain fill price means an historical market participant traded there; "
+                "it does not model queue priority, size impact, cancellations, or our fill."
+            ),
             "positive_verdict_ceiling": "SUGGESTIVE_NEEDS_EXECUTION_VALIDATION",
             "unmodeled_execution_costs": UNMODELED_EXECUTION_COSTS,
             "robust_or_edge_claim_allowed": False,
         },
+        "execution_price_comparison": _execution_price_comparison(valid_results),
         "safety": {
             "read_only": True,
             "wallet_or_order_access": False,
@@ -156,26 +178,31 @@ def run_polymarket_5m_firstpass(observations: Sequence[Mapping[str, object]]) ->
     }
 
 
-def _candidate_grid() -> tuple[FirstpassCandidate, ...]:
+def _candidate_grid(*, include_onchain: bool = True) -> tuple[FirstpassCandidate, ...]:
     candidates: list[FirstpassCandidate] = []
+    price_sources: tuple[PriceSource, ...] = (
+        ("observed_price", "onchain_fill") if include_onchain else ("observed_price",)
+    )
     for move in MOVE_THRESHOLDS:
         for window_start, window_end in ENTRY_WINDOWS:
             for lower, upper in PRICE_BANDS:
                 for exit_mode in EXIT_MODES:
-                    candidates.append(
-                        FirstpassCandidate(
-                            name=(
-                                f"move{move:g}_w{window_start}-{window_end}_"
-                                f"p{lower:g}-{upper:g}_{exit_mode}"
-                            ),
-                            move_threshold_usd=move,
-                            window_start_seconds=window_start,
-                            window_end_seconds=window_end,
-                            min_price=lower,
-                            max_price=upper,
-                            exit_mode=exit_mode,
+                    for price_source in price_sources:
+                        candidates.append(
+                            FirstpassCandidate(
+                                name=(
+                                    f"move{move:g}_w{window_start}-{window_end}_"
+                                    f"p{lower:g}-{upper:g}_{exit_mode}_{price_source}"
+                                ),
+                                move_threshold_usd=move,
+                                window_start_seconds=window_start,
+                                window_end_seconds=window_end,
+                                min_price=lower,
+                                max_price=upper,
+                                exit_mode=exit_mode,
+                                price_source=price_source,
+                            )
                         )
-                    )
     return tuple(candidates)
 
 
@@ -204,7 +231,7 @@ def _trade_for_observation(
     if abs(observation.btc_move_usd) < candidate.move_threshold_usd:
         return None
     direction = observation.btc_direction
-    prices = observation.up_prices if direction == "Up" else observation.down_prices
+    prices = _prices_for_source(observation, direction, candidate.price_source)
     entry = _entry_price_point(candidate, prices, observation.end_ts)
     if entry is None:
         return None
@@ -221,11 +248,22 @@ def _trade_for_observation(
         seconds_to_close=observation.end_ts - entry.timestamp,
         entry_price=entry.price,
         exit_price=exit_price,
+        price_source=candidate.price_source,
         settlement_direction=observation.settlement_direction,
         btc_move_usd=observation.btc_move_usd,
         net_return=net_return,
         outcome_correct=outcome_correct,
     )
+
+
+def _prices_for_source(
+    observation: Polymarket5mObservation,
+    direction: Direction,
+    price_source: PriceSource,
+) -> tuple[PricePoint, ...]:
+    if price_source == "observed_price":
+        return observation.up_prices if direction == "Up" else observation.down_prices
+    return observation.up_onchain_fills if direction == "Up" else observation.down_onchain_fills
 
 
 def _entry_price_point(
@@ -328,6 +366,7 @@ def _no_impulse_trades(
         min_price=candidate.min_price,
         max_price=candidate.max_price,
         exit_mode=candidate.exit_mode,
+        price_source=candidate.price_source,
     )
     return tuple(
         trade
@@ -369,6 +408,39 @@ def _threshold_entry_counts(results: Sequence[CandidateResult]) -> dict[str, int
     return dict(sorted(counts.items()))
 
 
+def _price_source_entry_counts(results: Sequence[CandidateResult]) -> dict[str, int]:
+    counts: dict[str, int] = {"observed_price": 0, "onchain_fill": 0}
+    for result in results:
+        counts[result.candidate.price_source] += len(result.trades)
+    return counts
+
+
+def _execution_price_comparison(results: Sequence[CandidateResult]) -> Mapping[str, object]:
+    observed = [
+        trade.entry_price
+        for result in results
+        for trade in result.trades
+        if trade.price_source == "observed_price"
+    ]
+    onchain = [
+        trade.entry_price
+        for result in results
+        for trade in result.trades
+        if trade.price_source == "onchain_fill"
+    ]
+    return {
+        "observed_entry_count": len(observed),
+        "onchain_entry_count": len(onchain),
+        "mean_observed_entry_price": statistics.fmean(observed) if observed else None,
+        "mean_onchain_fill_entry_price": statistics.fmean(onchain) if onchain else None,
+        "mean_onchain_minus_observed": (
+            statistics.fmean(onchain) - statistics.fmean(observed)
+            if observed and onchain
+            else None
+        ),
+    }
+
+
 def _date_range(observations: Sequence[Polymarket5mObservation]) -> Mapping[str, int | None]:
     if not observations:
         return {"start_ts": None, "end_ts": None}
@@ -403,6 +475,8 @@ def _observation_from_mapping(raw: Mapping[str, object]) -> Polymarket5mObservat
         btc_direction=btc_direction,
         up_prices=_price_points(raw.get("up_prices", ())),
         down_prices=_price_points(raw.get("down_prices", ())),
+        up_onchain_fills=_price_points(raw.get("up_onchain_fills", ())),
+        down_onchain_fills=_price_points(raw.get("down_onchain_fills", ())),
     )
 
 
@@ -459,6 +533,7 @@ def _candidate_to_dict(candidate: FirstpassCandidate) -> dict[str, float | int |
         "min_price": candidate.min_price,
         "max_price": candidate.max_price,
         "exit_mode": candidate.exit_mode,
+        "price_source": candidate.price_source,
     }
 
 
@@ -471,6 +546,7 @@ def _trade_to_dict(trade: FirstpassTrade) -> dict[str, float | int | str | bool]
         "seconds_to_close": trade.seconds_to_close,
         "entry_price": trade.entry_price,
         "exit_price": trade.exit_price,
+        "price_source": trade.price_source,
         "settlement_direction": trade.settlement_direction,
         "btc_move_usd": trade.btc_move_usd,
         "net_return": trade.net_return,
@@ -482,13 +558,13 @@ def _insufficient(
     reason: str,
     *,
     market_count: int = 0,
-    candidate_count: int = len(_candidate_grid()),
+    candidate_count: int = len(_candidate_grid(include_onchain=False)),
 ) -> Mapping[str, Any]:
     return {
         "status": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
-        "strategy": "polymarket_btc_5m_firstpass_optimistic",
+        "strategy": "polymarket_btc_5m_firstpass_observed_and_onchain",
         "candidate_count_n": candidate_count,
         "multiple_testing": {
             "method": "BH-FDR + CSCV_PBO",

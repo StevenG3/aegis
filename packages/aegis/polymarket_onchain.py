@@ -156,6 +156,70 @@ class PolymarketDataApiClient:
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
 
+    def get_events(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        order: str = "endDate",
+        ascending: bool = True,
+        closed: bool = False,
+        active: bool = True,
+        tag_slug: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "active": str(active).lower(),
+            "closed": str(closed).lower(),
+            "limit": str(limit),
+            "offset": str(offset),
+            "order": order,
+            "ascending": str(ascending).lower(),
+        }
+        if tag_slug is not None:
+            params["tag_slug"] = tag_slug
+        data = self._get_json(f"{self.gamma_api_base_url}/events?{urlencode(params)}")
+        if not isinstance(data, list):
+            raise ValueError("unexpected Gamma events response")
+        return [row for row in data if isinstance(row, dict)]
+
+    def iter_events(
+        self,
+        *,
+        limit: int = 100,
+        max_events: int = 500,
+        sleep_seconds: float = 0.0,
+        order: str = "endDate",
+        ascending: bool = True,
+        closed: bool = False,
+        active: bool = True,
+        tag_slug: str | None = None,
+    ) -> Iterable[dict[str, Any]]:
+        offset = 0
+        yielded = 0
+        while yielded < max_events:
+            page_limit = min(limit, max_events - yielded)
+            page = self.get_events(
+                limit=page_limit,
+                offset=offset,
+                order=order,
+                ascending=ascending,
+                closed=closed,
+                active=active,
+                tag_slug=tag_slug,
+            )
+            if not page:
+                break
+            for row in page:
+                yield row
+                yielded += 1
+                if yielded >= max_events:
+                    break
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+
     def get_trades(
         self,
         condition_id: str,
