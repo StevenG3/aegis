@@ -1,0 +1,206 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://aegis.local/schemas/backtest-core/hypothesis-spec.schema.json",
+  "title": "Aegis HypothesisSpec private file handoff",
+  "description": "Offline JSON contract for a private Hermes-exported hypothesis file consumed by scripts/run_hypothesis.py. Public artifacts contain only this schema and documentation; real specs, registry rows, actors, credentials, raw data, and results stay private.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "type",
+    "universe",
+    "predeclared_signals",
+    "params",
+    "cost_model",
+    "benchmark",
+    "data_source",
+    "trial_n",
+    "survivor_light",
+    "trust",
+    "discipline"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      "description": "Stable private registry id; maps to HypothesisSpec.key."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "factor",
+        "combo",
+        "carry",
+        "event",
+        "momentum",
+        "risk",
+        "price_action",
+        "other"
+      ],
+      "description": "Maps to HypothesisSpec.hypothesis_type."
+    },
+    "universe": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 80
+      },
+      "description": "Predeclared tradable or research universe."
+    },
+    "predeclared_signals": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160
+      },
+      "description": "Signal names fixed before evaluation."
+    },
+    "params": {
+      "type": "object",
+      "description": "Predeclared fixed settings or grid; all evaluated configurations contribute to trial_n."
+    },
+    "cost_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fee_bps",
+        "slippage_bps",
+        "funding_bps_per_period",
+        "funding_label"
+      ],
+      "properties": {
+        "fee_bps": {
+          "type": "number",
+          "minimum": 0
+        },
+        "slippage_bps": {
+          "type": "number",
+          "minimum": 0
+        },
+        "funding_bps_per_period": {
+          "type": "number"
+        },
+        "funding_label": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "description": "Explicit fees, slippage, funding/borrow treatment, or N/A where funding does not apply."
+    },
+    "benchmark": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "data_source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 320,
+      "description": "Sanitized local dataset label; do not include private paths, credentials, actors, URLs, or raw data."
+    },
+    "trial_n": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Total predeclared trials for multiple-testing accounting."
+    },
+    "survivor_light": {
+      "type": "boolean",
+      "description": "True when data is survivor-light or incomplete enough to cap positive claims."
+    },
+    "trust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry_scope",
+        "predeclared",
+        "review_gate",
+        "export_contains_private_spec_data",
+        "live_or_network_required",
+        "no_live",
+        "read_only"
+      ],
+      "properties": {
+        "registry_scope": {
+          "type": "string",
+          "const": "private"
+        },
+        "predeclared": {
+          "type": "boolean",
+          "const": true
+        },
+        "review_gate": {
+          "type": "boolean",
+          "const": true,
+          "description": "A human/Claude gate approved this single file run."
+        },
+        "export_contains_private_spec_data": {
+          "type": "boolean",
+          "const": false
+        },
+        "live_or_network_required": {
+          "type": "boolean",
+          "const": false
+        },
+        "no_live": {
+          "type": "boolean",
+          "const": true
+        },
+        "read_only": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "discipline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "t_plus_1_execution",
+        "locked_oos",
+        "walk_forward",
+        "full_costs",
+        "multiple_testing",
+        "survivor_ceiling"
+      ],
+      "properties": {
+        "t_plus_1_execution": {
+          "type": "boolean",
+          "const": true
+        },
+        "locked_oos": {
+          "type": "boolean",
+          "const": true
+        },
+        "walk_forward": {
+          "type": "boolean",
+          "const": true
+        },
+        "full_costs": {
+          "type": "boolean",
+          "const": true
+        },
+        "multiple_testing": {
+          "type": "boolean",
+          "const": true
+        },
+        "survivor_ceiling": {
+          "type": "boolean",
+          "description": "Must be true whenever survivor_light is true."
+        }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 2000,
+      "description": "Optional sanitized note; no actors, credentials, private paths, or raw data."
+    }
+  }
+}
