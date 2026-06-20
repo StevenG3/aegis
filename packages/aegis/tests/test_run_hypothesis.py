@@ -64,6 +64,30 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _microstructure_observations() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    closes = [100.0, 101.0, 103.0, 105.0, 100.0, 96.0, 98.0, 101.0, 97.0, 94.0]
+    for symbol, scale, survivor_status in (
+        ("BTC/USDT:USDT", 1.0, "active"),
+        ("DELISTED/USDT:USDT", 0.2, "delisted"),
+    ):
+        for index, close in enumerate(closes):
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "timestamp": 1_700_000_000 + index * 14_400,
+                    "close": max(1.0, close * scale),
+                    "open_interest": max(1.0, 1_000.0 - index * 35.0),
+                    "funding_rate": 0.0002,
+                    "buy_volume": 10.0,
+                    "sell_volume": 30.0,
+                    "order_book_event_rate_per_hour": 0.0,
+                    "survivor_status": survivor_status,
+                }
+            )
+    return rows
+
+
 def _set_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, Path, Path]:
@@ -144,12 +168,12 @@ def test_cli_rejects_spec_outside_olympus59(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _public_root, private_root, _task_dir = _set_roots(tmp_path, monkeypatch)
-    spec_path = private_root / "incubating" / "olympus60" / "unit.json"
+    spec_path = private_root / "scatter" / "unit.json"
     _write_json(spec_path, _base_spec())
 
     assert run_hypothesis.run_cli([str(spec_path)]) == 2
 
-    assert "spec JSON must live under" in capsys.readouterr().err
+    assert "must be under" in capsys.readouterr().err
 
 
 def test_cli_rejects_output_dir_outside_olympus59(
@@ -164,7 +188,67 @@ def test_cli_rejects_output_dir_outside_olympus59(
 
     assert run_hypothesis.run_cli([str(spec_path), "--private-dir", str(bad_output)]) == 2
 
-    assert "may only write under" in capsys.readouterr().err
+    assert "same ${AEGIS_STRATEGIES_ROOT}" in capsys.readouterr().err
+
+
+def test_cli_runs_named_microstructure_runner_from_olympus60(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    public_root = tmp_path / "public"
+    private_root = tmp_path / "aegis-strategies"
+    task_dir = private_root / "incubating" / "olympus60"
+    public_root.mkdir()
+    private_root.mkdir()
+    task_dir.mkdir(parents=True)
+    monkeypatch.setenv("AEGIS_STRATEGIES_ROOT", str(private_root))
+    monkeypatch.setattr(run_hypothesis, "REPO_ROOT", public_root)
+    spec_path = task_dir / "specs" / "microstructure.json"
+    payload = _base_spec()
+    payload.update(
+        {
+            "id": "olympus60_microstructure_unit",
+            "type": "event",
+            "runner": "microstructure_perp",
+            "universe": ["BTC/USDT:USDT", "DELISTED/USDT:USDT"],
+            "predeclared_signals": [
+                "funding_sign",
+                "oi_price_divergence",
+                "orderflow_imbalance",
+            ],
+            "trial_n": 4,
+            "survivor_light": True,
+            "benchmark": "buy_and_hold",
+            "data_source": "synthetic_offline_microstructure_fixture",
+        }
+    )
+    payload["discipline"]["survivor_ceiling"] = True
+    payload["cost_model"]["funding_label"] = "perp funding debited from observations"
+    payload["params"] = {
+        "observations": _microstructure_observations(),
+        "grid": {
+            "funding_abs_bps": [1.0, 2.0],
+            "imbalance_abs": [0.2],
+            "oi_drop_abs": [0.02],
+            "score_threshold": [1, 2],
+        },
+        "locked_oos_fraction": 0.8,
+        "fold_count": 4,
+        "pbo_splits": 4,
+    }
+    _write_json(spec_path, payload)
+
+    assert run_hypothesis.run_cli([str(spec_path)]) == 0
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["trial_n"] == 4
+    assert summary["result_path"].startswith(str(task_dir))
+    result = json.loads(Path(summary["result_path"]).read_text(encoding="utf-8"))
+    assert result["payload"]["strategy"] == "microstructure_perp_funding_oi_orderflow"
+    assert result["payload"]["multiple_testing"]["method"] == "BH-FDR + CSCV_PBO"
+    assert result["payload"]["safety"]["network"] is False
+    assert result["payload"]["safety"]["perp_funding_counted"] is True
 
 
 def test_cli_rejects_missing_discipline(
