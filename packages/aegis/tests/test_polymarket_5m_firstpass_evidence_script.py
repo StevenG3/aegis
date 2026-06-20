@@ -25,16 +25,18 @@ class FakePolymarketClient:
     def __init__(self, timeout_seconds: float) -> None:
         self.timeout_seconds = timeout_seconds
 
-    def iter_closed_markets(
+    def get_closed_markets(
         self,
         *,
         limit: int,
-        max_markets: int,
-        sleep_seconds: float,
+        offset: int,
         order: str,
         ascending: bool,
+        closed: bool = True,
     ) -> list[dict[str, object]]:
-        _ = limit, max_markets, sleep_seconds, order, ascending
+        _ = limit, order, ascending, closed
+        if offset > 0:
+            return []
         return [
             {
                 "conditionId": "condition-1",
@@ -56,6 +58,38 @@ class FakePolymarketClient:
                 "clobTokenIds": '["yes-token", "no-token"]',
                 "endDate": "2027-01-15T08:05:00Z",
                 "closed": True,
+            },
+        ]
+
+    def get_trades(
+        self,
+        condition_id: str,
+        *,
+        limit: int,
+        offset: int,
+        taker_only: bool,
+    ) -> list[dict[str, object]]:
+        _ = condition_id, limit, taker_only
+        if offset > 0:
+            return []
+        return [
+            {
+                "conditionId": "condition-1",
+                "outcomeIndex": 0,
+                "price": 0.83,
+                "size": 10,
+                "timestamp": 1_800_000_300 - 118,
+                "side": "BUY",
+                "transactionHash": "0xup",
+            },
+            {
+                "conditionId": "condition-1",
+                "outcomeIndex": 1,
+                "price": 0.17,
+                "size": 10,
+                "timestamp": 1_800_000_300 - 118,
+                "side": "BUY",
+                "transactionHash": "0xdown",
             },
         ]
 
@@ -95,6 +129,8 @@ def test_script_main_writes_private_firstpass_artifact(
     private_root.mkdir()
     monkeypatch.setenv("AEGIS_STRATEGIES_ROOT", str(private_root))
     monkeypatch.setenv("POLYMARKET_5M_MAX_MARKETS", "2")
+    monkeypatch.setenv("POLYMARKET_5M_MIN_ALIGNED_MARKETS", "1")
+    monkeypatch.setenv("POLYMARKET_5M_MIN_ENTRIES", "1")
     monkeypatch.setattr(module, "PolymarketDataApiClient", FakePolymarketClient)
     monkeypatch.setattr(module, "time", SimpleNamespace(sleep=lambda _: None))
     fake_ccxt = SimpleNamespace(binanceusdm=lambda config: FakeExchange())
@@ -118,10 +154,11 @@ def test_script_main_writes_private_firstpass_artifact(
 
     summary = json.loads(capsys.readouterr().out)
     json_path = Path(summary["json"])
-    assert json_path.is_relative_to(private_root / "incubating" / "olympus61")
+    assert json_path.is_relative_to(private_root / "incubating" / "olympus62")
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["coverage"]["gamma_closed_markets_fetched"] == 2
     assert payload["coverage"]["btc_5m_markets"] == 1
     assert payload["coverage"]["aligned_observations"] == 1
-    assert payload["spec"]["trial_n"] == 48
-    assert payload["report"]["optimistic_boundary"]["optimistic_only"] is True
+    assert payload["spec"]["trial_n"] == 96
+    assert payload["coverage"]["aligned_observations_with_onchain_fills"] == 1
+    assert payload["report"]["optimistic_boundary"]["optimistic_only"] is False
