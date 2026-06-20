@@ -67,7 +67,7 @@ def _spec(observations: list[dict[str, Any]]) -> HypothesisSpec:
         },
         benchmark="buy_and_hold",
         data_source="synthetic_offline_microstructure_fixture",
-        trial_count_n=4,
+        trial_count_n=8,
         discipline=BacktestDiscipline(
             t_plus_1_execution=True,
             locked_oos=True,
@@ -84,7 +84,7 @@ def test_microstructure_runner_reports_fdr_pbo_and_full_cost_safety() -> None:
     payload = run_microstructure_perp_from_spec(_spec(_bars()))
 
     assert payload["status"] == "OK"
-    assert payload["candidate_count_n"] == 4
+    assert payload["candidate_count_n"] == 8
     assert payload["multiple_testing"]["method"] == "BH-FDR + CSCV_PBO"
     assert "pbo_after_survivors" in payload["multiple_testing"]
     assert payload["safety"]["t_plus_1_execution"] is True

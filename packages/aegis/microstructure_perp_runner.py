@@ -43,6 +43,7 @@ class MicrostructureCandidate:
 
 @dataclass(frozen=True)
 class CandidateResult:
+    symbol: str
     candidate: MicrostructureCandidate
     returns: tuple[float, ...]
     benchmark_returns: tuple[float, ...]
@@ -87,11 +88,13 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
     results = tuple(
         _evaluate_candidate(
             candidate,
-            by_symbol=by_symbol,
+            symbol=symbol,
+            bars=bars,
             costs=costs,
             locked_oos_fraction=locked_oos_fraction,
             fold_count=fold_count,
         )
+        for symbol, bars in sorted(by_symbol.items())
         for candidate in grid
     )
     valid_results = tuple(result for result in results if result.returns)
@@ -99,7 +102,7 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
         return _insufficient_payload(
             "insufficient locked-OOS t+1 samples after applying grid",
             excluded_symbols=excluded_symbols,
-            candidate_count=len(grid),
+            candidate_count=max(_spec_trial_count(spec), len(grid) * len(by_symbol)),
         )
 
     p_values = [result.p_value for result in valid_results]
@@ -130,10 +133,11 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
     verdict = "EDGE" if survivors else "NO_EDGE"
     status = "OK"
     reason = (
-        "predeclared microstructure grid survived BH-FDR and PBO"
+            "predeclared microstructure symbol-grid survived BH-FDR and PBO"
         if survivors
-        else "no predeclared microstructure candidate survived BH-FDR, PBO, and buy-hold gates"
+        else "no predeclared microstructure symbol-grid survived BH-FDR, PBO, and buy-hold gates"
     )
+    candidate_count_n = max(_spec_trial_count(spec), len(grid) * len(by_symbol))
     return {
         "status": status,
         "verdict": verdict,
@@ -142,13 +146,15 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
         "standard_metrics": _metrics_to_dict(strategy_metrics),
         "benchmark_metrics": {"buy_and_hold": _metrics_to_dict(benchmark_metrics)},
         "trade_scorecard": trade_scorecard_to_dict(scorecard),
-        "candidate_count_n": len(grid),
+        "candidate_count_n": candidate_count_n,
         "raw_is_survivors": sum(1 for result in valid_results if _candidate_rank(result) > 0.0),
         "fdr_is_survivors": sum(1 for value in fdr_flags if value),
         "multiple_testing": {
             "method": "BH-FDR + CSCV_PBO",
-            "candidate_count_n": len(grid),
+            "candidate_count_n": candidate_count_n,
             "tested_candidates": len(valid_results),
+            "pooled_grid_candidates": len(grid),
+            "symbol_count": len(by_symbol),
             "fdr_alpha": fdr_alpha,
             "fdr_before": sum(1 for result in valid_results if result.p_value < fdr_alpha),
             "fdr_after": sum(1 for value in fdr_flags if value),
@@ -170,7 +176,7 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
             "order_book_event_rate_cap_per_hour": MAX_ORDER_BOOK_EVENT_RATE_PER_HOUR,
             "excluded_data_blocked_symbols": excluded_symbols,
         },
-        "best_candidate": _candidate_to_dict(best.candidate),
+        "best_candidate": _best_candidate_to_dict(best),
         "universe": {
             "usable_symbols": usable_symbols,
             "excluded_data_blocked_symbols": excluded_symbols,
@@ -254,30 +260,27 @@ def _candidate_grid(params: Mapping[str, object]) -> tuple[MicrostructureCandida
 def _evaluate_candidate(
     candidate: MicrostructureCandidate,
     *,
-    by_symbol: Mapping[str, Sequence[MicrostructureBar]],
+    symbol: str,
+    bars: Sequence[MicrostructureBar],
     costs: Mapping[str, float],
     locked_oos_fraction: float,
     fold_count: int,
 ) -> CandidateResult:
-    strategy_returns: list[float] = []
-    benchmark_returns: list[float] = []
-    trade_returns: list[float] = []
-    total_turnover = 0.0
-    total_cost = 0.0
-    for bars in by_symbol.values():
-        symbol_returns, symbol_benchmark, symbol_trades, turnover, net_cost = _symbol_returns(
-            candidate,
-            bars=bars,
-            costs=costs,
-            locked_oos_fraction=locked_oos_fraction,
-        )
-        strategy_returns.extend(symbol_returns)
-        benchmark_returns.extend(symbol_benchmark)
-        trade_returns.extend(symbol_trades)
-        total_turnover += turnover
-        total_cost += net_cost
+    (
+        strategy_returns,
+        benchmark_returns,
+        trade_returns,
+        total_turnover,
+        total_cost,
+    ) = _symbol_returns(
+        candidate,
+        bars=bars,
+        costs=costs,
+        locked_oos_fraction=locked_oos_fraction,
+    )
     fold_excess = _fold_excess(strategy_returns, benchmark_returns, fold_count)
     return CandidateResult(
+        symbol=symbol,
         candidate=candidate,
         returns=tuple(strategy_returns),
         benchmark_returns=tuple(benchmark_returns),
@@ -459,6 +462,19 @@ def _candidate_to_dict(candidate: MicrostructureCandidate) -> dict[str, float | 
         "oi_drop_abs": candidate.oi_drop_abs,
         "score_threshold": candidate.score_threshold,
     }
+
+
+def _best_candidate_to_dict(result: CandidateResult) -> dict[str, float | int | str]:
+    payload = _candidate_to_dict(result.candidate)
+    payload["symbol"] = result.symbol
+    return payload
+
+
+def _spec_trial_count(spec: Any) -> int:
+    value = getattr(spec, "trial_count_n", 0)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return 0
 
 
 def _insufficient_payload(
