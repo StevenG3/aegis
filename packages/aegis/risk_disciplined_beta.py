@@ -1,12 +1,29 @@
 from __future__ import annotations
 
 import math
-import random
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from aegis.combo_indicator_search import ComboBar, ComboCostModel, benjamini_hochberg
+from aegis.backtest_core import (
+    benjamini_hochberg,
+    risk_return_metrics,
+)
+from aegis.backtest_core import (
+    paired_block_bootstrap_risk_difference_test as _paired_block_bootstrap_risk_difference_test,
+)
+from aegis.combo_indicator_search import ComboBar, ComboCostModel
+
+__all__ = [
+    "RiskBetaConfig",
+    "RiskCandidate",
+    "RiskMetrics",
+    "_paired_block_bootstrap_risk_difference_test",
+    "predeclared_risk_candidates",
+    "report_to_dict",
+    "risk_metrics",
+    "run_risk_disciplined_beta",
+]
 
 
 @dataclass(frozen=True)
@@ -458,33 +475,25 @@ def risk_metrics(
     turnover: float,
     net_cost: float,
 ) -> RiskMetrics:
-    values = tuple(float(value) for value in returns)
-    if not values:
-        return RiskMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, target_volatility, 0.0, net_cost, 0.0, 0.0)
-    equity = _equity(values)
-    years = max(len(values) / annualization_periods, 1 / annualization_periods)
-    annualized_return = equity[-1] ** (1.0 / years) - 1.0 if equity[-1] > 0 else -1.0
-    max_drawdown = _max_drawdown(equity)
-    mean = statistics.fmean(values)
-    stdev = statistics.pstdev(values) if len(values) > 1 else 0.0
-    realized_vol = stdev * math.sqrt(annualization_periods)
-    sharpe = (mean / stdev) * math.sqrt(annualization_periods) if stdev > 0 else 0.0
-    downside = tuple(value for value in values if value < 0)
-    downside_dev = statistics.pstdev(downside) if len(downside) > 1 else 0.0
-    sortino = (mean / downside_dev) * math.sqrt(annualization_periods) if downside_dev > 0 else 0.0
-    calmar = annualized_return / abs(max_drawdown) if max_drawdown < 0 else 0.0
-    return RiskMetrics(
-        annualized_return=annualized_return,
-        max_drawdown=max_drawdown,
-        calmar=calmar,
-        sortino=sortino,
-        sharpe=sharpe,
-        realized_volatility=realized_vol,
+    values = risk_return_metrics(
+        returns,
+        annualization_periods=annualization_periods,
         target_volatility=target_volatility,
-        annualized_turnover=turnover / years,
+        turnover=turnover,
         net_cost=net_cost,
-        worst_month=_worst_month(values),
-        ulcer_index=_ulcer_index(equity),
+    )
+    return RiskMetrics(
+        annualized_return=values["annualized_return"],
+        max_drawdown=values["max_drawdown"],
+        calmar=values["calmar"],
+        sortino=values["sortino"],
+        sharpe=values["sharpe"],
+        realized_volatility=values["realized_volatility"],
+        target_volatility=values["target_volatility"],
+        annualized_turnover=values["annualized_turnover"],
+        net_cost=values["net_cost"],
+        worst_month=values["worst_month"],
+        ulcer_index=values["ulcer_index"],
     )
 
 
@@ -782,131 +791,6 @@ def _drawdown_reduction(strategy: RiskMetrics, benchmark: RiskMetrics) -> float:
     return (benchmark_dd - abs(strategy.max_drawdown)) / benchmark_dd
 
 
-def _paired_block_bootstrap_risk_difference_test(
-    strategy_returns: Sequence[float],
-    benchmark_returns: Sequence[float],
-    strategy_target_volatility: float,
-    benchmark_target_volatility: float,
-    config: RiskBetaConfig,
-    candidate_key: str,
-) -> dict[str, float | int | bool | str]:
-    n = min(len(strategy_returns), len(benchmark_returns))
-    if n < max(30, config.risk_diff_bootstrap_block_bars):
-        return {
-            "valid": False,
-            "method": "paired_block_bootstrap",
-            "reason": "insufficient locked-OOS paired returns for risk-difference bootstrap",
-            "sample_count": 0,
-            "p_value": 1.0,
-            "ci_lower_gt_0": False,
-        }
-    strategy = tuple(float(value) for value in strategy_returns[:n])
-    benchmark = tuple(float(value) for value in benchmark_returns[:n])
-    observed = _risk_difference_metrics(
-        strategy,
-        benchmark,
-        strategy_target_volatility,
-        benchmark_target_volatility,
-        config,
-    )
-    rng = random.Random(config.risk_diff_random_seed + sum(ord(char) for char in candidate_key))
-    sampled_drawdown: list[float] = []
-    sampled_calmar: list[float] = []
-    sampled_sortino: list[float] = []
-    block = min(config.risk_diff_bootstrap_block_bars, n)
-    for _ in range(config.risk_diff_bootstrap_samples):
-        indices: list[int] = []
-        while len(indices) < n:
-            start = rng.randint(0, n - block)
-            indices.extend(range(start, start + block))
-        indices = indices[:n]
-        sample_strategy = tuple(strategy[index] for index in indices)
-        sample_benchmark = tuple(benchmark[index] for index in indices)
-        sample = _risk_difference_metrics(
-            sample_strategy,
-            sample_benchmark,
-            strategy_target_volatility,
-            benchmark_target_volatility,
-            config,
-        )
-        sampled_drawdown.append(sample["drawdown_reduction"])
-        sampled_calmar.append(sample["calmar_diff"])
-        sampled_sortino.append(sample["sortino_diff"])
-    drawdown_ci_low = _quantile(sampled_drawdown, config.risk_diff_ci_alpha)
-    calmar_ci_low = _quantile(sampled_calmar, config.risk_diff_ci_alpha)
-    sortino_ci_low = _quantile(sampled_sortino, config.risk_diff_ci_alpha)
-    drawdown_tail = _nonpositive_share(sampled_drawdown)
-    calmar_tail = _nonpositive_share(sampled_calmar)
-    sortino_tail = _nonpositive_share(sampled_sortino)
-    p_value = (
-        max(drawdown_tail, calmar_tail, sortino_tail)
-        if (
-            observed["drawdown_reduction"] > 0
-            and observed["calmar_diff"] > 0
-            and observed["sortino_diff"] > 0
-        )
-        else 1.0
-    )
-    ci_lower_gt_0 = drawdown_ci_low > 0 and calmar_ci_low > 0 and sortino_ci_low > 0
-    return {
-        "valid": True,
-        "method": "paired_block_bootstrap",
-        "sample_count": config.risk_diff_bootstrap_samples,
-        "block_bars": block,
-        "ci_alpha": config.risk_diff_ci_alpha,
-        "p_value": p_value,
-        "ci_lower_gt_0": ci_lower_gt_0,
-        "drawdown_reduction": observed["drawdown_reduction"],
-        "drawdown_reduction_ci_low": drawdown_ci_low,
-        "calmar_diff": observed["calmar_diff"],
-        "calmar_diff_ci_low": calmar_ci_low,
-        "sortino_diff": observed["sortino_diff"],
-        "sortino_diff_ci_low": sortino_ci_low,
-    }
-
-
-def _risk_difference_metrics(
-    strategy_returns: Sequence[float],
-    benchmark_returns: Sequence[float],
-    strategy_target_volatility: float,
-    benchmark_target_volatility: float,
-    config: RiskBetaConfig,
-) -> dict[str, float]:
-    strategy = risk_metrics(
-        strategy_returns,
-        annualization_periods=config.annualization_periods,
-        target_volatility=strategy_target_volatility,
-        turnover=0.0,
-        net_cost=0.0,
-    )
-    benchmark = risk_metrics(
-        benchmark_returns,
-        annualization_periods=config.annualization_periods,
-        target_volatility=benchmark_target_volatility,
-        turnover=0.0,
-        net_cost=0.0,
-    )
-    return {
-        "drawdown_reduction": _drawdown_reduction(strategy, benchmark),
-        "calmar_diff": strategy.calmar - benchmark.calmar,
-        "sortino_diff": strategy.sortino - benchmark.sortino,
-    }
-
-
-def _quantile(values: Sequence[float], q: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = min(max(int(math.floor(q * (len(ordered) - 1))), 0), len(ordered) - 1)
-    return ordered[index]
-
-
-def _nonpositive_share(values: Sequence[float]) -> float:
-    if not values:
-        return 1.0
-    return sum(1 for value in values if value <= 0) / len(values)
-
-
 def _target_vol_close(metrics: RiskMetrics, config: RiskBetaConfig) -> bool:
     if metrics.target_volatility <= 0:
         return True
@@ -995,49 +879,6 @@ def _above_sma(bars: Sequence[ComboBar], index: int, period: int) -> bool:
         return False
     mean = statistics.fmean(bar.close for bar in bars[index - period + 1 : index + 1])
     return bars[index].close > mean
-
-
-def _equity(returns: Sequence[float]) -> tuple[float, ...]:
-    equity = 1.0
-    values: list[float] = []
-    for value in returns:
-        equity *= 1.0 + value
-        values.append(equity)
-    return tuple(values)
-
-
-def _max_drawdown(equity: Sequence[float]) -> float:
-    peak = 1.0
-    max_dd = 0.0
-    for value in equity:
-        peak = max(peak, value)
-        if peak > 0:
-            max_dd = min(max_dd, value / peak - 1.0)
-    return max_dd
-
-
-def _worst_month(returns: Sequence[float]) -> float:
-    if not returns:
-        return 0.0
-    month_returns: list[float] = []
-    for start in range(0, len(returns), 30):
-        equity = 1.0
-        for value in returns[start : start + 30]:
-            equity *= 1.0 + value
-        month_returns.append(equity - 1.0)
-    return min(month_returns) if month_returns else 0.0
-
-
-def _ulcer_index(equity: Sequence[float]) -> float:
-    if not equity:
-        return 0.0
-    peak = 1.0
-    squared_drawdowns: list[float] = []
-    for value in equity:
-        peak = max(peak, value)
-        drawdown_pct = (value / peak - 1.0) * 100.0 if peak else 0.0
-        squared_drawdowns.append(drawdown_pct * drawdown_pct)
-    return math.sqrt(statistics.fmean(squared_drawdowns)) / 100.0
 
 
 def _insufficient_report(

@@ -5,6 +5,11 @@ import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from aegis.backtest_core import (
+    TradeScorecard,
+    trade_scorecard,
+    trade_scorecard_to_dict,
+)
 from aegis.combo_indicator_search import (
     ComboBar,
     ComboCostModel,
@@ -16,6 +21,18 @@ from aegis.combo_indicator_search import (
     metrics_to_dict,
     sign_test_p_value,
 )
+
+__all__ = [
+    "ScorecardConfig",
+    "TradeScorecard",
+    "predeclared_scorecard_combos",
+    "report_to_dict",
+    "run_combo_scorecard",
+    "scorecard_to_dict",
+    "simulate_combo_with_signals",
+    "trade_scorecard",
+    "trade_scorecard_to_dict",
+]
 
 
 @dataclass(frozen=True)
@@ -48,18 +65,6 @@ class ScorecardCandidate:
     @property
     def name(self) -> str:
         return f"{self.symbol}::{self.combo.key}"
-
-
-@dataclass(frozen=True)
-class TradeScorecard:
-    total_trades: int
-    win_rate: float
-    average_win: float
-    average_loss: float
-    win_loss_ratio: float
-    expectancy_per_trade: float
-    profit_factor: float
-    max_consecutive_losses: int
 
 
 @dataclass(frozen=True)
@@ -441,34 +446,6 @@ def simulate_combo_with_signals(
     )
 
 
-def trade_scorecard(trade_returns: Sequence[float]) -> TradeScorecard:
-    trades = tuple(float(value) for value in trade_returns)
-    if not trades:
-        return TradeScorecard(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
-    wins = tuple(value for value in trades if value > 0)
-    losses = tuple(value for value in trades if value <= 0)
-    total_gain = sum(wins)
-    total_loss = abs(sum(losses))
-    average_win = statistics.fmean(wins) if wins else 0.0
-    average_loss = statistics.fmean(losses) if losses else 0.0
-    win_rate = len(wins) / len(trades)
-    win_loss_ratio = average_win / abs(average_loss) if average_loss < 0 else 0.0
-    expectancy = win_rate * average_win - (1.0 - win_rate) * abs(average_loss)
-    profit_factor = (
-        total_gain / total_loss if total_loss > 0 else (math.inf if total_gain > 0 else 0.0)
-    )
-    return TradeScorecard(
-        total_trades=len(trades),
-        win_rate=win_rate,
-        average_win=average_win,
-        average_loss=average_loss,
-        win_loss_ratio=win_loss_ratio,
-        expectancy_per_trade=expectancy,
-        profit_factor=profit_factor,
-        max_consecutive_losses=_max_consecutive_losses(trades),
-    )
-
-
 def composite_score(trade: TradeScorecard, metrics: ComboMetrics, excess_return: float) -> float:
     expectancy_points = _clip01((trade.expectancy_per_trade + 0.02) / 0.08) * 25.0
     profit_factor_points = _clip01((min(trade.profit_factor, 3.0) - 1.0) / 2.0) * 20.0
@@ -504,19 +481,6 @@ def scorecard_to_dict(scorecard: CandidateScorecard) -> dict[str, object]:
         "gate_checks": scorecard.gate_checks,
         "verdict": scorecard.verdict,
         "reason": scorecard.reason,
-    }
-
-
-def trade_scorecard_to_dict(scorecard: TradeScorecard) -> dict[str, float | int]:
-    return {
-        "total_trades": scorecard.total_trades,
-        "win_rate": scorecard.win_rate,
-        "average_win": scorecard.average_win,
-        "average_loss": scorecard.average_loss,
-        "win_loss_ratio": scorecard.win_loss_ratio,
-        "expectancy_per_trade": scorecard.expectancy_per_trade,
-        "profit_factor": scorecard.profit_factor,
-        "max_consecutive_losses": scorecard.max_consecutive_losses,
     }
 
 
@@ -785,18 +749,6 @@ def _insufficient_report(
             "funding": cost_model.funding_label,
         },
     )
-
-
-def _max_consecutive_losses(trades: Sequence[float]) -> int:
-    worst = 0
-    current = 0
-    for value in trades:
-        if value <= 0:
-            current += 1
-            worst = max(worst, current)
-        else:
-            current = 0
-    return worst
 
 
 def _clip01(value: float) -> float:
