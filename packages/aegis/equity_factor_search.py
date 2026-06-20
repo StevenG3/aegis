@@ -16,7 +16,19 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal
 
+from aegis.backtest_core import benjamini_hochberg
+from aegis.backtest_core import normal_two_sided_p as _normal_two_sided_p
 from aegis.edgar_pit import EdgarFact, derive_fcf, derive_net_debt
+
+__all__ = [
+    "CompositeDeclaration",
+    "FactorDeclaration",
+    "PriceObservation",
+    "SearchConfig",
+    "benjamini_hochberg",
+    "run_equity_factor_search",
+    "sanitized_report",
+]
 
 Verdict = Literal["SUGGESTIVE_NEEDS_PAID_CONFIRM", "NO_EDGE", "INSUFFICIENT"]
 FactorFamily = Literal["value", "quality", "momentum", "risk_size", "composite"]
@@ -312,22 +324,6 @@ def build_factor_values(
         for key, value in values.items()
         if value is not None and math.isfinite(value)
     }
-
-
-def benjamini_hochberg(p_values: Sequence[float], *, alpha: float) -> list[bool]:
-    if not p_values:
-        return []
-    ordered = sorted(enumerate(p_values), key=lambda item: item[1])
-    threshold_rank = -1
-    m = len(p_values)
-    for rank, (_index, p_value) in enumerate(ordered, start=1):
-        if p_value <= (rank / m) * alpha:
-            threshold_rank = rank
-    discoveries = [False] * len(p_values)
-    if threshold_rank > 0:
-        cutoff = ordered[threshold_rank - 1][1]
-        discoveries = [p_value <= cutoff for p_value in p_values]
-    return discoveries
 
 
 def sanitized_report(report: Mapping[str, Any]) -> dict[str, Any]:
@@ -722,10 +718,6 @@ def _latest_visible_date(dates: Sequence[date], as_of: date) -> date | None:
 def _previous_visible_date(dates: Sequence[date], current: date) -> date | None:
     previous = [candidate for candidate in dates if candidate < current]
     return previous[-1] if previous else None
-
-
-def _normal_two_sided_p(t_value: float) -> float:
-    return float(math.erfc(abs(t_value) / math.sqrt(2.0)))
 
 
 def _validate_config(config: SearchConfig) -> None:

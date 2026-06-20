@@ -6,6 +6,31 @@ import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
+from aegis.backtest_core import (
+    CostModel as ComboCostModel,
+)
+from aegis.backtest_core import (
+    ReturnMetrics as ComboMetrics,
+)
+from aegis.backtest_core import (
+    benjamini_hochberg,
+    metrics_from_returns,
+    sign_test_p_value,
+)
+
+__all__ = [
+    "ComboBar",
+    "ComboCostModel",
+    "ComboMetrics",
+    "ComboSearchConfig",
+    "benjamini_hochberg",
+    "buy_hold_simulation",
+    "metrics_from_returns",
+    "metrics_to_dict",
+    "run_combo_indicator_search",
+    "sign_test_p_value",
+]
+
 
 @dataclass(frozen=True)
 class ComboBar:
@@ -15,18 +40,6 @@ class ComboBar:
     low: float
     close: float
     volume: float
-
-
-@dataclass(frozen=True)
-class ComboCostModel:
-    fee_bps: float = 10.0
-    slippage_bps: float = 5.0
-    funding_bps_per_period: float = 0.0
-    funding_label: str = "N/A for spot long-only; perp funding not used"
-
-    @property
-    def one_way_cost(self) -> float:
-        return (self.fee_bps + self.slippage_bps) / 10_000.0
 
 
 @dataclass(frozen=True)
@@ -50,20 +63,6 @@ class ComboSearchConfig:
     realized_vol_periods: tuple[int, ...] = (20, 60)
     volume_z_periods: tuple[int, ...] = (20,)
     obv_periods: tuple[int, ...] = (20,)
-
-
-@dataclass(frozen=True)
-class ComboMetrics:
-    annualized_return: float
-    total_return: float
-    max_drawdown: float
-    sharpe: float
-    sortino: float
-    calmar: float
-    positive_period_win_rate: float
-    oos_vs_buy_hold_window_win_rate: float
-    annualized_turnover: float
-    net_cost: float
 
 
 @dataclass(frozen=True)
@@ -610,45 +609,6 @@ def buy_hold_simulation(
     )
 
 
-def metrics_from_returns(
-    returns: Sequence[float],
-    *,
-    annualization_periods: int,
-    turnover: float,
-    net_cost: float,
-    oos_vs_buy_hold_window_win_rate: float = 0.0,
-) -> ComboMetrics:
-    values = tuple(float(value) for value in returns)
-    if not values:
-        return ComboMetrics(
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, oos_vs_buy_hold_window_win_rate, 0.0, net_cost
-        )
-    equity = _equity(values)
-    total_return = equity[-1] - 1.0
-    years = max(len(values) / annualization_periods, 1 / annualization_periods)
-    annualized_return = equity[-1] ** (1 / years) - 1.0 if equity[-1] > 0 else -1.0
-    max_dd = _max_drawdown(equity)
-    mean = statistics.fmean(values)
-    stdev = statistics.pstdev(values) if len(values) > 1 else 0.0
-    sharpe = (mean / stdev) * math.sqrt(annualization_periods) if stdev > 0 else 0.0
-    downside = tuple(value for value in values if value < 0)
-    downside_dev = statistics.pstdev(downside) if len(downside) > 1 else 0.0
-    sortino = (mean / downside_dev) * math.sqrt(annualization_periods) if downside_dev > 0 else 0.0
-    calmar = annualized_return / abs(max_dd) if max_dd < 0 else 0.0
-    return ComboMetrics(
-        annualized_return=annualized_return,
-        total_return=total_return,
-        max_drawdown=max_dd,
-        sharpe=sharpe,
-        sortino=sortino,
-        calmar=calmar,
-        positive_period_win_rate=sum(1 for value in values if value > 0) / len(values),
-        oos_vs_buy_hold_window_win_rate=oos_vs_buy_hold_window_win_rate,
-        annualized_turnover=turnover / years,
-        net_cost=net_cost,
-    )
-
-
 def metrics_to_dict(metrics: ComboMetrics) -> dict[str, float]:
     return {
         "annualized_return": metrics.annualized_return,
@@ -662,32 +622,6 @@ def metrics_to_dict(metrics: ComboMetrics) -> dict[str, float]:
         "annualized_turnover": metrics.annualized_turnover,
         "net_cost": metrics.net_cost,
     }
-
-
-def benjamini_hochberg(p_values: Sequence[float], *, alpha: float) -> list[bool]:
-    m = len(p_values)
-    if m == 0:
-        return []
-    ordered = sorted(enumerate(p_values), key=lambda item: item[1])
-    threshold_rank = -1
-    for rank, (_, p_value) in enumerate(ordered, start=1):
-        if p_value <= alpha * rank / m:
-            threshold_rank = rank
-    keep = [False] * m
-    if threshold_rank >= 0:
-        cutoff = ordered[threshold_rank - 1][1]
-        keep = [p_value <= cutoff for p_value in p_values]
-    return keep
-
-
-def sign_test_p_value(excess_returns: Sequence[float]) -> float:
-    non_zero = [value for value in excess_returns if value != 0]
-    n = len(non_zero)
-    if n == 0:
-        return 1.0
-    wins = sum(1 for value in non_zero if value > 0)
-    tail = sum(math.comb(n, k) * (0.5**n) for k in range(wins, n + 1))
-    return min(1.0, tail)
 
 
 def report_to_dict(report: ComboSearchReport) -> dict[str, object]:
@@ -1303,22 +1237,3 @@ def _obv_slope(bars: Sequence[ComboBar], index: int, period: int) -> float:
         if current == index - period + 1:
             previous = obv
     return obv - previous
-
-
-def _equity(returns: Sequence[float]) -> tuple[float, ...]:
-    equity = 1.0
-    values: list[float] = []
-    for value in returns:
-        equity *= 1.0 + value
-        values.append(equity)
-    return tuple(values)
-
-
-def _max_drawdown(equity: Sequence[float]) -> float:
-    peak = 1.0
-    max_dd = 0.0
-    for value in equity:
-        peak = max(peak, value)
-        if peak > 0:
-            max_dd = min(max_dd, value / peak - 1.0)
-    return max_dd

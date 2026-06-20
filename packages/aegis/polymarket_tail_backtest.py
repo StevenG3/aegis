@@ -10,6 +10,7 @@ from decimal import Decimal
 from statistics import mean
 from typing import Any
 
+from aegis.backtest_core import bootstrap_mean_ci
 from aegis.polymarket_onchain import (
     PolymarketClosedMarket,
     PolymarketTrade,
@@ -145,7 +146,10 @@ def summarize_tail_backtest(
         returns,
         iterations=bootstrap_iterations,
         seed=random_seed,
+        empty_value=0.0,
+        include_iterations=True,
     )
+    ci_low = float(ci["p05"] or 0.0)
     cluster_payload = cluster_loss_events(losses)
     verdict = _tail_verdict(
         returns=returns,
@@ -153,7 +157,7 @@ def summarize_tail_backtest(
         independent_loss_events=independent_loss_events,
         net_mean=net_mean,
         risk_free=risk_free,
-        ci_low=float(ci["p05"]),
+        ci_low=ci_low,
         min_independent_loss_events_for_edge=min_independent_loss_events_for_edge,
     )
     return {
@@ -291,29 +295,6 @@ def walk_forward_summary(
         "insample": _slice_stats(insample, risk_free_return_per_trade),
         "outsample": _slice_stats(outsample, risk_free_return_per_trade),
         "note": "Small loss count means this is a stability diagnostic, not proof of edge.",
-    }
-
-
-def bootstrap_mean_ci(
-    values: Sequence[float],
-    *,
-    iterations: int,
-    seed: int,
-) -> dict[str, float | int]:
-    if not values:
-        return {"p05": 0.0, "p50": 0.0, "p95": 0.0, "iterations": iterations}
-    rng = random.Random(seed)
-    sample_size = len(values)
-    boot = [
-        mean(rng.choice(values) for _ in range(sample_size))
-        for _ in range(max(1, iterations))
-    ]
-    boot.sort()
-    return {
-        "p05": percentile(boot, 0.05),
-        "p50": percentile(boot, 0.50),
-        "p95": percentile(boot, 0.95),
-        "iterations": iterations,
     }
 
 

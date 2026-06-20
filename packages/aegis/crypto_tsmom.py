@@ -1,10 +1,33 @@
 from __future__ import annotations
 
-import math
-import random
 import statistics
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
+
+from aegis.backtest_core import (
+    CostModel,
+    benjamini_hochberg,
+    bootstrap_mean_ci,
+    equity_curve,
+    metrics_from_returns,
+    sign_test_p_value,
+)
+from aegis.backtest_core import (
+    ReturnMetrics as BacktestMetrics,
+)
+
+__all__ = [
+    "BacktestMetrics",
+    "CostModel",
+    "CryptoBar",
+    "TsmomConfig",
+    "benjamini_hochberg",
+    "report_to_dict",
+    "run_crypto_tsmom_walk_forward",
+    "sign_test_p_value",
+    "simulate_buy_hold",
+    "simulate_tsmom",
+]
 
 
 @dataclass(frozen=True)
@@ -15,18 +38,6 @@ class CryptoBar:
 
 
 @dataclass(frozen=True)
-class CostModel:
-    fee_bps: float = 10.0
-    slippage_bps: float = 5.0
-    funding_bps_per_period: float = 0.0
-    funding_label: str = "N/A for spot long-only"
-
-    @property
-    def round_trip_bps(self) -> float:
-        return self.fee_bps + self.slippage_bps
-
-
-@dataclass(frozen=True)
 class TsmomConfig:
     lookbacks: tuple[int, ...] = (30, 60, 90, 120)
     train_bars: int = 730
@@ -34,18 +45,6 @@ class TsmomConfig:
     step_bars: int = 180
     annualization_periods: int = 365
     allow_short: bool = False
-
-
-@dataclass(frozen=True)
-class BacktestMetrics:
-    total_return: float
-    max_drawdown: float
-    sharpe: float
-    sortino: float
-    calmar: float
-    positive_period_win_rate: float
-    annualized_turnover: float
-    net_cost: float
 
 
 @dataclass(frozen=True)
@@ -95,7 +94,7 @@ class WalkForwardReport:
 
 
 DEFAULT_TSMOM_CONFIG = TsmomConfig()
-DEFAULT_COST_MODEL = CostModel()
+DEFAULT_COST_MODEL = CostModel(funding_label="N/A for spot long-only")
 
 
 def run_crypto_tsmom_walk_forward(
@@ -200,6 +199,7 @@ def run_crypto_tsmom_walk_forward(
         turnover=sum(window.strategy_metrics.annualized_turnover for window in windows)
         / len(windows),
         net_cost=sum(window.strategy_metrics.net_cost for window in windows),
+        nonpositive_annualized_return=0.0,
     )
     buy_hold_metrics = metrics_from_returns(
         all_buy_hold_returns,
@@ -209,6 +209,7 @@ def run_crypto_tsmom_walk_forward(
             / len(windows)
         ),
         net_cost=sum(window.buy_hold_metrics.net_cost for window in windows),
+        nonpositive_annualized_return=0.0,
     )
     excess = tuple(window.excess_return for window in windows)
     multiple_testing = fdr_report(
@@ -283,6 +284,7 @@ def simulate_tsmom(
         annualization_periods=config.annualization_periods,
         turnover=turnover,
         net_cost=sum(costs),
+        nonpositive_annualized_return=0.0,
     )
     return SimulationResult(
         returns=tuple(returns),
@@ -321,6 +323,7 @@ def simulate_buy_hold(
         annualization_periods=annualization_periods,
         turnover=1.0,
         net_cost=sum(costs),
+        nonpositive_annualized_return=0.0,
     )
     return SimulationResult(
         returns=tuple(returns),
@@ -332,102 +335,6 @@ def simulate_buy_hold(
         first_trade_index=start,
         last_trade_index=max(start, end - 1),
     )
-
-
-def metrics_from_returns(
-    returns: Sequence[float],
-    *,
-    annualization_periods: int,
-    turnover: float,
-    net_cost: float,
-) -> BacktestMetrics:
-    if not returns:
-        return BacktestMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, net_cost)
-    equity = equity_curve(returns)
-    total_return = equity[-1] - 1.0
-    max_dd = max_drawdown(equity)
-    mean = statistics.fmean(returns)
-    stdev = statistics.pstdev(returns)
-    downside = [value for value in returns if value < 0]
-    downside_dev = statistics.pstdev(downside) if len(downside) > 1 else 0.0
-    years = len(returns) / annualization_periods
-    cagr = (equity[-1] ** (1.0 / years) - 1.0) if years > 0 and equity[-1] > 0 else 0.0
-    sharpe = mean / stdev * math.sqrt(annualization_periods) if stdev > 0 else 0.0
-    sortino = mean / downside_dev * math.sqrt(annualization_periods) if downside_dev > 0 else 0.0
-    calmar = cagr / abs(max_dd) if max_dd < 0 else 0.0
-    return BacktestMetrics(
-        total_return=total_return,
-        max_drawdown=max_dd,
-        sharpe=sharpe,
-        sortino=sortino,
-        calmar=calmar,
-        positive_period_win_rate=sum(1 for value in returns if value > 0) / len(returns),
-        annualized_turnover=turnover / max(years, 1e-9),
-        net_cost=net_cost,
-    )
-
-
-def equity_curve(returns: Iterable[float]) -> tuple[float, ...]:
-    equity = 1.0
-    curve = [equity]
-    for value in returns:
-        equity *= 1.0 + value
-        curve.append(equity)
-    return tuple(curve)
-
-
-def max_drawdown(equity: Sequence[float]) -> float:
-    peak = equity[0] if equity else 1.0
-    worst = 0.0
-    for value in equity:
-        peak = max(peak, value)
-        drawdown = value / peak - 1.0 if peak else 0.0
-        worst = min(worst, drawdown)
-    return worst
-
-
-def sign_test_p_value(excess_returns: Sequence[float]) -> float:
-    non_zero = [value for value in excess_returns if value != 0]
-    n = len(non_zero)
-    if n == 0:
-        return 1.0
-    wins = sum(1 for value in non_zero if value > 0)
-    losses = n - wins
-    tail_count = min(wins, losses)
-    tail = float(sum(math.comb(n, k) for k in range(0, tail_count + 1)) / (2**n))
-    return min(1.0, 2.0 * tail)
-
-
-def bootstrap_mean_ci(
-    values: Sequence[float],
-    *,
-    iterations: int = 1_000,
-    seed: int = 44,
-) -> dict[str, float | None]:
-    if not values:
-        return {"p05": None, "p50": None, "p95": None}
-    rng = random.Random(seed)
-    means = sorted(statistics.fmean(rng.choice(values) for _ in values) for _ in range(iterations))
-    return {
-        "p05": means[int(iterations * 0.05)],
-        "p50": means[int(iterations * 0.50)],
-        "p95": means[int(iterations * 0.95)],
-    }
-
-
-def benjamini_hochberg(p_values: Sequence[float], *, alpha: float = 0.10) -> list[bool]:
-    indexed = sorted(enumerate(p_values), key=lambda item: item[1])
-    passed = [False for _ in p_values]
-    max_rank = -1
-    m = len(indexed)
-    for rank, (_index, p_value) in enumerate(indexed, start=1):
-        if p_value <= alpha * rank / m:
-            max_rank = rank
-    if max_rank >= 1:
-        for _rank, (index, _p_value) in enumerate(indexed, start=1):
-            if _rank <= max_rank:
-                passed[index] = True
-    return passed
 
 
 def report_to_dict(report: WalkForwardReport) -> dict[str, object]:
@@ -573,6 +480,7 @@ def _combine_equal_weight(
             annualization_periods=annualization_periods,
             turnover=0.0,
             net_cost=0.0,
+            nonpositive_annualized_return=0.0,
         )
         return SimulationResult((), (1.0,), (), (), 0.0, empty_metrics, 0, 0)
     returns = tuple(
@@ -586,6 +494,7 @@ def _combine_equal_weight(
         annualization_periods=annualization_periods,
         turnover=turnover,
         net_cost=net_cost,
+        nonpositive_annualized_return=0.0,
     )
     return SimulationResult(
         returns=returns,
@@ -628,7 +537,7 @@ def _summary(
         "excess_bootstrap_ci_p05": ci["p05"],
         "excess_bootstrap_ci_p50": ci["p50"],
         "excess_bootstrap_ci_p95": ci["p95"],
-        "sign_test_p_value": sign_test_p_value(excess),
+        "sign_test_p_value": sign_test_p_value(excess, alternative="two-sided"),
         "strategy_sharpe": strategy_metrics.sharpe,
         "buy_hold_sharpe": buy_hold_metrics.sharpe,
         "strategy_calmar": strategy_metrics.calmar,
@@ -639,7 +548,7 @@ def _summary(
 def fdr_report(
     p_values: Sequence[float], *, alpha: float = 0.10
 ) -> dict[str, float | int | str | None]:
-    passed = benjamini_hochberg(p_values, alpha=alpha)
+    passed = benjamini_hochberg(p_values, alpha=alpha, tie_policy="rank")
     return {
         "method": "Benjamini-Hochberg",
         "alpha": alpha,
@@ -680,7 +589,7 @@ def _static_oos_p_value(
             annualization_periods=config.annualization_periods,
         )
         excess.append(strategy.metrics.total_return - buy_hold.metrics.total_return)
-    return sign_test_p_value(excess)
+    return sign_test_p_value(excess, alternative="two-sided")
 
 
 def _verdict(

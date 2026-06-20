@@ -5,11 +5,19 @@ import math
 import os
 import statistics
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any, Literal, cast
+from functools import partial
+from typing import Any, Literal, Protocol, cast
 
 import pandas as pd  # type: ignore[import-untyped]
+from aegis.backtest_core import (
+    benjamini_hochberg as _core_benjamini_hochberg,
+)
+from aegis.backtest_core import (
+    sign_test_p_value as _core_sign_test_p_value,
+)
 
 from data import TIMEFRAME_MS, DataLoadError
 
@@ -19,6 +27,21 @@ FundingVerdict = Literal["ROBUST_CARRY", "NO_ROBUST_EDGE", "INSUFFICIENT"]
 REQUEST_LIMIT = 1000
 RETRY_COUNT = 2
 DEFAULT_MAX_FUNDING_EVENTS = 1500
+
+
+class _BhCallable(Protocol):
+    def __call__(self, p_values: Sequence[float], *, alpha: float) -> list[bool]:
+        ...
+
+
+_sign_test_p_value = cast(
+    Callable[[Sequence[float]], float],
+    partial(_core_sign_test_p_value, alternative="greater"),
+)
+_benjamini_hochberg = cast(
+    _BhCallable,
+    partial(_core_benjamini_hochberg, tie_policy="rank"),
+)
 
 
 @dataclass(frozen=True)
@@ -1173,28 +1196,6 @@ def _research_insufficient(
     }
 
 
-def _sign_test_p_value(excess_returns: list[float]) -> float:
-    non_zero = [value for value in excess_returns if value != 0.0]
-    n = len(non_zero)
-    if n == 0:
-        return 1.0
-    wins = sum(1 for value in non_zero if value > 0.0)
-    return min(1.0, float(sum(math.comb(n, k) for k in range(wins, n + 1)) / (2**n)))
-
-
-def _benjamini_hochberg(p_values: list[float], *, alpha: float) -> list[bool]:
-    indexed = sorted(enumerate(p_values), key=lambda item: item[1])
-    passed = [False for _ in p_values]
-    max_rank = -1
-    tests = len(indexed)
-    for rank, (_index, p_value) in enumerate(indexed, start=1):
-        if p_value <= alpha * rank / tests:
-            max_rank = rank
-    if max_rank >= 1:
-        for rank, (index, _p_value) in enumerate(indexed, start=1):
-            if rank <= max_rank:
-                passed[index] = True
-    return passed
 
 
 def _median(values: list[float]) -> float:
