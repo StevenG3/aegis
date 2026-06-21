@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -567,6 +568,132 @@ def test_readyz_returns_503_when_no_exchange_is_configured(monkeypatch) -> None:
         "status": "not_ready",
         "exchanges": {"binance": False, "okx": False, "bybit": False},
     }
+
+
+class ProbeClient:
+    def configured_exchanges(self) -> list[str]:
+        return ["binance", "okx", "bybit"]
+
+    def is_configured(self, exchange: str) -> bool:
+        _ = exchange
+        return True
+
+    def is_ready(self, exchange: str) -> bool:
+        _ = exchange
+        return True
+
+    def fetch_balance_payload(self, exchange: str) -> dict[str, object]:
+        return {
+            "balances": [
+                {
+                    "exchange": exchange,
+                    "asset": "USDT",
+                    "free": "1",
+                    "used": "0",
+                    "total": "1",
+                    "usd_value": "1",
+                    "sources": "synthetic:1",
+                }
+            ],
+            "summary": {
+                "total_usd": "1",
+                "visible_usd": "1",
+                "hidden_usd": "0",
+                "hidden_count": "0",
+                "total_assets": "1",
+                "visible_assets": "1",
+                "min_usd_detail": "10",
+            },
+        }
+
+
+def install_fake_timeout(
+    monkeypatch,
+    bridge_app,
+    *,
+    slow_exchange: str | None = None,
+    delay_seconds: float = 0.05,
+) -> None:
+    async def fake_with_timeout(func, *args: object) -> object:
+        exchange = str(args[0])
+        await bridge_app.asyncio.sleep(delay_seconds)
+        if exchange == slow_exchange:
+            raise TimeoutError()
+        return func(*args)
+
+    monkeypatch.setattr(bridge_app, "_with_timeout", fake_with_timeout)
+
+
+def test_readyz_all_ready_with_concurrent_probes(monkeypatch) -> None:
+    bridge_app, _fake_ccxt = load_service_app(monkeypatch)
+    bridge_app.client = ProbeClient()
+    install_fake_timeout(monkeypatch, bridge_app, delay_seconds=0.05)
+
+    started = time.monotonic()
+    response = TestClient(bridge_app.app).get("/readyz")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.12
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "exchanges": {"binance": True, "okx": True, "bybit": True},
+    }
+
+
+def test_readyz_single_exchange_timeout_degrades_without_blocking_others(monkeypatch) -> None:
+    bridge_app, _fake_ccxt = load_service_app(monkeypatch)
+    bridge_app.client = ProbeClient()
+    install_fake_timeout(monkeypatch, bridge_app, slow_exchange="okx", delay_seconds=0.05)
+
+    started = time.monotonic()
+    response = TestClient(bridge_app.app).get("/readyz")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.12
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "exchanges": {"binance": True, "okx": False, "bybit": True},
+    }
+
+
+def test_balances_single_exchange_timeout_keeps_other_payloads(monkeypatch) -> None:
+    bridge_app, _fake_ccxt = load_service_app(monkeypatch)
+    bridge_app.client = ProbeClient()
+    install_fake_timeout(monkeypatch, bridge_app, slow_exchange="okx", delay_seconds=0.05)
+
+    started = time.monotonic()
+    response = TestClient(bridge_app.app).get("/balances")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.12
+    assert response.status_code == 200
+    body = response.json()
+    assert body["exchanges"] == {"binance": True, "okx": False, "bybit": True}
+    assert body["readiness"]["okx"] == {"ready": False, "reason": "TIMEOUT"}
+    assert body["errors"] == {"okx": "TIMEOUT"}
+    assert body["summaries"] == {
+        "binance": {
+            "total_usd": "1",
+            "visible_usd": "1",
+            "hidden_usd": "0",
+            "hidden_count": "0",
+            "total_assets": "1",
+            "visible_assets": "1",
+            "min_usd_detail": "10",
+        },
+        "bybit": {
+            "total_usd": "1",
+            "visible_usd": "1",
+            "hidden_usd": "0",
+            "hidden_count": "0",
+            "total_assets": "1",
+            "visible_assets": "1",
+            "min_usd_detail": "10",
+        },
+    }
+    assert [row["exchange"] for row in body["balances"]] == ["binance", "bybit"]
 
 
 def test_source_contains_no_ccxt_mutation_calls() -> None:

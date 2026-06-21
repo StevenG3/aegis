@@ -15,6 +15,7 @@ from exchange_client import SUPPORTED_EXCHANGES, ExchangeClient, ExchangeName
 logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT_SEC = float(os.getenv("EXCHANGE_TIMEOUT_SEC", "10"))
 EXCHANGE_QUERY = Query(default=None)
+BalanceProbeTask = asyncio.Task[tuple[ExchangeName, dict[str, object] | Exception]]
 
 
 class BalanceItem(BaseModel):
@@ -76,6 +77,18 @@ def _not_configured_reason(exchange: ExchangeName) -> str:
     return "no credentials"
 
 
+async def _exchange_ready(exchange: ExchangeName) -> tuple[ExchangeName, bool]:
+    try:
+        return exchange, bool(await _with_timeout(client.is_ready, exchange))
+    except Exception as exc:
+        logger.warning(
+            "exchange readiness probe failed exchange=%s error=%s",
+            exchange,
+            type(exc).__name__,
+        )
+        return exchange, False
+
+
 @app.get("/readyz", response_model=None)
 async def readyz() -> JSONResponse | dict[str, object]:
     exchanges: dict[ExchangeName, bool] = {
@@ -88,20 +101,32 @@ async def readyz() -> JSONResponse | dict[str, object]:
             content={"status": "not_ready", "exchanges": exchanges},
         )
 
-    for exchange in configured:
-        try:
-            exchanges[exchange] = bool(await _with_timeout(client.is_ready, exchange))
-        except Exception as exc:
-            logger.warning(
-                "exchange readiness probe failed exchange=%s error=%s",
-                exchange,
-                type(exc).__name__,
-            )
-            exchanges[exchange] = False
+    readiness_results = await asyncio.gather(
+        *(_exchange_ready(exchange) for exchange in configured)
+    )
+    for exchange, is_ready in readiness_results:
+        exchanges[exchange] = is_ready
 
     status = "ready" if any(exchanges.values()) else "not_ready"
     status_code = 200 if status == "ready" else 503
     return JSONResponse(status_code=status_code, content={"status": status, "exchanges": exchanges})
+
+
+async def _exchange_balance_payload(
+    exchange: ExchangeName,
+) -> tuple[ExchangeName, dict[str, object] | Exception]:
+    try:
+        payload = await _with_timeout(client.fetch_balance_payload, exchange)
+    except Exception as exc:
+        logger.warning(
+            "exchange balance fetch failed exchange=%s error=%s",
+            exchange,
+            type(exc).__name__,
+        )
+        return exchange, exc
+    if isinstance(payload, dict):
+        return exchange, cast(dict[str, object], payload)
+    return exchange, RuntimeError("EXCHANGE_BALANCE_UNAVAILABLE")
 
 
 @app.get("/balances", response_model=BalancesResponse)
@@ -119,6 +144,7 @@ async def balances(
     summaries: dict[ExchangeName, dict[str, str]] = {}
     requested = (exchange,) if exchange is not None else SUPPORTED_EXCHANGES
     payload: list[dict[str, str]] = []
+    balance_tasks: list[BalanceProbeTask] = []
 
     for exchange_name in requested:
         if not client.is_configured(exchange_name):
@@ -127,27 +153,27 @@ async def balances(
                 "reason": _not_configured_reason(exchange_name),
             }
             continue
-        try:
-            balance_payload = await _with_timeout(client.fetch_balance_payload, exchange_name)
-        except Exception as exc:
-            logger.warning(
-                "exchange balance fetch failed exchange=%s error=%s",
-                exchange_name,
-                type(exc).__name__,
-            )
+        balance_tasks.append(asyncio.create_task(_exchange_balance_payload(exchange_name)))
+
+    if balance_tasks:
+        balance_results = await asyncio.gather(*balance_tasks)
+    else:
+        balance_results = []
+
+    for exchange_name, balance_payload in balance_results:
+        if isinstance(balance_payload, Exception):
             exchanges[exchange_name] = False
-            reason = _error_code(exc)
+            reason = _error_code(balance_payload)
             errors[exchange_name] = reason
             readiness[exchange_name] = {"ready": False, "reason": reason}
             continue
         exchanges[exchange_name] = True
         readiness[exchange_name] = {"ready": True, "reason": ""}
-        if isinstance(balance_payload, dict):
-            payload.extend(cast(list[dict[str, str]], balance_payload.get("balances", [])))
-            summaries[exchange_name] = cast(
-                dict[str, str],
-                balance_payload.get("summary", {}),
-            )
+        payload.extend(cast(list[dict[str, str]], balance_payload.get("balances", [])))
+        summaries[exchange_name] = cast(
+            dict[str, str],
+            balance_payload.get("summary", {}),
+        )
 
     return {
         "balances": payload,
