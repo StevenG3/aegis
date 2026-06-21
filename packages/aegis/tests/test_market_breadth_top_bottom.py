@@ -8,8 +8,10 @@ from aegis.backtest_core import CostModel
 from aegis.market_breadth_top_bottom import (
     BreadthBar,
     BreadthConfig,
+    EventRecord,
     build_event_records,
     compute_breadth_frames,
+    disjoint_event_records,
     run_market_breadth_study,
     trial_count_for_config,
 )
@@ -176,3 +178,129 @@ def test_t_plus_one_return_does_not_use_signal_day_close_as_entry() -> None:
     )
 
     assert first.forward_return_after_costs == pytest.approx(expected)
+
+
+def test_disjoint_events_are_deduped_per_trial_key_and_horizon() -> None:
+    base = BreadthBar(timestamp=0, open=1, high=1, low=1, close=1, volume=1)
+    events = []
+    for timestamp in (10, 12, 15, 19, 20):
+        events.append(
+            _event(
+                key="A|thr=0.7000|h=5",
+                timestamp=timestamp,
+                horizon=5,
+            )
+        )
+    events.append(_event(key="B|thr=0.7000|h=5", timestamp=12, horizon=5))
+    assert base.close == 1
+
+    kept = disjoint_event_records(events)
+
+    assert [
+        event.timestamp for event in kept if event.key == "A|thr=0.7000|h=5"
+    ] == [10, 15, 20]
+    assert [event.timestamp for event in kept if event.key == "B|thr=0.7000|h=5"] == [12]
+
+
+def test_overlap_correction_is_explicit_and_reports_raw_vs_disjoint_counts() -> None:
+    member_bars = {
+        "AAA": _bars(drift=0.003),
+        "BBB": _bars(drift=0.003),
+        "CCC": _bars(drift=0.003),
+    }
+    benchmark_bars = _bars(drift=0.002)
+    cost_model = CostModel(fee_bps=0.0, slippage_bps=0.0)
+
+    raw = run_market_breadth_study(
+        universe_name="synthetic",
+        member_bars=member_bars,
+        benchmark_bars=benchmark_bars,
+        config=BreadthConfig(
+            horizons=(5,),
+            hot_thresholds=(0.50,),
+            floor_thresholds=(0.10,),
+            min_events_per_candidate=1,
+            overlap_correction=False,
+        ),
+        cost_model=cost_model,
+        data_source="synthetic",
+        benchmark_name="SYNTH",
+        survivor_light=True,
+    )
+    corrected = run_market_breadth_study(
+        universe_name="synthetic",
+        member_bars=member_bars,
+        benchmark_bars=benchmark_bars,
+        config=BreadthConfig(
+            horizons=(5,),
+            hot_thresholds=(0.50,),
+            floor_thresholds=(0.10,),
+            min_events_per_candidate=1,
+            overlap_correction=True,
+        ),
+        cost_model=cost_model,
+        data_source="synthetic",
+        benchmark_name="SYNTH",
+        survivor_light=True,
+    )
+
+    raw_multiple = raw["multiple_testing"]
+    corrected_multiple = corrected["multiple_testing"]
+    raw_overlap = raw_multiple["overlap_correction"]
+    corrected_overlap = corrected_multiple["overlap_correction"]
+    assert raw_overlap["enabled"] is False
+    assert corrected_overlap["enabled"] is True
+    assert corrected_overlap["disjoint_event_count"] < corrected_overlap["raw_event_count"]
+    assert raw["event_summary"]["events"] == raw_overlap["raw_event_count"]
+
+
+def test_overlap_correction_uses_block_p_value_for_fdr() -> None:
+    result = run_market_breadth_study(
+        universe_name="small_sample",
+        member_bars={
+            "AAA": _bars(drift=0.003, count=230),
+            "BBB": _bars(drift=0.003, count=230),
+            "CCC": _bars(drift=0.003, count=230),
+        },
+        benchmark_bars=_bars(drift=0.002, count=230),
+        config=BreadthConfig(
+            horizons=(60,),
+            hot_thresholds=(0.50,),
+            floor_thresholds=(0.10,),
+            min_events_per_candidate=1,
+            overlap_correction=True,
+        ),
+        cost_model=CostModel(fee_bps=0.0, slippage_bps=0.0),
+        data_source="synthetic",
+        benchmark_name="SYNTH",
+        survivor_light=True,
+    )
+
+    rows = [
+        row
+        for row in result["candidate_statistics"]
+        if row["signal"] != "untriggered" and row["events"] > 0
+    ]
+    assert rows
+    assert all(row["p_value"] == row["block_bootstrap_p_value"] for row in rows)
+    assert any(row["block_bootstrap_valid"] is False for row in rows)
+
+
+def _event(*, key: str, timestamp: int, horizon: int) -> EventRecord:
+    return EventRecord(
+        key=key,
+        signal=key.split("|", maxsplit=1)[0],
+        threshold=0.7,
+        horizon=horizon,
+        timestamp=timestamp,
+        entry_timestamp=timestamp + 1,
+        exit_timestamp=timestamp + horizon,
+        regime="bull",
+        forward_return_after_costs=0.01,
+        baseline_return=0.0,
+        excess_return=0.01,
+        drawdown=0.0,
+        breadth_ma8=0.8,
+        breadth_ma21=0.8,
+        breadth_ma60=0.8,
+    )
