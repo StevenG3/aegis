@@ -42,6 +42,16 @@ def test_sign_test_supports_one_sided_and_two_sided_modes() -> None:
     assert sign_test_p_value(excess, alternative="two-sided") == pytest.approx(0.625)
 
 
+def test_sign_test_large_sample_uses_stable_approximation() -> None:
+    excess = [1.0] * 600 + [-1.0] * 400
+
+    greater = sign_test_p_value(excess, alternative="greater")
+    two_sided = sign_test_p_value(excess, alternative="two-sided")
+
+    assert 0.0 < greater < 1e-9
+    assert 0.0 < two_sided < 1e-8
+
+
 def test_metrics_from_returns_preserves_combo_metric_shape() -> None:
     metrics = metrics_from_returns(
         [0.10, -0.05, 0.02],

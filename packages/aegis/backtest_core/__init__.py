@@ -398,6 +398,8 @@ def sign_test_p_value(
     if n == 0:
         return 1.0
     wins = sum(1 for value in non_zero if value > 0)
+    if n > 200:
+        return _large_sample_sign_test_p_value(wins=wins, n=n, alternative=alternative)
     if alternative == "greater":
         tail = sum(math.comb(n, k) * 0.5**n for k in range(wins, n + 1))
         return min(1.0, float(tail))
@@ -405,6 +407,26 @@ def sign_test_p_value(
     tail_count = min(wins, losses)
     tail = float(sum(math.comb(n, k) for k in range(0, tail_count + 1)) / (2**n))
     return min(1.0, 2.0 * tail)
+
+
+def _large_sample_sign_test_p_value(
+    *,
+    wins: int,
+    n: int,
+    alternative: SignAlternative,
+) -> float:
+    mean = n * 0.5
+    sigma = math.sqrt(n * 0.25)
+    if sigma == 0.0:
+        return 1.0
+    if alternative == "greater":
+        z_score = (wins - 0.5 - mean) / sigma
+        return min(1.0, 0.5 * math.erfc(z_score / math.sqrt(2.0)))
+    losses = n - wins
+    tail_count = min(wins, losses)
+    z_score = (tail_count + 0.5 - mean) / sigma
+    lower_tail = 0.5 * (1.0 + math.erf(z_score / math.sqrt(2.0)))
+    return min(1.0, 2.0 * lower_tail)
 
 
 def bootstrap_mean_ci(
