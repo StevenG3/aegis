@@ -21,6 +21,19 @@ def load_script() -> Any:
     return module
 
 
+def load_impulse_script() -> Any:
+    repo_root = Path(__file__).resolve().parents[3]
+    script_path = repo_root / "scripts" / "microstructure_impulse_evidence.py"
+    spec = importlib.util.spec_from_file_location(
+        "microstructure_impulse_evidence_script", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["microstructure_impulse_evidence_script"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class FakeBinanceUsdm:
     def __init__(self, config: dict[str, object]) -> None:
         self.config = config
@@ -154,3 +167,31 @@ def test_main_with_fake_ccxt_writes_private_evidence(
     assert payload["report"]["multiple_testing"]["method"] == "BH-FDR + CSCV_PBO"
     assert payload["verdict"]["survivor_ceiling_applied"] is True
     assert payload["input"]["btc_reference_symbol"] == "BTC/USDT:USDT"
+
+
+def test_impulse_main_with_fake_ccxt_writes_olympus65_comparison(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = load_impulse_script()
+    fake_ccxt = SimpleNamespace(binanceusdm=lambda config: FakeBinanceUsdm(config))
+    monkeypatch.setitem(sys.modules, "ccxt", fake_ccxt)
+    private_root = tmp_path / "aegis-strategies"
+    private_root.mkdir()
+    monkeypatch.setenv("AEGIS_STRATEGIES_ROOT", str(private_root))
+    monkeypatch.setenv("MICROSTRUCTURE_EVIDENCE_SYMBOLS", "BTC/USDT:USDT")
+    monkeypatch.setenv("MICROSTRUCTURE_EVIDENCE_START", "2024-01-01T00:00:00+00:00")
+    monkeypatch.setenv("MICROSTRUCTURE_EVIDENCE_END", "2024-01-05T00:00:00+00:00")
+    monkeypatch.setenv("MICROSTRUCTURE_EVIDENCE_MAX_BARS", "6")
+
+    assert module.main() == 0
+
+    summary = json.loads(capsys.readouterr().out)
+    json_path = Path(summary["json"])
+    assert json_path.is_relative_to(private_root / "incubating" / "olympus65")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["briefing"] == "CODEX_OLYMPUS_65_MICROSTRUCTURE_IMPULSE_REAL_CCXT"
+    assert payload["comparison"]["impulse"]["candidate_count_n"] > payload["comparison"]["base"][
+        "candidate_count_n"
+    ]
+    assert payload["predeclared"]["survivor_light_ceiling"] is True
+    assert payload["impulse"]["verdict"]["survivor_ceiling_applied"] is True

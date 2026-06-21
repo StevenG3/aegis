@@ -46,20 +46,6 @@ class MicrostructureCandidate:
 
 
 @dataclass(frozen=True)
-class CandidateResult:
-    symbol: str
-    candidate: MicrostructureCandidate
-    returns: tuple[float, ...]
-    benchmark_returns: tuple[float, ...]
-    trade_returns: tuple[float, ...]
-    fold_excess: tuple[float, ...]
-    p_value: float
-    turnover: float
-    net_cost: float
-    event_log: tuple[Mapping[str, object], ...]
-
-
-@dataclass(frozen=True)
 class BtcImpulseConfig:
     enabled: bool
     lookback_bars: int
@@ -85,6 +71,29 @@ class LiquidityDataAvailability:
 class EntryWindow:
     start_timestamp: int | None
     end_timestamp: int | None
+
+
+@dataclass(frozen=True)
+class MicrostructureControl:
+    name: str
+    btc_impulse: BtcImpulseConfig
+    liquidity_guard: LiquidityGuardConfig
+    entry_window: EntryWindow
+
+
+@dataclass(frozen=True)
+class CandidateResult:
+    symbol: str
+    candidate: MicrostructureCandidate
+    control: MicrostructureControl
+    returns: tuple[float, ...]
+    benchmark_returns: tuple[float, ...]
+    trade_returns: tuple[float, ...]
+    fold_excess: tuple[float, ...]
+    p_value: float
+    turnover: float
+    net_cost: float
+    event_log: tuple[Mapping[str, object], ...]
 
 
 def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
@@ -118,26 +127,23 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
     fdr_alpha = _float_param(params, "fdr_alpha", 0.10)
     pbo_splits = _int_param(params, "pbo_splits", 4)
     pbo_threshold = _float_param(params, "pbo_threshold", 0.20)
-    btc_impulse = _btc_impulse_config(params)
-    liquidity_guard = _liquidity_guard_config(params)
     liquidity_availability = _liquidity_data_availability(filtered)
-    entry_window = _entry_window(params)
+    controls = _control_grid(params)
 
     results = tuple(
         _evaluate_candidate(
             candidate,
+            control=control,
             symbol=symbol,
             bars=bars,
             costs=costs,
             locked_oos_fraction=locked_oos_fraction,
             fold_count=fold_count,
-            btc_impulse=btc_impulse,
-            liquidity_guard=liquidity_guard,
             liquidity_availability=liquidity_availability,
-            entry_window=entry_window,
         )
         for symbol, bars in sorted(by_symbol.items())
         for candidate in grid
+        for control in controls
     )
     valid_results = tuple(result for result in results if result.returns)
     if not valid_results:
@@ -147,7 +153,10 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
         return _insufficient_payload(
             "insufficient locked-OOS t+1 samples after applying grid",
             excluded_symbols=excluded_symbols,
-            candidate_count=max(_spec_trial_count(spec), len(grid) * len(by_symbol)),
+            candidate_count=max(
+                _spec_trial_count(spec),
+                len(grid) * len(controls) * len(by_symbol),
+            ),
             event_log=event_log,
         )
 
@@ -183,7 +192,7 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
         if survivors
         else "no predeclared microstructure symbol-grid survived BH-FDR, PBO, and buy-hold gates"
     )
-    candidate_count_n = max(_spec_trial_count(spec), len(grid) * len(by_symbol))
+    candidate_count_n = max(_spec_trial_count(spec), len(grid) * len(controls) * len(by_symbol))
     return {
         "status": status,
         "verdict": verdict,
@@ -200,8 +209,10 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
             "candidate_count_n": candidate_count_n,
             "tested_candidates": len(valid_results),
             "pooled_grid_candidates": len(grid),
+            "control_grid_candidates": len(controls),
             "symbol_count": len(by_symbol),
             "fdr_alpha": fdr_alpha,
+            "min_p_value": min(p_values) if p_values else None,
             "fdr_before": sum(1 for result in valid_results if result.p_value < fdr_alpha),
             "fdr_after": sum(1 for value in fdr_flags if value),
             "pbo_before_survivors": sum(1 for value in fdr_flags if value),
@@ -231,9 +242,7 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
             "survivor_light": True,
         },
         "research_controls": {
-            "btc_impulse": _btc_impulse_to_dict(btc_impulse),
-            "entry_window": _entry_window_to_dict(entry_window),
-            "liquidity_guard": _liquidity_guard_to_dict(liquidity_guard),
+            "control_grid": tuple(_control_to_dict(control) for control in controls),
             "liquidity_data_availability": _liquidity_availability_to_dict(
                 liquidity_availability
             ),
@@ -328,15 +337,13 @@ def _candidate_grid(params: Mapping[str, object]) -> tuple[MicrostructureCandida
 def _evaluate_candidate(
     candidate: MicrostructureCandidate,
     *,
+    control: MicrostructureControl,
     symbol: str,
     bars: Sequence[MicrostructureBar],
     costs: Mapping[str, float],
     locked_oos_fraction: float,
     fold_count: int,
-    btc_impulse: BtcImpulseConfig,
-    liquidity_guard: LiquidityGuardConfig,
     liquidity_availability: LiquidityDataAvailability,
-    entry_window: EntryWindow,
 ) -> CandidateResult:
     (
         strategy_returns,
@@ -350,15 +357,14 @@ def _evaluate_candidate(
         bars=bars,
         costs=costs,
         locked_oos_fraction=locked_oos_fraction,
-        btc_impulse=btc_impulse,
-        liquidity_guard=liquidity_guard,
+        control=control,
         liquidity_availability=liquidity_availability,
-        entry_window=entry_window,
     )
     fold_excess = _fold_excess(strategy_returns, benchmark_returns, fold_count)
     return CandidateResult(
         symbol=symbol,
         candidate=candidate,
+        control=control,
         returns=tuple(strategy_returns),
         benchmark_returns=tuple(benchmark_returns),
         trade_returns=tuple(trade_returns),
@@ -376,14 +382,15 @@ def _symbol_returns(
     bars: Sequence[MicrostructureBar],
     costs: Mapping[str, float],
     locked_oos_fraction: float,
-    btc_impulse: BtcImpulseConfig,
-    liquidity_guard: LiquidityGuardConfig,
+    control: MicrostructureControl,
     liquidity_availability: LiquidityDataAvailability,
-    entry_window: EntryWindow,
 ) -> tuple[list[float], list[float], list[float], float, float, list[Mapping[str, object]]]:
     if len(bars) < 6:
         return [], [], [], 0.0, 0.0, []
-    start = max(btc_impulse.lookback_bars, int(len(bars) * (1.0 - locked_oos_fraction)))
+    start = max(
+        control.btc_impulse.lookback_bars,
+        int(len(bars) * (1.0 - locked_oos_fraction)),
+    )
     strategy: list[float] = []
     benchmark: list[float] = []
     trades: list[float] = []
@@ -397,11 +404,13 @@ def _symbol_returns(
         entry = bars[index + 1]
         exit_bar = bars[index + 2]
         signal = _signal(candidate, previous=previous, current=current)
-        btc_pass, btc_reason = _btc_impulse_pass(bars, index=index, config=btc_impulse)
-        liquidity_pass, liquidity_reason = _liquidity_guard_pass(
-            current, liquidity_guard, liquidity_availability
+        btc_pass, btc_reason = _btc_impulse_pass(
+            bars, index=index, config=control.btc_impulse
         )
-        entry_window_pass = _entry_window_pass(current.timestamp, entry_window)
+        liquidity_pass, liquidity_reason = _liquidity_guard_pass(
+            current, control.liquidity_guard, liquidity_availability
+        )
+        entry_window_pass = _entry_window_pass(current.timestamp, control.entry_window)
         orderbook_missing = current.order_book_event_rate_per_hour is None
         excluded_reason = _excluded_reason(
             btc_reason=btc_reason,
@@ -425,6 +434,7 @@ def _symbol_returns(
         event_log.append(
             _event_log_entry(
                 candidate=candidate,
+                control=control,
                 current=current,
                 previous=previous,
                 signal=signal,
@@ -595,6 +605,7 @@ def _excluded_reason(
 def _event_log_entry(
     *,
     candidate: MicrostructureCandidate,
+    control: MicrostructureControl,
     current: MicrostructureBar,
     previous: MicrostructureBar,
     signal: int,
@@ -612,6 +623,7 @@ def _event_log_entry(
 ) -> Mapping[str, object]:
     return {
         "candidate": candidate.name,
+        "control": control.name,
         "symbol": current.symbol,
         "timestamp": current.timestamp,
         "btc_impulse_pass": btc_impulse_pass,
@@ -767,6 +779,10 @@ def _costs(cost_model: object) -> Mapping[str, float]:
 
 def _btc_impulse_config(params: Mapping[str, object]) -> BtcImpulseConfig:
     raw = _mapping(params.get("btc_impulse", {}), "params.btc_impulse")
+    return _btc_impulse_config_from_mapping(raw)
+
+
+def _btc_impulse_config_from_mapping(raw: Mapping[str, object]) -> BtcImpulseConfig:
     return BtcImpulseConfig(
         enabled=_bool_param(raw, "enabled", True),
         lookback_bars=max(1, _int_param(raw, "lookback_bars", 3)),
@@ -777,6 +793,10 @@ def _btc_impulse_config(params: Mapping[str, object]) -> BtcImpulseConfig:
 
 def _liquidity_guard_config(params: Mapping[str, object]) -> LiquidityGuardConfig:
     raw = _mapping(params.get("liquidity_guard", {}), "params.liquidity_guard")
+    return _liquidity_guard_config_from_mapping(raw)
+
+
+def _liquidity_guard_config_from_mapping(raw: Mapping[str, object]) -> LiquidityGuardConfig:
     return LiquidityGuardConfig(
         enabled=_bool_param(raw, "enabled", True),
         max_spread_bps=_float_param(raw, "max_spread_bps", 25.0),
@@ -787,10 +807,59 @@ def _liquidity_guard_config(params: Mapping[str, object]) -> LiquidityGuardConfi
 
 def _entry_window(params: Mapping[str, object]) -> EntryWindow:
     raw = _mapping(params.get("entry_window", {}), "params.entry_window")
+    return _entry_window_from_mapping(raw)
+
+
+def _entry_window_from_mapping(raw: Mapping[str, object]) -> EntryWindow:
     return EntryWindow(
         start_timestamp=_optional_int(raw, "start_timestamp"),
         end_timestamp=_optional_int(raw, "end_timestamp"),
     )
+
+
+def _control_grid(params: Mapping[str, object]) -> tuple[MicrostructureControl, ...]:
+    raw = params.get("control_grid")
+    if raw is None:
+        return (
+            MicrostructureControl(
+                name="default",
+                btc_impulse=_btc_impulse_config(params),
+                liquidity_guard=_liquidity_guard_config(params),
+                entry_window=_entry_window(params),
+            ),
+        )
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise ValueError("params.control_grid must be a list of control objects")
+    controls: list[MicrostructureControl] = []
+    for index, item in enumerate(raw):
+        mapping = _mapping(item, "params.control_grid[]")
+        name = str(mapping.get("name") or f"control_{index}")
+        controls.append(
+            MicrostructureControl(
+                name=name,
+                btc_impulse=_btc_impulse_config_from_mapping(
+                    _mapping(mapping.get("btc_impulse", {}), "control.btc_impulse")
+                ),
+                liquidity_guard=_liquidity_guard_config_from_mapping(
+                    _mapping(mapping.get("liquidity_guard", {}), "control.liquidity_guard")
+                ),
+                entry_window=_entry_window_from_mapping(
+                    _mapping(mapping.get("entry_window", {}), "control.entry_window")
+                ),
+            )
+        )
+    return tuple(controls)
+
+
+def _control_to_dict(
+    control: MicrostructureControl,
+) -> dict[str, object]:
+    return {
+        "name": control.name,
+        "btc_impulse": _btc_impulse_to_dict(control.btc_impulse),
+        "entry_window": _entry_window_to_dict(control.entry_window),
+        "liquidity_guard": _liquidity_guard_to_dict(control.liquidity_guard),
+    }
 
 
 def _btc_impulse_to_dict(config: BtcImpulseConfig) -> dict[str, float | int | bool]:
@@ -853,8 +922,9 @@ def _candidate_to_dict(candidate: MicrostructureCandidate) -> dict[str, float | 
 
 
 def _best_candidate_to_dict(result: CandidateResult) -> dict[str, float | int | str]:
-    payload = _candidate_to_dict(result.candidate)
+    payload: dict[str, float | int | str] = _candidate_to_dict(result.candidate)
     payload["symbol"] = result.symbol
+    payload["control"] = result.control.name
     return payload
 
 

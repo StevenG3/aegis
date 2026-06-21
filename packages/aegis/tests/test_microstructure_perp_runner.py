@@ -121,8 +121,9 @@ def test_microstructure_runner_reports_fdr_pbo_and_full_cost_safety() -> None:
     assert payload["standard_metrics"]["net_cost"] > 0
     assert "buy_and_hold" in payload["benchmark_metrics"]
     assert "DELISTED/USDT:USDT" in payload["universe"]["usable_symbols"]
-    assert payload["research_controls"]["btc_impulse"]["enabled"] is True
-    assert payload["research_controls"]["liquidity_guard"]["enabled"] is True
+    controls = payload["research_controls"]["control_grid"]
+    assert controls[0]["btc_impulse"]["enabled"] is True
+    assert controls[0]["liquidity_guard"]["enabled"] is True
     assert payload["event_log"]
     first_log = payload["event_log"][0]
     assert "btc_impulse_pass" in first_log
@@ -139,6 +140,58 @@ def test_microstructure_runner_reports_fdr_pbo_and_full_cost_safety() -> None:
     assert all(entry["liquidity_guard_pass"] is True for entry in passing_logs)
     assert any(entry["oi_price_divergence"] is True for entry in passing_logs)
     assert any(abs(float(entry["order_flow_imbalance"])) >= 0.2 for entry in passing_logs)
+
+
+def test_microstructure_runner_counts_predeclared_control_grid() -> None:
+    payload = run_microstructure_perp_from_spec(
+        _spec(
+            _bars(),
+            extra_params={
+                "control_grid": [
+                    {
+                        "name": "impulse_loose",
+                        "btc_impulse": {
+                            "enabled": True,
+                            "lookback_bars": 3,
+                            "return_threshold": 0.01,
+                            "zscore_threshold": 0.0,
+                        },
+                        "liquidity_guard": {
+                            "enabled": True,
+                            "max_spread_bps": 25.0,
+                            "min_top_depth_usd": 50_000.0,
+                            "min_quote_volume_usd": 1_000_000.0,
+                        },
+                        "entry_window": {},
+                    },
+                    {
+                        "name": "impulse_strict",
+                        "btc_impulse": {
+                            "enabled": True,
+                            "lookback_bars": 6,
+                            "return_threshold": 0.02,
+                            "zscore_threshold": 1.0,
+                        },
+                        "liquidity_guard": {
+                            "enabled": True,
+                            "max_spread_bps": 25.0,
+                            "min_top_depth_usd": 50_000.0,
+                            "min_quote_volume_usd": 1_000_000.0,
+                        },
+                        "entry_window": {},
+                    },
+                ]
+            },
+        )
+    )
+
+    assert payload["candidate_count_n"] == 16
+    assert payload["multiple_testing"]["control_grid_candidates"] == 2
+    assert len(payload["research_controls"]["control_grid"]) == 2
+    assert {entry["control"] for entry in payload["event_log"]} == {
+        "impulse_loose",
+        "impulse_strict",
+    }
 
 
 def test_microstructure_runner_data_blocks_high_orderbook_event_rate() -> None:
