@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from aegis.backtest_core import (
     benjamini_hochberg,
     deflated_sharpe_threshold,
     metrics_from_returns,
+    paired_block_bootstrap_risk_difference_test,
     pbo,
     sign_test_p_value,
 )
@@ -49,6 +51,10 @@ class BreadthConfig:
     pbo_threshold: float = 0.50
     min_events_per_candidate: int = 5
     min_oos_years: int = 3
+    overlap_correction: bool = False
+    block_bootstrap_samples: int = 1_000
+    block_bootstrap_ci_alpha: float = 0.05
+    block_bootstrap_seed: int = 70
     annualization_periods: int = 252
     survivor_light: bool = True
 
@@ -89,6 +95,15 @@ class EventRecord:
     breadth_ma8: float
     breadth_ma21: float
     breadth_ma60: float
+
+
+@dataclass(frozen=True)
+class _BlockBootstrapConfig:
+    annualization_periods: int
+    risk_diff_bootstrap_samples: int
+    risk_diff_bootstrap_block_bars: int
+    risk_diff_ci_alpha: float
+    risk_diff_random_seed: int
 
 
 DEFAULT_COST_MODEL = CostModel(
@@ -150,17 +165,39 @@ def run_market_breadth_study(
             "breadth_tail": [_frame_dict(frame) for frame in frames[-5:]],
             "data_quality": data_quality,
         }
+    scoring_events = disjoint_event_records(events) if config.overlap_correction else events
     candidates = _candidate_statistics(
+        scoring_events,
+        trial_count=trial_count,
+        config=config,
+        cost_model=cost_model,
+        use_block_bootstrap_p=config.overlap_correction,
+    )
+    raw_candidates = _candidate_statistics(
         events,
         trial_count=trial_count,
         config=config,
         cost_model=cost_model,
+        use_block_bootstrap_p=False,
     )
+    raw_p_values = [_float_field(row["p_value"]) for row in raw_candidates]
+    raw_fdr_flags = (
+        benjamini_hochberg(raw_p_values, alpha=config.fdr_alpha) if raw_p_values else []
+    )
+    for row, passed in zip(raw_candidates, raw_fdr_flags, strict=True):
+        row["bh_fdr_pass"] = bool(passed)
+    raw_fdr_survivors = [
+        row
+        for row in raw_candidates
+        if bool(row["bh_fdr_pass"])
+        and _float_field(row["mean_excess_return"]) > 0.0
+        and bool(row["deflated_sharpe_pass"])
+    ]
     p_values = [_float_field(row["p_value"]) for row in candidates]
     fdr_flags = benjamini_hochberg(p_values, alpha=config.fdr_alpha) if p_values else []
     for row, passed in zip(candidates, fdr_flags, strict=True):
         row["bh_fdr_pass"] = bool(passed)
-    pbo_report = _pbo_report(events, config=config)
+    pbo_report = _pbo_report(scoring_events, config=config)
     fdr_survivors = [
         row
         for row in candidates
@@ -212,6 +249,18 @@ def run_market_breadth_study(
             "raw_min_p": min(p_values) if p_values else None,
             "pbo": pbo_report,
             "annual_oos_stability": oos_stability,
+            "overlap_correction": {
+                "enabled": config.overlap_correction,
+                "raw_event_count": len(events),
+                "disjoint_event_count": len(scoring_events),
+                "raw_fdr_survivors": len(raw_fdr_survivors),
+                "corrected_fdr_survivors": len(fdr_survivors),
+                "raw_min_p": min(raw_p_values) if raw_p_values else None,
+                "event_count_by_candidate": _overlap_event_count_comparison(
+                    events,
+                    scoring_events,
+                ),
+            },
         },
         "costs": {
             "fee_bps": cost_model.fee_bps,
@@ -220,9 +269,11 @@ def run_market_breadth_study(
         },
         "data_quality": data_quality,
         "factor_tail": [_frame_dict(frame) for frame in frames[-5:]],
-        "event_summary": _event_summary(events),
+        "raw_event_summary": _event_summary(events),
+        "event_summary": _event_summary(scoring_events),
+        "raw_candidate_statistics": raw_candidates,
         "candidate_statistics": candidates,
-        "sanitized_event_sample": [_event_dict(event) for event in events[:10]],
+        "sanitized_event_sample": [_event_dict(event) for event in scoring_events[:10]],
         "safety": {
             "research_only": True,
             "live_trading": False,
@@ -375,6 +426,20 @@ def build_event_records(
     return tuple(events)
 
 
+def disjoint_event_records(events: Sequence[EventRecord]) -> tuple[EventRecord, ...]:
+    grouped: dict[str, list[EventRecord]] = {}
+    for event in events:
+        grouped.setdefault(event.key, []).append(event)
+    kept: list[EventRecord] = []
+    for group in grouped.values():
+        next_allowed_timestamp: int | None = None
+        for event in sorted(group, key=lambda item: item.timestamp):
+            if next_allowed_timestamp is None or event.timestamp >= next_allowed_timestamp:
+                kept.append(event)
+                next_allowed_timestamp = event.exit_timestamp
+    return tuple(sorted(kept, key=lambda event: (event.timestamp, event.key)))
+
+
 def trial_count_for_config(config: BreadthConfig) -> int:
     signal_thresholds = (
         len(config.hot_thresholds)
@@ -431,6 +496,7 @@ def _candidate_statistics(
     trial_count: int,
     config: BreadthConfig,
     cost_model: CostModel,
+    use_block_bootstrap_p: bool,
 ) -> list[dict[str, object]]:
     grouped: dict[str, list[EventRecord]] = {}
     for event in events:
@@ -439,10 +505,16 @@ def _candidate_statistics(
     for key, group in sorted(grouped.items()):
         returns = tuple(event.forward_return_after_costs for event in group)
         excess = tuple(event.excess_return for event in group)
-        p_value = (
+        sign_p_value = (
             sign_test_p_value(excess, alternative="greater")
             if len(group) >= config.min_events_per_candidate
             else 1.0
+        )
+        block_report = _paired_block_bootstrap_excess_report(group, config=config)
+        p_value = (
+            _float_field(block_report["p_value"], default=1.0)
+            if use_block_bootstrap_p
+            else sign_p_value
         )
         metrics = metrics_from_returns(
             returns,
@@ -468,6 +540,13 @@ def _candidate_statistics(
                 "median_excess_return": statistics.median(excess),
                 "max_drawdown": min(event.drawdown for event in group),
                 "p_value": p_value,
+                "sign_test_p_value": sign_p_value,
+                "block_bootstrap_p_value": block_report["p_value"],
+                "block_bootstrap_valid": block_report["valid"],
+                "block_bootstrap_ci_lower_gt_0": block_report["ci_lower_gt_0"],
+                "block_bootstrap_block_bars": block_report["block_bars"],
+                "block_bootstrap_sample_count": block_report["sample_count"],
+                "risk_difference_block_bootstrap": block_report["risk_difference_reference"],
                 "sharpe": metrics.sharpe,
                 "deflated_sharpe_threshold": dsr_threshold,
                 "deflated_sharpe_pass": metrics.sharpe > dsr_threshold and metrics.sharpe > 0.0,
@@ -489,6 +568,13 @@ def _candidate_statistics(
                 "median_excess_return": 0.0,
                 "max_drawdown": 0.0,
                 "p_value": 1.0,
+                "sign_test_p_value": 1.0,
+                "block_bootstrap_p_value": 1.0,
+                "block_bootstrap_valid": False,
+                "block_bootstrap_ci_lower_gt_0": False,
+                "block_bootstrap_block_bars": 0,
+                "block_bootstrap_sample_count": 0,
+                "risk_difference_block_bootstrap": {},
                 "sharpe": 0.0,
                 "deflated_sharpe_threshold": deflated_sharpe_threshold(
                     trial_count=trial_count,
@@ -498,6 +584,81 @@ def _candidate_statistics(
             }
         )
     return rows
+
+
+def _paired_block_bootstrap_excess_report(
+    group: Sequence[EventRecord],
+    *,
+    config: BreadthConfig,
+) -> dict[str, object]:
+    if not group:
+        return _empty_block_report(reason="empty candidate")
+    horizon = max(event.horizon for event in group)
+    block_bars = max(1, horizon)
+    excess = tuple(event.excess_return for event in group)
+    if len(excess) < max(30, block_bars):
+        return _empty_block_report(
+            reason="insufficient disjoint events for block bootstrap",
+            block_bars=block_bars,
+        )
+    rng = random.Random(config.block_bootstrap_seed + sum(ord(char) for char in group[0].key))
+    sample_means: list[float] = []
+    block = min(block_bars, len(excess))
+    for _ in range(config.block_bootstrap_samples):
+        indices: list[int] = []
+        while len(indices) < len(excess):
+            start = rng.randint(0, len(excess) - block)
+            indices.extend(range(start, start + block))
+        indices = indices[: len(excess)]
+        sample_means.append(statistics.fmean(excess[index] for index in indices))
+    p_value = sum(1 for value in sample_means if value <= 0.0) / len(sample_means)
+    ci_low = _quantile(sample_means, config.block_bootstrap_ci_alpha)
+    risk_report = paired_block_bootstrap_risk_difference_test(
+        excess,
+        tuple(0.0 for _ in excess),
+        0.0,
+        0.0,
+        _BlockBootstrapConfig(
+            annualization_periods=config.annualization_periods,
+            risk_diff_bootstrap_samples=config.block_bootstrap_samples,
+            risk_diff_bootstrap_block_bars=block_bars,
+            risk_diff_ci_alpha=config.block_bootstrap_ci_alpha,
+            risk_diff_random_seed=config.block_bootstrap_seed,
+        ),
+        group[0].key,
+    )
+    return {
+        "valid": True,
+        "method": "paired_block_bootstrap_mean_excess",
+        "p_value": p_value,
+        "ci_lower_gt_0": ci_low > 0.0,
+        "mean_ci_low": ci_low,
+        "block_bars": block,
+        "sample_count": config.block_bootstrap_samples,
+        "risk_difference_reference": risk_report,
+    }
+
+
+def _empty_block_report(*, reason: str, block_bars: int = 0) -> dict[str, object]:
+    return {
+        "valid": False,
+        "method": "paired_block_bootstrap_mean_excess",
+        "reason": reason,
+        "p_value": 1.0,
+        "ci_lower_gt_0": False,
+        "mean_ci_low": 0.0,
+        "block_bars": block_bars,
+        "sample_count": 0,
+        "risk_difference_reference": {},
+    }
+
+
+def _quantile(values: Sequence[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(max(int(math.floor(q * (len(ordered) - 1))), 0), len(ordered) - 1)
+    return ordered[index]
 
 
 def _pbo_report(events: Sequence[EventRecord], *, config: BreadthConfig) -> dict[str, object]:
@@ -520,6 +681,27 @@ def _pbo_report(events: Sequence[EventRecord], *, config: BreadthConfig) -> dict
     except ValueError as exc:
         return {"valid": False, "reason": str(exc), "pbo": None}
     return {"valid": True, **result}
+
+
+def _overlap_event_count_comparison(
+    raw_events: Sequence[EventRecord],
+    disjoint_events: Sequence[EventRecord],
+) -> list[dict[str, object]]:
+    raw_counts: dict[str, int] = {}
+    disjoint_counts: dict[str, int] = {}
+    for event in raw_events:
+        raw_counts[event.key] = raw_counts.get(event.key, 0) + 1
+    for event in disjoint_events:
+        disjoint_counts[event.key] = disjoint_counts.get(event.key, 0) + 1
+    return [
+        {
+            "key": key,
+            "raw_events": raw_counts.get(key, 0),
+            "disjoint_events": disjoint_counts.get(key, 0),
+            "removed_events": raw_counts.get(key, 0) - disjoint_counts.get(key, 0),
+        }
+        for key in sorted(raw_counts)
+    ]
 
 
 def _annual_oos_stability(
