@@ -152,8 +152,31 @@ def test_run_evaluation_reports_dual_benchmarks_and_honest_verdict() -> None:
     assert report["safety"]["order_path_added"] is False
     assert set(report["benchmarks"]) == {"buy_and_hold", "static_rsi"}
     assert report["walk_forward"]["summary"]["windows"] >= 3
+    assert report["walk_forward"]["calibrated_oos_gate"]["verdict"] in {
+        "ROBUST_OOS_EDGE",
+        "NO_ROBUST_EDGE",
+        "OOS_DATA_INSUFFICIENT",
+    }
     assert report["verdict"] in {
         module.VERDICT_PASS,
         module.VERDICT_FAIL,
         module.VERDICT_DATA,
     }
+
+
+def test_crypto_daily_annualization_uses_365_periods() -> None:
+    module = load_candidate_module()
+    frame = synthetic_rsi_frame(120)
+    config = module.StrategyConfig(
+        instrument_type="spot",
+        timeframe="1d",
+        rsi_period=3,
+        entry_threshold=45.0,
+        stop_loss_pct=0.03,
+        take_profit_pct=0.04,
+        max_holding_bars=8,
+    )
+
+    result = module.simulate_strategy(frame, config)
+
+    assert result.metrics["annualization_periods"] == 365

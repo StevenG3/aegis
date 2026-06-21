@@ -13,6 +13,13 @@ from typing import Any, cast
 
 import pandas as pd  # type: ignore[import-untyped]
 
+from aegis.calibrated_oos_gate import (
+    CalibratedOosGateConfig,
+    OosWindow,
+    annualization_periods_for_instrument,
+    evaluate_calibrated_oos_gate,
+)
+
 SERVICE_DIR = Path(__file__).resolve().parents[1] / "services" / "backtest-service"
 if str(SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(SERVICE_DIR))
@@ -181,6 +188,7 @@ def run_evaluation(
         "config": {
             "strategy": asdict(strategy),
             "goal": asdict(goal),
+            "annualization_periods": annualization_periods_for_strategy(strategy),
             "position_sizing": (
                 "Each entry risks account_equity * position_size_r at the stop distance; "
                 "spot notional is capped at current equity, so no leverage is introduced."
@@ -237,9 +245,9 @@ def run_walk_forward(
                     "selector_data_end": period(train)["end"],
                 },
                 "oos": {
-                    "autotune": public_result(candidate),
-                    "static_rsi": public_result(static),
-                    "buy_and_hold": public_result(buy_hold),
+                    "autotune": public_result(candidate, score(candidate, goal)),
+                    "static_rsi": public_result(static, score(static, goal)),
+                    "buy_and_hold": public_result(buy_hold, score(buy_hold, goal)),
                     "beats_static_rsi": bool(
                         metric_float(candidate, "total_return_pct")
                         > metric_float(static, "total_return_pct")
@@ -248,16 +256,30 @@ def run_walk_forward(
                         metric_float(candidate, "total_return_pct")
                         > metric_float(buy_hold, "total_return_pct")
                     ),
+                    "risk_adjusted_beats_static_rsi": score(candidate, goal)
+                    > score(static, goal),
+                    "risk_adjusted_beats_buy_and_hold": score(candidate, goal)
+                    > score(buy_hold, goal),
                 },
+                "oos_candidate_returns": equity_returns(candidate.equity),
             }
         )
     summary = walk_forward_summary(windows)
+    calibrated_gate = calibrated_oos_gate_from_windows(
+        windows,
+        strategy=strategy,
+        parameter_trials=len(candidate_configs(strategy, goal)) * max(len(windows), 1),
+    )
     return {
         "status": "OK",
         "mode": "rolling_walk_forward_is_autotune_oos_frozen",
         "windows": windows,
         "summary": summary,
-        "combined_oos_equity": equity_summary(oos_equity_parts),
+        "calibrated_oos_gate": calibrated_gate,
+        "combined_oos_equity": equity_summary(
+            oos_equity_parts,
+            annualization_periods=annualization_periods_for_strategy(strategy),
+        ),
     }
 
 
@@ -442,7 +464,16 @@ def simulate_strategy(frame: pd.DataFrame, config: StrategyConfig) -> Simulation
         "funding_or_borrow": "N/A",
     }
     return SimulationResult(
-        series, trades, metrics_from_equity(series, trades, traded_notional, costs), costs
+        series,
+        trades,
+        metrics_from_equity(
+            series,
+            trades,
+            traded_notional,
+            costs,
+            annualization_periods=annualization_periods_for_strategy(config),
+        ),
+        costs,
     )
 
 
@@ -485,7 +516,13 @@ def simulate_buy_hold(frame: pd.DataFrame, config: StrategyConfig) -> Simulation
     return SimulationResult(
         equity,
         [trade],
-        metrics_from_equity(equity, [trade], notional + exit_notional, costs),
+        metrics_from_equity(
+            equity,
+            [trade],
+            notional + exit_notional,
+            costs,
+            annualization_periods=annualization_periods_for_strategy(config),
+        ),
         costs,
     )
 
@@ -554,16 +591,18 @@ def metrics_from_equity(
     trades: list[Trade],
     traded_notional: float,
     costs: dict[str, float | str],
+    *,
+    annualization_periods: int = 252,
 ) -> dict[str, float | int | str]:
     if equity.empty:
         return default_metrics()
     returns = equity.pct_change().replace([math.inf, -math.inf], math.nan).dropna()
     total_return = float(equity.iloc[-1] / equity.iloc[0] - 1)
-    years = max(len(equity) / 252, 1 / 252)
+    years = max(len(equity) / annualization_periods, 1 / annualization_periods)
     annual_return = (1 + total_return) ** (1 / years) - 1 if total_return > -1 else -1.0
     max_dd = max_drawdown(equity)
-    sharpe = annualized_sharpe(returns)
-    sortino = annualized_sortino(returns)
+    sharpe = annualized_sharpe(returns, annualization_periods=annualization_periods)
+    sortino = annualized_sortino(returns, annualization_periods=annualization_periods)
     calmar = annual_return / abs(max_dd) if max_dd < 0 else 0.0
     positive_period_win_rate = float((returns > 0).mean()) if len(returns) else 0.0
     return {
@@ -580,6 +619,7 @@ def metrics_from_equity(
         if trades
         else 0.0,
         "annualized_turnover": round((traded_notional / 10_000.0) / years, 6),
+        "annualization_periods": annualization_periods,
         "net_cost_pct": costs["total_cost_pct"],
     }
 
@@ -614,18 +654,20 @@ def walk_forward_summary(windows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def verdict_from_report(walk_forward: dict[str, Any]) -> tuple[str, list[str]]:
     summary = cast(dict[str, Any], walk_forward.get("summary", {}))
+    calibrated_gate = cast(dict[str, Any], walk_forward.get("calibrated_oos_gate", {}))
     reasons: list[str] = []
     if summary.get("windows", 0) < 3:
         return VERDICT_DATA, ["fewer than three OOS windows; insufficient walk-forward sample"]
-    if not summary.get("all_windows_beat_static_rsi"):
-        reasons.append("autotune did not beat static RSI in every OOS window")
-    if not summary.get("all_windows_beat_buy_hold"):
-        reasons.append("autotune did not beat buy-and-hold in every OOS window")
+    gate_verdict = calibrated_gate.get("verdict")
+    if gate_verdict == "OOS_DATA_INSUFFICIENT":
+        return VERDICT_DATA, [str(calibrated_gate.get("reason", "calibrated gate insufficient"))]
+    if gate_verdict != "ROBUST_OOS_EDGE":
+        reasons.append(str(calibrated_gate.get("reason", "calibrated OOS gate failed")))
     if summary.get("oscillation_window_count", 0):
         reasons.append("one-variable reflection showed oscillation in at least one IS window")
     if reasons:
         return VERDICT_FAIL, reasons
-    return VERDICT_PASS, ["autotune beat both benchmarks in all OOS windows after costs"]
+    return VERDICT_PASS, ["autotune passed calibrated OOS significance and deflated Sharpe gates"]
 
 
 def compute_rsi(close: pd.Series, period: int) -> pd.Series:
@@ -762,12 +804,15 @@ def public_strategy_params(config: StrategyConfig) -> dict[str, int | float]:
     }
 
 
-def public_result(result: SimulationResult) -> dict[str, Any]:
+def public_result(
+    result: SimulationResult, risk_adjusted_score: float | None = None
+) -> dict[str, Any]:
     return {
         "metrics": result.metrics,
         "costs": result.costs,
         "trades": len(result.trades),
         "exit_reason_counts": exit_reason_counts(result.trades),
+        "risk_adjusted_score": risk_adjusted_score,
     }
 
 
@@ -801,11 +846,17 @@ def data_summary(frame: pd.DataFrame, start: str, end: str) -> dict[str, Any]:
     }
 
 
-def equity_summary(parts: list[pd.Series]) -> dict[str, Any]:
+def equity_summary(parts: list[pd.Series], *, annualization_periods: int = 252) -> dict[str, Any]:
     if not parts:
         return default_metrics()
     combined = pd.concat(parts)
-    return metrics_from_equity(combined, [], 0.0, {"total_cost_pct": 0.0})
+    return metrics_from_equity(
+        combined,
+        [],
+        0.0,
+        {"total_cost_pct": 0.0},
+        annualization_periods=annualization_periods,
+    )
 
 
 def write_report(report: dict[str, Any], output_dir: Path) -> dict[str, str]:
@@ -921,23 +972,79 @@ def max_drawdown(equity: pd.Series) -> float:
     return float(drawdowns.min()) if len(drawdowns) else 0.0
 
 
-def annualized_sharpe(returns: pd.Series) -> float:
+def annualized_sharpe(returns: pd.Series, *, annualization_periods: int = 252) -> float:
     if len(returns) < 2:
         return 0.0
     std = float(returns.std())
     if std == 0 or math.isnan(std):
         return 0.0
-    return float(returns.mean()) / std * math.sqrt(252)
+    return float(returns.mean()) / std * math.sqrt(annualization_periods)
 
 
-def annualized_sortino(returns: pd.Series) -> float:
+def annualized_sortino(returns: pd.Series, *, annualization_periods: int = 252) -> float:
     downside = returns[returns < 0]
     if len(downside) < 2:
         return 0.0
     std = float(downside.std())
     if std == 0 or math.isnan(std):
         return 0.0
-    return float(returns.mean()) / std * math.sqrt(252)
+    return float(returns.mean()) / std * math.sqrt(annualization_periods)
+
+
+def annualization_periods_for_strategy(config: StrategyConfig) -> int:
+    return annualization_periods_for_instrument(config.instrument_type, config.timeframe)
+
+
+def equity_returns(equity: pd.Series) -> list[float]:
+    if equity.empty:
+        return []
+    returns = equity.pct_change().replace([math.inf, -math.inf], math.nan).dropna()
+    return [float(value) for value in returns.tolist() if math.isfinite(float(value))]
+
+
+def calibrated_oos_gate_from_windows(
+    windows: list[dict[str, Any]],
+    *,
+    strategy: StrategyConfig,
+    parameter_trials: int,
+) -> dict[str, Any]:
+    observations: list[OosWindow] = []
+    candidate_returns: list[float] = []
+    for window in windows:
+        oos = cast(dict[str, Any], window["oos"])
+        candidate = cast(dict[str, Any], oos["autotune"])
+        static = cast(dict[str, Any], oos["static_rsi"])
+        buy_hold = cast(dict[str, Any], oos["buy_and_hold"])
+        observations.append(
+            OosWindow(
+                candidate_score=float(candidate.get("risk_adjusted_score") or 0.0),
+                static_score=float(static.get("risk_adjusted_score") or 0.0),
+                buy_hold_score=float(buy_hold.get("risk_adjusted_score") or 0.0),
+                candidate_return=float(
+                    cast(dict[str, Any], candidate["metrics"])["total_return_pct"]
+                ),
+                static_return=float(cast(dict[str, Any], static["metrics"])["total_return_pct"]),
+                buy_hold_return=float(
+                    cast(dict[str, Any], buy_hold["metrics"])["total_return_pct"]
+                ),
+            )
+        )
+        candidate_returns.extend(cast(list[float], window.get("oos_candidate_returns", [])))
+    return dict(
+        evaluate_calibrated_oos_gate(
+            observations,
+            candidate_returns,
+            config=CalibratedOosGateConfig(
+                min_windows=3,
+                alpha=0.05,
+                bootstrap_iterations=1_000,
+                bootstrap_seed=39,
+                trial_count=parameter_trials,
+                annualization_periods=annualization_periods_for_strategy(strategy),
+                min_deflated_sharpe=0.0,
+            ),
+        )
+    )
 
 
 def empty_simulation() -> SimulationResult:
