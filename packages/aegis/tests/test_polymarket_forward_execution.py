@@ -17,6 +17,7 @@ def test_forward_execution_requires_chainlink_reference_prices() -> None:
             "start_ts": 1_900_000_000,
             "end_ts": 1_900_000_300,
             "seconds_to_close": 80,
+            "actual_settlement_source": "https://data.chain.link/streams/btc-usd",
             "best_ask": "0.88",
             "ask_levels": [{"price": "0.88", "size": "100"}],
         },
@@ -26,6 +27,7 @@ def test_forward_execution_requires_chainlink_reference_prices() -> None:
             "condition_id": "condition-1",
             "start_ts": 1_900_000_000,
             "end_ts": 1_900_000_300,
+            "actual_settlement_source": "https://data.chain.link/streams/btc-usd",
             "settlement_direction": "Up",
         },
     ]
@@ -38,6 +40,71 @@ def test_forward_execution_requires_chainlink_reference_prices() -> None:
     assert report["status"] == "INSUFFICIENT"
     assert report["verdict"] == "INSUFFICIENT"
     assert "Chainlink" in str(report["reason"])
+
+
+def test_forward_execution_fail_closed_without_verified_settlement_source() -> None:
+    rows = [
+        _snapshot(
+            "btc-updown-5m-1900000000",
+            1_900_000_000,
+            1_900_000_300,
+            timestamp_ms=1_900_000_220_000,
+            seconds_to_close=80,
+            outcome="Up",
+            chainlink_start=100_000.0,
+            chainlink_reference=100_100.0,
+            ask="0.86",
+            bid="0.85",
+            settlement_source=None,
+        ),
+        {
+            "record_type": "settlement",
+            "slug": "btc-updown-5m-1900000000",
+            "condition_id": "condition-1",
+            "start_ts": 1_900_000_000,
+            "end_ts": 1_900_000_300,
+            "settlement_direction": "Up",
+        },
+    ]
+
+    report = run_forward_execution_backtest(rows, config=ForwardExecutionConfig(min_markets=1))
+
+    assert report["status"] == "INSUFFICIENT"
+    assert report["coverage"]["missing_settlement_source_markets"] == 1
+    assert "verified Chainlink Data Streams settlement source" in str(report["reason"])
+
+
+def test_forward_execution_fail_closed_on_mismatched_settlement_source() -> None:
+    rows = [
+        _snapshot(
+            "btc-updown-5m-1900000000",
+            1_900_000_000,
+            1_900_000_300,
+            timestamp_ms=1_900_000_220_000,
+            seconds_to_close=80,
+            outcome="Up",
+            chainlink_start=100_000.0,
+            chainlink_reference=100_100.0,
+            ask="0.86",
+            bid="0.85",
+            settlement_source="https://example.com/not-the-settlement-source",
+        ),
+        {
+            "record_type": "settlement",
+            "slug": "btc-updown-5m-1900000000",
+            "condition_id": "condition-1",
+            "start_ts": 1_900_000_000,
+            "end_ts": 1_900_000_300,
+            "actual_settlement_source": "https://example.com/not-the-settlement-source",
+            "settlement_direction": "Up",
+        },
+    ]
+
+    report = run_forward_execution_backtest(rows, config=ForwardExecutionConfig(min_markets=1))
+
+    assert report["status"] == "INSUFFICIENT"
+    assert report["coverage"]["mismatched_settlement_source_markets"] == 1
+    assert report["coverage"]["markets"] == 0
 
 
 def test_forward_execution_uses_delayed_ask_fill_and_preclose_bid_exit() -> None:
@@ -90,6 +157,7 @@ def test_forward_execution_uses_delayed_ask_fill_and_preclose_bid_exit() -> None
                     "condition_id": f"condition-{offset}",
                     "start_ts": start_ts,
                     "end_ts": end_ts,
+                    "actual_settlement_source": "https://data.chain.link/streams/btc-usd",
                     "settlement_direction": "Up",
                 },
             ]
@@ -118,12 +186,14 @@ def test_forward_execution_can_use_separate_chainlink_tick_rows() -> None:
         {
             "record_type": "chainlink_price",
             "symbol": "btc/usd",
+            "source": "polymarket_rtds_crypto_prices_chainlink",
             "price": 100_000.0,
             "price_ts_ms": start_ts * 1000,
         },
         {
             "record_type": "chainlink_price",
             "symbol": "btc/usd",
+            "source": "polymarket_rtds_crypto_prices_chainlink",
             "price": 100_080.0,
             "price_ts_ms": (end_ts - 80) * 1000,
         },
@@ -163,6 +233,7 @@ def test_forward_execution_can_use_separate_chainlink_tick_rows() -> None:
             "condition_id": "condition-tick",
             "start_ts": start_ts,
             "end_ts": end_ts,
+            "actual_settlement_source": "https://data.chain.link/streams/btc-usd",
             "settlement_direction": "Up",
         },
     ]
@@ -188,8 +259,9 @@ def _snapshot(
     chainlink_reference: float,
     ask: str,
     bid: str,
+    settlement_source: str | None = "https://data.chain.link/streams/btc-usd",
 ) -> dict[str, object]:
-    return {
+    row: dict[str, object] = {
         "record_type": "snapshot",
         "slug": slug,
         "condition_id": f"condition-{slug}",
@@ -205,6 +277,9 @@ def _snapshot(
         "ask_levels": [{"price": ask, "size": "100"}],
         "bid_levels": [{"price": bid, "size": "100"}],
     }
+    if settlement_source is not None:
+        row["actual_settlement_source"] = settlement_source
+    return row
 
 
 def _snapshot_without_chainlink(
@@ -227,6 +302,7 @@ def _snapshot_without_chainlink(
         "start_ts": start_ts,
         "end_ts": end_ts,
         "seconds_to_close": seconds_to_close,
+        "actual_settlement_source": "https://data.chain.link/streams/btc-usd",
         "best_ask": ask,
         "best_bid": bid,
         "ask_levels": [{"price": ask, "size": "100"}],

@@ -126,6 +126,7 @@ def sanitized_artifact(
     multiple_testing = cast(Mapping[str, Any], payload.get("multiple_testing", {}))
     safety = cast(Mapping[str, Any], payload.get("safety", {}))
     fill_ratio = cast(Mapping[str, Any], payload.get("fill_ratio_distribution", {}))
+    settlement_source = cast(Mapping[str, Any], payload.get("settlement_source", {}))
     return {
         "generated_at": generated_at.isoformat(),
         "briefing": "CODEX_OLYMPUS_63_POLYMARKET_5M_FORWARD_EXECUTION",
@@ -148,6 +149,7 @@ def sanitized_artifact(
             "verdict": payload.get("verdict"),
             "reason": payload.get("reason"),
             "coverage": dict(coverage),
+            "settlement_source": dict(settlement_source),
             "multiple_testing": {
                 "method": multiple_testing.get("method"),
                 "candidate_count_n": multiple_testing.get("candidate_count_n"),
@@ -195,6 +197,8 @@ def markdown_summary(artifact: Mapping[str, Any], json_path: Path) -> str:
             f"- Markets: `{coverage.get('markets', 0)}`",
             f"- Settled markets: `{coverage.get('settled_markets', 0)}`",
             f"- Chainlink-ready markets: `{coverage.get('chainlink_ready_markets', 0)}`",
+            f"- Verified settlement-source markets: "
+            f"`{coverage.get('verified_settlement_source_markets', 0)}`",
             f"- Snapshots: `{coverage.get('snapshots', 0)}`",
             "",
             "## Multiple Testing",

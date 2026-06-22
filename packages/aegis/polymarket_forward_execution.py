@@ -17,6 +17,9 @@ ENTRY_WINDOWS_SECONDS = ((90, 60), (60, 30))
 ASK_BANDS = ((0.80, 0.95), (0.85, 0.99))
 LATENCIES_MS = (200, 500)
 EXIT_MODES: tuple[ExitMode, ...] = ("preclose_30s", "settlement")
+CHAINLINK_BTC_DATA_STREAM_URL = "https://data.chain.link/streams/btc-usd"
+CHAINLINK_DATA_STREAM_SOURCE_TYPE = "chainlink_data_streams_not_aggregator_v3"
+CHAINLINK_RTDS_SOURCE = "polymarket_rtds_crypto_prices_chainlink"
 TRIAL_COUNT_N = (
     len(MOVE_THRESHOLDS_USD)
     * len(ENTRY_WINDOWS_SECONDS)
@@ -125,10 +128,14 @@ def run_forward_execution_backtest(
 ) -> Mapping[str, Any]:
     if config is None:
         config = ForwardExecutionConfig()
+    source_coverage = _settlement_source_coverage(rows)
     markets = parse_forward_markets(rows)
-    coverage = _coverage(markets)
+    coverage = {**_coverage(markets), **source_coverage}
     if not markets:
-        return _insufficient("no forward Polymarket rows", coverage)
+        return _insufficient(
+            "no forward Polymarket rows with verified Chainlink Data Streams settlement source",
+            coverage,
+        )
     if coverage["chainlink_ready_markets"] == 0:
         return _insufficient("no Chainlink BTC reference prices in forward rows", coverage)
     if int(coverage["settled_markets"]) < config.min_markets:
@@ -203,6 +210,12 @@ def run_forward_execution_backtest(
         ),
         "fdr_is_survivors": sum(1 for flag in fdr_flags if flag),
         "coverage": coverage,
+        "settlement_source": {
+            "source": CHAINLINK_BTC_DATA_STREAM_URL,
+            "source_type": CHAINLINK_DATA_STREAM_SOURCE_TYPE,
+            "signal_source": CHAINLINK_RTDS_SOURCE,
+            "fail_closed_on_missing_or_mismatched_source": True,
+        },
         "standard_metrics": _candidate_metrics(best_preclose or best),
         "benchmark_metrics": {
             "benchmark": "no_trade_cash",
@@ -250,6 +263,8 @@ def parse_forward_markets(rows: Sequence[Mapping[str, object]]) -> tuple[Forward
         if condition_id:
             conditions[slug] = condition_id
         if record_type == "settlement":
+            if not _has_verified_settlement_source(row):
+                continue
             direction = _direction(row.get("settlement_direction"))
             if direction is not None:
                 settlements[slug] = direction
@@ -311,6 +326,8 @@ def _snapshot_from_row(
         or end_ts is None
         or seconds_to_close is None
     ):
+        return None
+    if not _has_verified_settlement_source(row):
         return None
     chainlink_start = _float_value(
         row.get("chainlink_start_price"), row.get("btc_start_price_chainlink")
@@ -614,6 +631,31 @@ def _coverage(markets: Sequence[ForwardMarket]) -> Mapping[str, int]:
     }
 
 
+def _settlement_source_coverage(rows: Sequence[Mapping[str, object]]) -> Mapping[str, int]:
+    verified_slugs: set[str] = set()
+    missing_slugs: set[str] = set()
+    mismatched_slugs: set[str] = set()
+    for row in rows:
+        record_type = str(row.get("record_type", "snapshot"))
+        if record_type not in {"snapshot", "settlement"}:
+            continue
+        slug = _str_value(row.get("slug"))
+        if slug is None:
+            continue
+        source = _str_value(row.get("actual_settlement_source"))
+        if source == CHAINLINK_BTC_DATA_STREAM_URL:
+            verified_slugs.add(slug)
+        elif source is None:
+            missing_slugs.add(slug)
+        else:
+            mismatched_slugs.add(slug)
+    return {
+        "verified_settlement_source_markets": len(verified_slugs),
+        "missing_settlement_source_markets": len(missing_slugs - verified_slugs),
+        "mismatched_settlement_source_markets": len(mismatched_slugs),
+    }
+
+
 def _candidate_metrics(evaluation: CandidateEvaluation) -> Mapping[str, Any]:
     trades = evaluation.trades
     returns = [trade.net_return for trade in trades]
@@ -719,6 +761,10 @@ def _chainlink_move(snapshot: ForwardSnapshot) -> float:
     return snapshot.chainlink_reference_price - snapshot.chainlink_start_price
 
 
+def _has_verified_settlement_source(row: Mapping[str, object]) -> bool:
+    return _str_value(row.get("actual_settlement_source")) == CHAINLINK_BTC_DATA_STREAM_URL
+
+
 def _mean_return(trades: Sequence[ForwardTrade]) -> float:
     return statistics.fmean(trade.net_return for trade in trades) if trades else 0.0
 
@@ -742,6 +788,9 @@ def _chainlink_ticks(rows: Sequence[Mapping[str, object]]) -> tuple[tuple[int, f
     ticks: list[tuple[int, float]] = []
     for row in rows:
         if row.get("record_type") != "chainlink_price":
+            continue
+        source = _str_value(row.get("source"))
+        if source is not None and source != CHAINLINK_RTDS_SOURCE:
             continue
         symbol = row.get("symbol")
         if symbol != "btc/usd":
