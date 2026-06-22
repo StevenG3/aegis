@@ -299,7 +299,7 @@ def build_snapshot_record(
         "captured_at": captured_at.isoformat(),
         "captured_ts_ms": int(captured_at.timestamp() * 1000),
         "source": "polymarket_clob_book_public_read_only",
-        "actual_settlement_source": CHAINLINK_BTC_STREAM_URL,
+        "actual_settlement_source": market.resolution_source,
         "actual_settlement_source_type": "chainlink_data_streams_not_aggregator_v3",
         "condition_id": market.condition_id,
         "slug": market.slug,

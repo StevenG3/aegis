@@ -180,6 +180,29 @@ def test_settlement_record_marks_missing_chainlink_source() -> None:
     assert record["chainlink_start_status"] == "chainlink_historical_source_not_configured"
 
 
+def test_active_market_rejects_non_chainlink_data_stream_source() -> None:
+    module = load_script()
+    end = datetime(2030, 1, 1, tzinfo=UTC) + timedelta(seconds=300)
+    start_ts = int(end.timestamp()) - 300
+
+    parsed = module.active_market_from_raw(
+        {
+            "conditionId": "condition-1",
+            "slug": f"btc-updown-5m-{start_ts}",
+            "question": "Bitcoin Up or Down - synthetic 5m",
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '["0.5", "0.5"]',
+            "clobTokenIds": '["up-token", "down-token"]',
+            "resolutionSource": "https://example.com/not-chainlink-data-stream",
+            "endDate": end.isoformat().replace("+00:00", "Z"),
+            "closed": False,
+        },
+        now_ts=start_ts,
+    )
+
+    assert parsed is None
+
+
 def test_chainlink_rtds_message_parser_accepts_btc_usd_tick() -> None:
     module = load_script()
 

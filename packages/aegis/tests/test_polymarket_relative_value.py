@@ -189,6 +189,7 @@ def _market_rows(
             "condition_id": f"condition-{index}",
             "start_ts": start_ts,
             "end_ts": end_ts,
+            "actual_settlement_source": "https://data.chain.link/streams/btc-usd",
             "settlement_direction": settlement,
         },
     ]
@@ -214,6 +215,7 @@ def _snapshot(
         "start_ts": start_ts,
         "end_ts": end_ts,
         "seconds_to_close": seconds_to_close,
+        "actual_settlement_source": "https://data.chain.link/streams/btc-usd",
         "best_bid": str(bid),
         "best_ask": str(ask),
         "bid_levels": [{"price": str(bid), "size": "100"}],
