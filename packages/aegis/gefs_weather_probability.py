@@ -7,9 +7,10 @@ import tempfile
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -77,6 +78,26 @@ class ArchiveAvailability:
     missing_examples: tuple[str, ...]
 
 
+@dataclass
+class SampledDecoderValueSelfCheck:
+    max_checks: int = 24
+    _checks_run: int = field(default=0, init=False)
+    _lock: Any = field(default_factory=Lock, init=False, repr=False)
+
+    @property
+    def checks_run(self) -> int:
+        return self._checks_run
+
+    def __call__(self, message: bytes, station: StationSpec) -> float:
+        with self._lock:
+            should_check = self._checks_run < self.max_checks
+            if should_check:
+                self._checks_run += 1
+        if should_check:
+            return _decode_station_tmax_k_checked(message, station)
+        return _decode_station_tmax_k(message, station)
+
+
 STATIONS: Mapping[str, StationSpec] = {
     "KLGA": StationSpec("KLGA", latitude=40.7769, longitude=-73.8740, timezone="America/New_York"),
     "KMIA": StationSpec("KMIA", latitude=25.7959, longitude=-80.2870, timezone="America/New_York"),
@@ -92,6 +113,7 @@ STATIONS: Mapping[str, StationSpec] = {
 ByteFetcher = Callable[[str, int, int], bytes]
 TextFetcher = Callable[[str], str]
 Decoder = Callable[[bytes, StationSpec], float]
+DECODER_VALUE_SELF_CHECK_MAX_ERROR_K = 0.05
 
 
 def latest_gefs_cycle_before(decision_ts: int) -> GefsCycle | None:
@@ -175,7 +197,7 @@ def station_daily_samples_from_gefs(
 ) -> tuple[list[StationForecastSample], GefsCycle, tuple[int, ...]]:
     text_fetcher = text_fetcher or _fetch_text
     byte_fetcher = byte_fetcher or _fetch_range
-    decoder = decoder or _decode_station_tmax_k
+    decoder = decoder or _decode_station_tmax_k_checked
     cycle = latest_gefs_cycle_before(decision_ts)
     if cycle is None:
         raise ValueError("no GEFS cycle strictly before decision timestamp")
@@ -208,6 +230,7 @@ def station_daily_samples_from_gefs(
             rounded_daily_max_f=round_temperature_f(daily_max_f),
             lead_hours_used=tuple(used_leads),
         )
+
     if max_workers <= 1:
         samples = [sample_member(member) for member in members]
     else:
@@ -362,6 +385,31 @@ def decoder_self_check(
     return payload
 
 
+def decoder_value_cross_check(
+    *,
+    primary_value_k: float,
+    reference_value_k: float,
+    max_abs_error_k: float = DECODER_VALUE_SELF_CHECK_MAX_ERROR_K,
+) -> Mapping[str, Any]:
+    if not math.isfinite(primary_value_k) or not math.isfinite(reference_value_k):
+        return {
+            "passed": False,
+            "reason": "non_finite_decoder_value",
+            "primary_value_k": primary_value_k,
+            "reference_value_k": reference_value_k,
+        }
+    abs_error_k = abs(primary_value_k - reference_value_k)
+    plausible = 180.0 <= primary_value_k <= 340.0 and 180.0 <= reference_value_k <= 340.0
+    return {
+        "passed": plausible and abs_error_k <= max_abs_error_k,
+        "primary_value_k": primary_value_k,
+        "reference_value_k": reference_value_k,
+        "abs_error_k": abs_error_k,
+        "max_abs_error_k": max_abs_error_k,
+        "plausible_kelvin_range": plausible,
+    }
+
+
 def _parse_idx_rows(text: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in text.splitlines():
@@ -403,6 +451,18 @@ def _fetch_range(url: str, byte_start: int, byte_end: int) -> bytes:
         return cast(bytes, response.read())
 
 
+def _decode_station_tmax_k_checked(message: bytes, station: StationSpec) -> float:
+    primary = _decode_station_tmax_k(message, station)
+    reference = _decode_station_tmax_k_grid_scan(message, station)
+    check = decoder_value_cross_check(
+        primary_value_k=primary,
+        reference_value_k=reference,
+    )
+    if not check["passed"]:
+        raise ValueError(f"GEFS decoder value self-check failed: {check}")
+    return primary
+
+
 def _decode_station_tmax_k(message: bytes, station: StationSpec) -> float:
     eccodes = importlib.import_module("eccodes")
     with tempfile.NamedTemporaryFile(suffix=".grib2") as handle:
@@ -426,6 +486,51 @@ def _decode_station_tmax_k(message: bytes, station: StationSpec) -> float:
                 if not isinstance(value, (float, int)) or not math.isfinite(value):
                     raise ValueError(f"non-finite nearest TMAX value {value!r}")
                 return float(value)
+            finally:
+                eccodes.codes_release(gid)
+
+
+def _decode_station_tmax_k_grid_scan(message: bytes, station: StationSpec) -> float:
+    eccodes = importlib.import_module("eccodes")
+    with tempfile.NamedTemporaryFile(suffix=".grib2") as handle:
+        handle.write(message)
+        handle.flush()
+        with Path(handle.name).open("rb") as grib_file:
+            gid = eccodes.codes_grib_new_from_file(grib_file)
+            if gid is None:
+                raise ValueError("eccodes could not read GRIB2 message")
+            try:
+                short_name = eccodes.codes_get(gid, "shortName")
+                units = eccodes.codes_get(gid, "units")
+                if short_name != "tmax" or units != "K":
+                    raise ValueError(f"unexpected GRIB field {short_name=} {units=}")
+                latitudes = cast(Sequence[float], eccodes.codes_get_double_array(gid, "latitudes"))
+                longitudes = cast(
+                    Sequence[float], eccodes.codes_get_double_array(gid, "longitudes")
+                )
+                values = cast(Sequence[float], eccodes.codes_get_double_array(gid, "values"))
+                if not (len(latitudes) == len(longitudes) == len(values)):
+                    raise ValueError("GRIB latitude/longitude/value arrays have different lengths")
+                target_lon = _to_360_longitude(station.longitude)
+                best_value: float | None = None
+                best_distance = float("inf")
+                for latitude, longitude, value in zip(
+                    latitudes,
+                    longitudes,
+                    values,
+                    strict=True,
+                ):
+                    if not math.isfinite(value):
+                        continue
+                    distance = (float(latitude) - station.latitude) ** 2 + (
+                        _to_360_longitude(float(longitude)) - target_lon
+                    ) ** 2
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_value = float(value)
+                if best_value is None:
+                    raise ValueError("no finite TMAX value found during grid-scan self-check")
+                return best_value
             finally:
                 eccodes.codes_release(gid)
 

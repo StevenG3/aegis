@@ -5,8 +5,10 @@ from datetime import UTC, date, datetime
 import pytest
 
 from aegis.gefs_weather_probability import (
+    SampledDecoderValueSelfCheck,
     StationSpec,
     bucket_probability_from_gefs,
+    decoder_value_cross_check,
     gefs_archive_availability,
     kelvin_to_fahrenheit,
     latest_gefs_cycle_before,
@@ -127,3 +129,41 @@ def test_temperature_unit_helpers() -> None:
     assert kelvin_to_fahrenheit(273.15) == pytest.approx(32.0)
     assert round_temperature_f(84.49) == 84
     assert round_temperature_f(84.50) == 85
+
+
+def test_decoder_value_cross_check_fails_loud_on_large_disagreement() -> None:
+    passed = decoder_value_cross_check(primary_value_k=300.00, reference_value_k=300.02)
+    assert passed["passed"] is True
+
+    failed = decoder_value_cross_check(primary_value_k=300.00, reference_value_k=301.00)
+    assert failed["passed"] is False
+    assert failed["abs_error_k"] == pytest.approx(1.0)
+
+
+def test_sampled_decoder_value_self_check_tracks_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    station = StationSpec("KLGA", 40.7769, -73.8740, "America/New_York")
+    import aegis.gefs_weather_probability as module
+
+    checked_calls = 0
+    plain_calls = 0
+
+    def checked(_: bytes, __: StationSpec) -> float:
+        nonlocal checked_calls
+        checked_calls += 1
+        return 300.0
+
+    def plain(_: bytes, __: StationSpec) -> float:
+        nonlocal plain_calls
+        plain_calls += 1
+        return 300.0
+
+    monkeypatch.setattr(module, "_decode_station_tmax_k_checked", checked)
+    monkeypatch.setattr(module, "_decode_station_tmax_k", plain)
+    decoder = SampledDecoderValueSelfCheck(max_checks=2)
+
+    assert decoder(b"message-1", station) == 300.0
+    assert decoder(b"message-2", station) == 300.0
+    assert decoder(b"message-3", station) == 300.0
+    assert decoder.checks_run == 2
+    assert checked_calls == 2
+    assert plain_calls == 1
