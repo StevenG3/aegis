@@ -18,6 +18,7 @@ from aegis.gefs_weather_probability import (
     GEFS_MEMBERS,
     STATIONS,
     GefsCycle,
+    SampledDecoderValueSelfCheck,
     StationForecastSample,
     bucket_probability_from_samples,
     gefs_archive_availability,
@@ -65,8 +66,8 @@ def main() -> int:
         max_workers=args.max_workers,
     )
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    json_path = output_dir / f"polymarket-weather-model-{stamp}.json"
-    md_path = output_dir / f"polymarket-weather-model-{stamp}.md"
+    json_path = output_dir / f"polymarket-weather-twosided-{stamp}.json"
+    md_path = output_dir / f"polymarket-weather-twosided-{stamp}.md"
     json_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     md_path.write_text(_markdown(result, json_path), encoding="utf-8")
     print(
@@ -107,6 +108,7 @@ def run_weather_model_evidence(
     sample_probability_rows: list[Mapping[str, object]] = []
     text_fetcher = _cached_text_fetcher(cache_dir / "idx")
     byte_fetcher = _cached_byte_fetcher(cache_dir / "messages")
+    decoder_self_check = SampledDecoderValueSelfCheck(max_checks=24)
 
     processed_events = 0
     for event in events:
@@ -167,6 +169,7 @@ def run_weather_model_evidence(
                 members=members,
                 text_fetcher=text_fetcher,
                 byte_fetcher=byte_fetcher,
+                decoder=decoder_self_check,
                 max_workers=max_workers,
             )
         except Exception as exc:
@@ -212,14 +215,18 @@ def run_weather_model_evidence(
             "cities": list(city_slugs),
             "date_range": {"start": start_date.isoformat(), "end": end_date.isoformat()},
             "price_source": (
-                "CLOB prices-history latest price before market end "
+                "CLOB prices-history latest YES/NO token prices before market end "
                 "+ fixed ask proxy spread"
+            ),
+            "ask_method": (
+                "YES ask proxy = YES token prices-history + spread; "
+                "NO ask proxy = NO token prices-history + spread; never 1 - yes_ask"
             ),
             "ask_proxy_spread_cost": ASK_PROXY_SPREAD_COST,
         }
     )
     return {
-        "briefing": "CODEX_OLYMPUS_71B_WEATHER_MODEL",
+        "briefing": "CODEX_OLYMPUS_71C_WEATHER_TWOSIDED",
         "generated_at": datetime.now(UTC).isoformat(),
         "verdict": verdict,
         "reason": report.get("reason"),
@@ -230,6 +237,11 @@ def run_weather_model_evidence(
         "best_candidate": report.get("best_candidate"),
         "gate_evidence": {
             "decoder": "eccodes.codes_grib_find_nearest",
+            "decoder_value_self_check": (
+                "24 sampled GRIB messages cross-check find_nearest against raw "
+                "grid lat/lon/value scan; fail-loud if absolute difference exceeds 0.05K"
+            ),
+            "decoder_value_self_check_messages": decoder_self_check.checks_run,
             "interpolation": "nearest",
             "forecast_issue_rule": "latest GEFS 00/06/12/18 cycle strictly before decision_ts",
             "availability_sample": availability_checks[:20],
@@ -278,10 +290,11 @@ def _load_or_compute_samples(
     members: Sequence[str],
     text_fetcher: Any,
     byte_fetcher: Any,
+    decoder: Any,
     max_workers: int,
 ) -> tuple[list[StationForecastSample], GefsCycle, tuple[int, ...]]:
     key = hashlib.sha256(
-        f"{event_slug}:{station.code}:{decision_ts}:{','.join(members)}:v1".encode()
+        f"{event_slug}:{station.code}:{decision_ts}:{','.join(members)}:v3".encode()
     ).hexdigest()
     path = sample_cache_dir / f"{key}.json"
     if path.exists():
@@ -308,6 +321,7 @@ def _load_or_compute_samples(
         members=members,
         text_fetcher=text_fetcher,
         byte_fetcher=byte_fetcher,
+        decoder=decoder,
         max_workers=max_workers,
     )
     payload = {
@@ -350,8 +364,9 @@ def _observations_for_event(
         bucket = _bucket_from_market(market)
         if bucket is None:
             continue
-        yes_price = _latest_yes_price(market, decision_ts)
-        if yes_price is None:
+        yes_price = _latest_token_price(_token_at(market, 0), decision_ts)
+        no_price = _latest_token_price(_token_at(market, 1), decision_ts)
+        if yes_price is None or no_price is None:
             continue
         actual_won = _market_yes_won(market)
         probability = bucket_probability_from_samples(
@@ -362,6 +377,7 @@ def _observations_for_event(
             station=STATIONS[station_code],
         )
         yes_ask_proxy = min(1.0, yes_price + ASK_PROXY_SPREAD_COST)
+        no_ask_proxy = min(1.0, no_price + ASK_PROXY_SPREAD_COST)
         row = {
             "event_slug": event_slug,
             "market_slug": str(market.get("slug")),
@@ -373,13 +389,15 @@ def _observations_for_event(
             "model_probability": probability.probability,
             "yes_ask": yes_ask_proxy,
             "yes_bid": max(0.0, yes_price - ASK_PROXY_SPREAD_COST),
+            "no_ask": no_ask_proxy,
+            "no_bid": max(0.0, no_price - ASK_PROXY_SPREAD_COST),
             "actual_won": actual_won,
             "member_count": probability.member_count,
             "members_in_bucket": probability.members_in_bucket,
             "cycle_hour": probability.cycle_hour,
             "lead_hours": list(probability.lead_hours),
             "price_source_limit": (
-                "historical CLOB ask unavailable; fixed spread added to prices-history"
+                "historical CLOB ask unavailable; fixed spread added to YES/NO token prices-history"
             ),
         }
         rows.append(row)
@@ -390,6 +408,7 @@ def _observations_for_event(
                 "bucket": bucket.label,
                 "model_probability": probability.probability,
                 "yes_ask_proxy": yes_ask_proxy,
+                "no_ask_proxy": no_ask_proxy,
                 "actual_won": actual_won,
                 "member_count": probability.member_count,
             }
@@ -397,8 +416,7 @@ def _observations_for_event(
     return rows, sample_rows
 
 
-def _latest_yes_price(market: Mapping[str, Any], decision_ts: int) -> float | None:
-    token = _first_yes_token(market)
+def _latest_token_price(token: str | None, decision_ts: int) -> float | None:
     if token is None:
         return None
     params = {
@@ -493,7 +511,7 @@ def _markets(event: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [market for market in markets if isinstance(market, Mapping)]
 
 
-def _first_yes_token(market: Mapping[str, Any]) -> str | None:
+def _token_at(market: Mapping[str, Any], index: int) -> str | None:
     raw = market.get("clobTokenIds")
     if not isinstance(raw, str):
         return None
@@ -501,8 +519,8 @@ def _first_yes_token(market: Mapping[str, Any]) -> str | None:
         tokens = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    if isinstance(tokens, list) and tokens:
-        return str(tokens[0])
+    if isinstance(tokens, list) and len(tokens) > index:
+        return str(tokens[index])
     return None
 
 
@@ -606,7 +624,7 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
     multiple = cast(Mapping[str, Any], payload.get("multiple_testing", {}))
     metrics = cast(Mapping[str, Any], payload.get("standard_metrics", {}) or {})
     lines = [
-        "# CODEX OLYMPUS 71B Weather Model Evidence",
+        "# CODEX OLYMPUS 71C Weather Two-Sided Evidence",
         "",
         f"- Verdict: `{payload.get('verdict')}`",
         f"- Reason: {payload.get('reason')}",
@@ -618,6 +636,7 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
         f"- Observations: `{coverage.get('observations')}`",
         f"- Member count: `{coverage.get('member_count')}`",
         f"- Price source: `{coverage.get('price_source')}`",
+        f"- Ask method: `{coverage.get('ask_method')}`",
         "",
         "## Metrics",
         f"- Trades: `{metrics.get('trades')}`",
@@ -634,7 +653,7 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run #71B Polymarket weather model evidence.")
+    parser = argparse.ArgumentParser(description="Run #71C Polymarket weather model evidence.")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--start-date", type=date.fromisoformat, default=DEFAULT_START_DATE)
     parser.add_argument("--end-date", type=date.fromisoformat, default=DEFAULT_END_DATE)

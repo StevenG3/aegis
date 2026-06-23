@@ -11,9 +11,11 @@ from urllib.parse import urlparse
 from aegis.backtest_core import benjamini_hochberg, pbo, sign_test_p_value
 
 Verdict = Literal["SUGGESTIVE_NEEDS_PAID_CONFIRM", "NO_EDGE", "INSUFFICIENT"]
+TradeDirection = Literal["BUY_YES", "BUY_NO"]
 
 EDGE_THRESHOLDS = (0.05, 0.10, 0.15)
-TRIAL_COUNT_N = len(EDGE_THRESHOLDS)
+TRADE_DIRECTIONS: tuple[TradeDirection, ...] = ("BUY_YES", "BUY_NO")
+TRIAL_COUNT_N = len(EDGE_THRESHOLDS) * len(TRADE_DIRECTIONS)
 
 
 @dataclass(frozen=True)
@@ -51,7 +53,9 @@ class WeatherRelativeValueObservation:
     forecast_issue_ts: int
     model_probability: float
     yes_ask: float
+    no_ask: float
     yes_bid: float | None
+    no_bid: float | None
     actual_won: bool
 
 
@@ -59,9 +63,13 @@ class WeatherRelativeValueObservation:
 class WeatherTrade:
     event_slug: str
     market_slug: str
+    direction: TradeDirection
     threshold: float
     model_probability: float
+    side_probability: float
     yes_ask: float
+    no_ask: float
+    ask_price: float
     fee_cost: float
     net_return: float
     actual_won: bool
@@ -92,7 +100,8 @@ def run_weather_relative_value_firstpass(
         )
 
     evaluations = [
-        _evaluate_threshold(threshold, observations, config)
+        _evaluate_threshold(threshold, direction, observations, config)
+        for direction in TRADE_DIRECTIONS
         for threshold in config.edge_thresholds
     ]
     valid = [evaluation for evaluation in evaluations if evaluation["trades"]]
@@ -127,14 +136,13 @@ def run_weather_relative_value_firstpass(
     else:
         verdict = "NO_EDGE"
         reason = (
-            "no predeclared weather relative-value threshold passed FDR, "
-            "valid PBO, and EV gates"
+            "no predeclared weather relative-value threshold passed FDR, valid PBO, and EV gates"
         )
     return {
         "status": "OK",
         "verdict": verdict,
         "reason": reason,
-        "candidate_count_n": len(config.edge_thresholds),
+        "candidate_count_n": len(config.edge_thresholds) * len(TRADE_DIRECTIONS),
         "coverage": coverage,
         "standard_metrics": _metrics(best["trades"]),
         "benchmark_metrics": {
@@ -144,15 +152,15 @@ def run_weather_relative_value_firstpass(
         },
         "multiple_testing": {
             "method": "BH-FDR + CSCV_PBO",
-            "candidate_count_n": len(config.edge_thresholds),
+            "candidate_count_n": len(config.edge_thresholds) * len(TRADE_DIRECTIONS),
             "tested_candidates": len(valid),
             "fdr_after": sum(1 for flag in fdr_flags if flag),
             "pbo": pbo_report,
             "min_p": min(p_values) if p_values else None,
+            "directions": list(TRADE_DIRECTIONS),
+            "direction_trade_counts": _direction_trade_counts(valid),
         },
-        "best_candidate": {
-            key: value for key, value in best.items() if key != "trades"
-        },
+        "best_candidate": {key: value for key, value in best.items() if key != "trades"},
         "safety": _safety(config),
     }
 
@@ -194,15 +202,9 @@ def settlement_source_alignment(event: Mapping[str, object]) -> Mapping[str, Any
         markets = []
     event_source = _str(event.get("resolutionSource"))
     market_sources = [
-        _str(market.get("resolutionSource"))
-        for market in markets
-        if isinstance(market, Mapping)
+        _str(market.get("resolutionSource")) for market in markets if isinstance(market, Mapping)
     ]
-    sources = {
-        source
-        for source in [event_source, *market_sources]
-        if source
-    }
+    sources = {source for source in [event_source, *market_sources] if source}
     stations = {station for source in sources if (station := station_from_wunderground_url(source))}
     descriptions = [
         _str(event.get("description")) or "",
@@ -252,7 +254,9 @@ def _observations(
                 forecast_issue_ts=_required_int(row["forecast_issue_ts"]),
                 model_probability=_required_float(row["model_probability"]),
                 yes_ask=_required_float(row["yes_ask"]),
+                no_ask=_required_float(row["no_ask"]),
                 yes_bid=_optional_float(row.get("yes_bid")),
+                no_bid=_optional_float(row.get("no_bid")),
                 actual_won=bool(row["actual_won"]),
             )
         )
@@ -270,6 +274,7 @@ def _row_exclusion_reason(row: Mapping[str, object]) -> str | None:
         "forecast_issue_ts",
         "model_probability",
         "yes_ask",
+        "no_ask",
         "actual_won",
     )
     for key in required:
@@ -279,11 +284,13 @@ def _row_exclusion_reason(row: Mapping[str, object]) -> str | None:
     issue_ts = _optional_int(row["forecast_issue_ts"])
     model_probability = _optional_float(row["model_probability"])
     yes_ask = _optional_float(row["yes_ask"])
+    no_ask = _optional_float(row["no_ask"])
     if (
         decision_ts is None
         or issue_ts is None
         or model_probability is None
         or yes_ask is None
+        or no_ask is None
     ):
         return "parse_error"
     if issue_ts >= decision_ts:
@@ -292,6 +299,8 @@ def _row_exclusion_reason(row: Mapping[str, object]) -> str | None:
         return "model_probability_out_of_range"
     if not 0.0 < yes_ask <= 1.0:
         return "yes_ask_out_of_range"
+    if not 0.0 < no_ask <= 1.0:
+        return "no_ask_out_of_range"
     if parse_temperature_bucket(str(row["bucket_label"])) is None:
         return "unparseable_temperature_bucket"
     return None
@@ -299,32 +308,48 @@ def _row_exclusion_reason(row: Mapping[str, object]) -> str | None:
 
 def _evaluate_threshold(
     threshold: float,
+    direction: TradeDirection,
     observations: Sequence[WeatherRelativeValueObservation],
     config: WeatherRelativeValueConfig,
 ) -> dict[str, Any]:
-    trades = [
-        WeatherTrade(
-            event_slug=observation.event_slug,
-            market_slug=observation.market_slug,
-            threshold=threshold,
-            model_probability=observation.model_probability,
-            yes_ask=observation.yes_ask,
-            fee_cost=observation.yes_ask * config.taker_fee_rate,
-            net_return=(
-                (1.0 - observation.yes_ask - observation.yes_ask * config.taker_fee_rate)
-                if observation.actual_won
-                else (-observation.yes_ask - observation.yes_ask * config.taker_fee_rate)
-            )
-            / max(observation.yes_ask, 1e-9),
-            actual_won=observation.actual_won,
+    trades: list[WeatherTrade] = []
+    for observation in observations:
+        side_probability = (
+            observation.model_probability
+            if direction == "BUY_YES"
+            else 1.0 - observation.model_probability
         )
-        for observation in observations
-        if observation.model_probability - observation.yes_ask >= threshold
-    ]
+        ask_price = observation.yes_ask if direction == "BUY_YES" else observation.no_ask
+        if side_probability - ask_price < threshold:
+            continue
+        actual_won = (
+            observation.actual_won if direction == "BUY_YES" else not observation.actual_won
+        )
+        fee_cost = ask_price * config.taker_fee_rate
+        net_return = (
+            (1.0 - ask_price - fee_cost) if actual_won else (-ask_price - fee_cost)
+        ) / max(ask_price, 1e-9)
+        trades.append(
+            WeatherTrade(
+                event_slug=observation.event_slug,
+                market_slug=observation.market_slug,
+                direction=direction,
+                threshold=threshold,
+                model_probability=observation.model_probability,
+                side_probability=side_probability,
+                yes_ask=observation.yes_ask,
+                no_ask=observation.no_ask,
+                ask_price=ask_price,
+                fee_cost=fee_cost,
+                net_return=net_return,
+                actual_won=actual_won,
+            )
+        )
     wins = sum(1 for trade in trades if trade.actual_won)
     losses = sum(1 for trade in trades if not trade.actual_won)
     signs = [1 if trade.net_return > 0 else -1 if trade.net_return < 0 else 0 for trade in trades]
     return {
+        "direction": direction,
         "threshold": threshold,
         "trade_count": len(trades),
         "wins": wins,
@@ -376,16 +401,32 @@ def _metrics(trades: object) -> Mapping[str, Any]:
         "wins": wins,
         "losses": losses,
         "win_rate": wins / len(clean) if clean else 0.0,
-        "mean_net_return": statistics.fmean(trade.net_return for trade in clean)
-        if clean
-        else 0.0,
+        "mean_net_return": statistics.fmean(trade.net_return for trade in clean) if clean else 0.0,
         "total_net_return": sum(trade.net_return for trade in clean),
         "mean_yes_ask": statistics.fmean(trade.yes_ask for trade in clean) if clean else None,
+        "mean_no_ask": statistics.fmean(trade.no_ask for trade in clean) if clean else None,
+        "mean_ask_price": statistics.fmean(trade.ask_price for trade in clean) if clean else None,
         "mean_model_probability": statistics.fmean(trade.model_probability for trade in clean)
         if clean
         else None,
+        "direction_counts": {
+            direction: sum(1 for trade in clean if trade.direction == direction)
+            for direction in TRADE_DIRECTIONS
+        },
         "mean_fee_cost": statistics.fmean(trade.fee_cost for trade in clean) if clean else None,
     }
+
+
+def _direction_trade_counts(evaluations: Sequence[Mapping[str, Any]]) -> Mapping[str, int]:
+    counts: dict[str, int] = {direction: 0 for direction in TRADE_DIRECTIONS}
+    for evaluation in evaluations:
+        trades = evaluation.get("trades")
+        if not isinstance(trades, Sequence):
+            continue
+        for trade in trades:
+            if isinstance(trade, WeatherTrade):
+                counts[trade.direction] += 1
+    return counts
 
 
 def _reason_counts(excluded: Sequence[tuple[str, str]]) -> Mapping[str, int]:
@@ -404,7 +445,7 @@ def _insufficient(
         "status": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
-        "candidate_count_n": len(config.edge_thresholds),
+        "candidate_count_n": len(config.edge_thresholds) * len(TRADE_DIRECTIONS),
         "coverage": dict(coverage),
         "standard_metrics": {},
         "benchmark_metrics": {
@@ -413,7 +454,7 @@ def _insufficient(
         },
         "multiple_testing": {
             "method": "BH-FDR + CSCV_PBO",
-            "candidate_count_n": len(config.edge_thresholds),
+            "candidate_count_n": len(config.edge_thresholds) * len(TRADE_DIRECTIONS),
             "fdr_after": 0,
             "pbo": {"valid": False, "reason": "not run under INSUFFICIENT gate"},
         },
