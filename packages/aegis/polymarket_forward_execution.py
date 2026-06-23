@@ -201,6 +201,11 @@ def run_forward_execution_backtest(
         "status": "OK",
         "verdict": verdict,
         "reason": reason,
+        "data_adequacy": "limited",
+        "unlock_condition": (
+            "multi-week cross-regime forward executable order-book capture with venue "
+            "access resolved and non-survivor-limited coverage"
+        ),
         "candidate_count_n": len(candidates),
         "raw_is_survivors": sum(
             1
@@ -737,6 +742,8 @@ def _insufficient(reason: str, coverage: Mapping[str, Any]) -> Mapping[str, Any]
         "status": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
+        "data_adequacy": "blocked",
+        "unlock_condition": reason,
         "candidate_count_n": TRIAL_COUNT_N,
         "coverage": coverage,
         "multiple_testing": {

@@ -249,6 +249,12 @@ def run_underlying_adx_prefilter(
             fdr_survivors=fdr_survivors,
             pbo_valid=pbo_report.get("valid") is True,
         ),
+        "data_adequacy": "limited" if config.survivor_light else "adequate",
+        "unlock_condition": (
+            "non-survivor-limited point-in-time continuous futures construction"
+            if config.survivor_light
+            else "N/A"
+        ),
         "symbols": symbols,
         "data": {
             "source": data_source,
@@ -605,6 +611,8 @@ def _insufficient(
         "verdict": "INSUFFICIENT",
         "standard_verdict": "INSUFFICIENT",
         "reason": reason,
+        "data_adequacy": "blocked",
+        "unlock_condition": reason,
         "symbols": symbols,
         "data": {
             "source": data_source,

@@ -299,6 +299,8 @@ def comparison_row(verdict: Any, payload: Mapping[str, Any]) -> dict[str, object
     return {
         "verdict": verdict.verdict,
         "state": verdict.state,
+        "data_adequacy": verdict.data_adequacy,
+        "unlock_condition": verdict.unlock_condition,
         "candidate_count_n": verdict.candidate_count_n,
         "tested_candidates": multiple_testing.get("tested_candidates"),
         "fdr_after": multiple_testing.get("fdr_after"),
@@ -327,6 +329,8 @@ def _verdict_to_dict(verdict: Any) -> dict[str, object]:
         "state": verdict.state,
         "verdict": verdict.verdict,
         "reason": verdict.reason,
+        "data_adequacy": verdict.data_adequacy,
+        "unlock_condition": verdict.unlock_condition,
         "candidate_count_n": verdict.candidate_count_n,
         "raw_survivors": verdict.raw_survivors,
         "fdr_survivors": verdict.fdr_survivors,

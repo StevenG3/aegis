@@ -115,6 +115,11 @@ def run_relative_value_calibration(
         "status": "OK",
         "verdict": verdict,
         "reason": reason,
+        "data_adequacy": "limited",
+        "unlock_condition": (
+            "longer multi-regime forward capture with confirmed full market enumeration "
+            "and non-survivor-limited coverage"
+        ),
         "candidate_count_n": TRIAL_COUNT_N,
         "raw_is_survivors": len(raw_miscalibrated),
         "fdr_is_survivors": len(exploitable),
@@ -432,6 +437,8 @@ def _insufficient(
         "status": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
+        "data_adequacy": "blocked",
+        "unlock_condition": reason,
         "candidate_count_n": TRIAL_COUNT_N,
         "coverage": dict(coverage),
         "standard_metrics": {},

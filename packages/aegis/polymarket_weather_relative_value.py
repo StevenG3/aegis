@@ -142,6 +142,11 @@ def run_weather_relative_value_firstpass(
         "status": "OK",
         "verdict": verdict,
         "reason": reason,
+        "data_adequacy": "limited",
+        "unlock_condition": (
+            "longer multi-city history with true YES/NO ask series, settlement-aligned stations, "
+            "and both-sided coverage beyond the initial small sample"
+        ),
         "candidate_count_n": len(config.edge_thresholds) * len(TRADE_DIRECTIONS),
         "coverage": coverage,
         "standard_metrics": _metrics(best["trades"]),
@@ -445,6 +450,8 @@ def _insufficient(
         "status": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
+        "data_adequacy": "blocked",
+        "unlock_condition": reason,
         "candidate_count_n": len(config.edge_thresholds) * len(TRADE_DIRECTIONS),
         "coverage": dict(coverage),
         "standard_metrics": {},

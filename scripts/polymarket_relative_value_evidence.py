@@ -81,6 +81,8 @@ def main() -> int:
             "state": run.verdict.state,
             "verdict": run.verdict.verdict,
             "reason": run.verdict.reason,
+            "data_adequacy": run.verdict.data_adequacy,
+            "unlock_condition": run.verdict.unlock_condition,
             "candidate_count_n": run.verdict.candidate_count_n,
             "fdr_survivors": run.verdict.fdr_survivors,
             "survivor_ceiling_applied": run.verdict.survivor_ceiling_applied,

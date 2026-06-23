@@ -154,6 +154,8 @@ def main() -> int:
             "raw_backtest_verdict": backtest.verdict.verdict,
             "raw_backtest_state": backtest.verdict.state,
             "raw_backtest_reason": backtest.verdict.reason,
+            "raw_backtest_data_adequacy": backtest.verdict.data_adequacy,
+            "raw_backtest_unlock_condition": backtest.verdict.unlock_condition,
             "candidate_count_n": backtest.verdict.candidate_count_n,
             "fdr_survivors": backtest.verdict.fdr_survivors,
             "survivor_ceiling_applied": backtest.verdict.survivor_ceiling_applied,

@@ -74,6 +74,8 @@ def main() -> int:
             {
                 "verdict": result.get("verdict"),
                 "reason": result.get("reason"),
+                "data_adequacy": result.get("data_adequacy"),
+                "unlock_condition": result.get("unlock_condition"),
                 "candidate_count_n": result.get("candidate_count_n"),
                 "fdr_survivors": result.get("fdr_survivors"),
                 "historical_iv_positive_rows": fetch_report["availability"].get(
@@ -350,6 +352,8 @@ def _markdown(payload: Mapping[str, object], json_path: Path) -> str:
             "",
             f"- Verdict: `{result.get('verdict')}`",
             f"- Reason: {result.get('reason')}",
+            f"- Data adequacy: `{result.get('data_adequacy')}`",
+            f"- Unlock condition: {result.get('unlock_condition')}",
             f"- Historical IV source: `{availability.get('historical_iv_source')}`",
             f"- Historical IV positive rows: `{availability.get('historical_iv_positive_rows')}`",
             f"- Index source: `{availability.get('index_source')}`",
