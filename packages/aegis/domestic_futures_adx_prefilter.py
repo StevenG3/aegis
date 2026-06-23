@@ -338,7 +338,7 @@ def simulate_candidate(
                 entry_timestamps.append(ordered[execution_index].timestamp)
                 in_trade = True
         gross = position * (ordered[execution_index + 1].open / ordered[execution_index].open - 1.0)
-        trade_cost = position_change * cost_model.round_trip_bps / 10_000.0
+        trade_cost = position_change * cost_model.one_way_cost
         net = gross - trade_cost
         if position != 0:
             current_trade_return += net

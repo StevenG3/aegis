@@ -329,7 +329,7 @@ def simulate_tsmom(
             bars[execution_index + 1].open / bars[execution_index].open - 1.0
         )
         position_change = abs(position - prev_position)
-        trade_cost = position_change * cost_model.round_trip_bps / 10_000.0
+        trade_cost = position_change * cost_model.one_way_cost
         funding_cost = abs(position) * cost_model.funding_bps_per_period / 10_000.0
         net_return = gross_return - trade_cost - funding_cost
         returns.append(net_return)
@@ -369,7 +369,7 @@ def simulate_buy_hold(
     start = max(start, 1)
     end = min(end, len(bars) - 1)
     for execution_index in range(start, end):
-        trade_cost = cost_model.round_trip_bps / 10_000.0 if execution_index == start else 0.0
+        trade_cost = cost_model.one_way_cost if execution_index == start else 0.0
         returns.append(
             bars[execution_index + 1].open / bars[execution_index].open
             - 1.0

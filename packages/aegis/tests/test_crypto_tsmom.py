@@ -81,6 +81,22 @@ def test_costs_and_funding_are_counted_against_returns() -> None:
     assert with_cost.metrics.total_return < no_cost.metrics.total_return
 
 
+def test_position_change_charges_one_way_cost_not_round_trip() -> None:
+    bars = _bars([100, 100, 110, 121, 133.1, 146.41])
+    result = simulate_tsmom(
+        bars,
+        lookback=2,
+        start=3,
+        end=5,
+        config=TsmomConfig(lookbacks=(2,), annualization_periods=365),
+        cost_model=CostModel(fee_bps=10, slippage_bps=5, funding_bps_per_period=0),
+    )
+
+    assert result.positions == (1, 1)
+    assert result.costs == pytest.approx((0.0015, 0.0))
+    assert result.returns[0] == pytest.approx(133.1 / 121 - 1 - 0.0015)
+
+
 def test_sign_test_and_fdr_are_explicit_not_all_window_gates() -> None:
     assert sign_test_p_value([0.1, 0.2, 0.3, -0.1, 0.4]) < 1.0
     assert benjamini_hochberg([0.01, 0.04, 0.5], alpha=0.10) == [True, True, False]
