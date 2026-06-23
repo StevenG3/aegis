@@ -41,6 +41,12 @@ INSUFFICIENT_VERDICTS = frozenset({"INSUFFICIENT", "INSUFFICIENT_DATA"})
 
 @dataclass(frozen=True)
 class CostModel:
+    """Trading cost model with fee and slippage expressed per side.
+
+    ``fee_bps`` and ``slippage_bps`` are one-way costs. A full open+close
+    round trip is therefore twice ``one_way_cost``.
+    """
+
     fee_bps: float = 10.0
     slippage_bps: float = 5.0
     funding_bps_per_period: float = 0.0
@@ -51,8 +57,12 @@ class CostModel:
         return (self.fee_bps + self.slippage_bps) / 10_000.0
 
     @property
+    def round_trip_cost(self) -> float:
+        return 2.0 * self.one_way_cost
+
+    @property
     def round_trip_bps(self) -> float:
-        return self.fee_bps + self.slippage_bps
+        return 2.0 * (self.fee_bps + self.slippage_bps)
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ import pytest
 
 from aegis.backtest_core import (
     BacktestDiscipline,
+    CostModel,
     HypothesisSpec,
     StandardVerdict,
     benjamini_hochberg,
@@ -18,6 +19,28 @@ from aegis.backtest_core import (
     sign_test_p_value,
     trade_scorecard,
 )
+
+
+def test_cost_model_one_way_and_round_trip_semantics() -> None:
+    cost_model = CostModel(fee_bps=10.0, slippage_bps=5.0)
+
+    assert cost_model.one_way_cost == pytest.approx(0.0015)
+    assert cost_model.round_trip_cost == pytest.approx(0.0030)
+    assert cost_model.round_trip_bps == pytest.approx(30.0)
+    assert cost_model.round_trip_cost == pytest.approx(2.0 * cost_model.one_way_cost)
+    assert cost_model.round_trip_bps == pytest.approx(
+        2.0 * (cost_model.fee_bps + cost_model.slippage_bps)
+    )
+
+
+def test_complete_open_close_cost_equals_round_trip() -> None:
+    cost_model = CostModel(fee_bps=10.0, slippage_bps=5.0)
+    position_changes = (1.0, 1.0)
+
+    total_cost = sum(change * cost_model.one_way_cost for change in position_changes)
+
+    assert total_cost == pytest.approx(cost_model.round_trip_cost)
+    assert total_cost == pytest.approx(cost_model.round_trip_bps / 10_000.0)
 
 
 def test_benjamini_hochberg_supports_legacy_rank_and_cutoff_modes() -> None:
