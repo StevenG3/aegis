@@ -281,6 +281,11 @@ def _run_impl(
         "status": "INSUFFICIENT" if verdict == "INSUFFICIENT" else "OK",
         "verdict": verdict,
         "reason": reason,
+        "data_adequacy": "limited",
+        "unlock_condition": (
+            "point-in-time venue universe with delisted contracts, complete historical funding, "
+            "and non-survivor-limited liquidity/market-cap coverage"
+        ),
         "candidate_count_n": 1,
         "raw_is_survivors": int(statistics.fmean(oos_returns) > 0.0),
         "fdr_is_survivors": int(fdr_pass),
@@ -830,6 +835,8 @@ def _insufficient(
         "status": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
+        "data_adequacy": "blocked",
+        "unlock_condition": reason,
         "candidate_count_n": 1,
         "standard_metrics": {},
         "benchmark_metrics": {},

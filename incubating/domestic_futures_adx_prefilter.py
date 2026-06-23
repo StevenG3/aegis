@@ -97,6 +97,8 @@ def main() -> int:
             {
                 "verdict": result.get("verdict"),
                 "reason": result.get("reason"),
+                "data_adequacy": result.get("data_adequacy"),
+                "unlock_condition": result.get("unlock_condition"),
                 "candidate_count_n": result.get("candidate_count_n"),
                 "fdr_survivors": result.get("fdr_survivors"),
                 "pbo": (
@@ -231,6 +233,8 @@ def _markdown(payload: dict[str, Any], json_path: Path) -> str:
             f"- generated_at: {payload['generated_at']}",
             f"- verdict: {result.get('verdict')}",
             f"- reason: {result.get('reason')}",
+            f"- data_adequacy: {result.get('data_adequacy')}",
+            f"- unlock_condition: {result.get('unlock_condition')}",
             f"- candidate_count_n: {result.get('candidate_count_n')}",
             f"- fdr_survivors: {result.get('fdr_survivors')}",
             f"- pbo: {pbo_report.get('pbo')}",

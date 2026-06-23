@@ -197,6 +197,11 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
         "status": status,
         "verdict": verdict,
         "reason": reason,
+        "data_adequacy": "limited",
+        "unlock_condition": (
+            "paid or forward full-depth historical order book with bid/ask spread, "
+            "top depth, and point-in-time delisted perp coverage"
+        ),
         "strategy": "microstructure_perp_funding_oi_orderflow",
         "standard_metrics": _metrics_to_dict(strategy_metrics),
         "benchmark_metrics": {"buy_and_hold": _metrics_to_dict(benchmark_metrics)},
@@ -946,6 +951,8 @@ def _insufficient_payload(
         "status": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
+        "data_adequacy": "blocked",
+        "unlock_condition": reason,
         "candidate_count_n": candidate_count,
         "multiple_testing": {
             "method": "BH-FDR + CSCV_PBO",

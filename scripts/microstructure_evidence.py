@@ -770,6 +770,8 @@ def _verdict_to_dict(verdict: Any) -> dict[str, Any]:
         "state": verdict.state,
         "verdict": verdict.verdict,
         "reason": verdict.reason,
+        "data_adequacy": verdict.data_adequacy,
+        "unlock_condition": verdict.unlock_condition,
         "candidate_count_n": verdict.candidate_count_n,
         "raw_survivors": verdict.raw_survivors,
         "fdr_survivors": verdict.fdr_survivors,

@@ -406,6 +406,8 @@ def _insufficient_verdict(mechanism: Mechanism, reason: str) -> StandardVerdict:
         state="INSUFFICIENT",
         verdict="INSUFFICIENT",
         reason=f"{mechanism}: {reason}",
+        data_adequacy="blocked",
+        unlock_condition=reason,
         metrics={},
         benchmarks={"cash": 0.0, "underlying_buy_hold": "not evaluated"},
         candidate_count_n=0,

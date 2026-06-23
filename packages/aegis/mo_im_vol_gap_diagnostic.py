@@ -145,6 +145,10 @@ def run_vol_gap_diagnostic(
     return {
         "verdict": verdict,
         "reason": reason,
+        "data_adequacy": "limited",
+        "unlock_condition": (
+            "true PIT ATM MO option-chain IV with term structure and hedge-cost data"
+        ),
         "candidate_count_n": trial_count(config),
         "raw_survivors": len(
             [
@@ -445,6 +449,8 @@ def _insufficient(
     return {
         "verdict": "INSUFFICIENT",
         "reason": reason,
+        "data_adequacy": "blocked",
+        "unlock_condition": reason,
         "candidate_count_n": trial_count(config),
         "raw_survivors": 0,
         "fdr_survivors": 0,

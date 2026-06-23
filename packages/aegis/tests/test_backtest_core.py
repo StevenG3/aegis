@@ -155,6 +155,8 @@ def test_run_backtest_standardizes_payload_and_injects_trial_count() -> None:
     assert result.verdict.state == "NO_EDGE"
     assert result.verdict.candidate_count_n == 2
     assert result.verdict.multiple_testing["hypothesis_trial_count_n"] == 2
+    assert result.verdict.data_adequacy == "limited"
+    assert result.verdict.unlock_condition
 
 
 def test_run_backtest_rejects_missing_discipline() -> None:
@@ -173,6 +175,59 @@ def test_run_backtest_rejects_missing_discipline() -> None:
     )
 
     with pytest.raises(ValueError, match="t_plus_1_execution"):
+        run_backtest(spec)
+
+
+def test_standard_verdict_requires_blocked_only_for_insufficient() -> None:
+    with pytest.raises(ValueError, match="blocked"):
+        StandardVerdict(
+            state="NO_EDGE",
+            verdict="NO_EDGE",
+            reason="tested",
+            data_adequacy="blocked",
+            unlock_condition="data",
+        )
+    with pytest.raises(ValueError, match="blocked"):
+        StandardVerdict(
+            state="INSUFFICIENT",
+            verdict="INSUFFICIENT",
+            reason="data missing",
+            data_adequacy="limited",
+            unlock_condition="data",
+        )
+
+    verdict = StandardVerdict(
+        state="INSUFFICIENT",
+        verdict="INSUFFICIENT",
+        reason="data missing",
+        data_adequacy="blocked",
+        unlock_condition="obtain PIT data",
+    )
+    assert verdict.data_adequacy == "blocked"
+
+
+def test_survivor_light_specs_cannot_claim_adequate_data() -> None:
+    spec = HypothesisSpec(
+        key="survivor_bad_adequacy",
+        hypothesis_type="factor",
+        universe=("BTC/USDT",),
+        predeclared_signals=("signal",),
+        params={},
+        cost_model={},
+        benchmark="cash",
+        data_source="survivor_light_free_data",
+        trial_count_n=1,
+        survivor_light=True,
+        runner=lambda: {
+            "status": "OK",
+            "verdict": "NO_EDGE",
+            "reason": "tested",
+            "data_adequacy": "adequate",
+            "unlock_condition": "N/A",
+        },
+    )
+
+    with pytest.raises(ValueError, match="survivor_light"):
         run_backtest(spec)
 
 
@@ -213,6 +268,8 @@ def test_run_backtest_accepts_custom_verdict_adapter() -> None:
             state="INSUFFICIENT",
             verdict="INSUFFICIENT",
             reason="too few events",
+            data_adequacy="blocked",
+            unlock_condition="more events",
         ),
     )
 

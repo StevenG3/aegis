@@ -6,7 +6,7 @@ import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import combinations
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 BhTiePolicy = Literal["p_value_cutoff", "rank"]
 SignAlternative = Literal["greater", "two-sided"]
@@ -21,6 +21,7 @@ HypothesisType = Literal[
     "other",
 ]
 StandardVerdictState = Literal["EDGE", "NO_EDGE", "INSUFFICIENT"]
+DataAdequacy = Literal["adequate", "limited", "blocked"]
 
 
 POSITIVE_VERDICTS = frozenset(
@@ -106,6 +107,8 @@ class StandardVerdict:
     state: StandardVerdictState
     verdict: str
     reason: str
+    data_adequacy: DataAdequacy = "limited"
+    unlock_condition: str = "runner did not declare an unlock condition"
     metrics: Mapping[str, object] = field(default_factory=dict)
     benchmarks: Mapping[str, object] = field(default_factory=dict)
     candidate_count_n: int = 0
@@ -114,6 +117,14 @@ class StandardVerdict:
     multiple_testing: Mapping[str, object] = field(default_factory=dict)
     safety: Mapping[str, object] = field(default_factory=dict)
     survivor_ceiling_applied: bool = False
+
+    def __post_init__(self) -> None:
+        if (self.data_adequacy == "blocked") != (self.state == "INSUFFICIENT"):
+            raise ValueError("data_adequacy='blocked' must correspond exactly to INSUFFICIENT")
+        if self.data_adequacy == "adequate" and self.unlock_condition != "N/A":
+            raise ValueError("adequate verdicts must use unlock_condition='N/A'")
+        if self.data_adequacy != "adequate" and not self.unlock_condition.strip():
+            raise ValueError("limited/blocked verdicts must declare an unlock_condition")
 
 
 @dataclass(frozen=True)
@@ -156,6 +167,7 @@ def run_backtest(spec: HypothesisSpec) -> BacktestRun:
 def default_verdict_adapter(payload: object, spec: HypothesisSpec) -> StandardVerdict:
     verdict = str(_payload_get(payload, "verdict", _payload_get(payload, "alpha_verdict", "OK")))
     status = str(_payload_get(payload, "status", "OK"))
+    state = _standard_state(verdict, status)
     reason = str(_payload_get(payload, "reason", ""))
     multiple_testing = _mapping_or_empty(_payload_get(payload, "multiple_testing", {}))
     safety = _mapping_or_empty(_payload_get(payload, "safety", {}))
@@ -192,10 +204,14 @@ def default_verdict_adapter(payload: object, spec: HypothesisSpec) -> StandardVe
             ),
         ),
     )
+    data_adequacy = _data_adequacy_from_payload(payload, state)
+    unlock_condition = _unlock_condition_from_payload(payload, data_adequacy, reason)
     return StandardVerdict(
-        state=_standard_state(verdict, status),
+        state=state,
         verdict=verdict,
         reason=reason,
+        data_adequacy=data_adequacy,
+        unlock_condition=unlock_condition,
         metrics=metrics,
         benchmarks=benchmarks,
         candidate_count_n=candidate_count_n,
@@ -235,6 +251,8 @@ def _validate_hypothesis_spec(spec: HypothesisSpec) -> None:
 
 
 def _normalize_standard_verdict(verdict: StandardVerdict, spec: HypothesisSpec) -> StandardVerdict:
+    if spec.survivor_light and verdict.data_adequacy == "adequate":
+        raise ValueError("survivor_light specs cannot produce data_adequacy='adequate'")
     candidate_count_n = max(verdict.candidate_count_n, spec.trial_count_n)
     multiple_testing = dict(verdict.multiple_testing)
     multiple_testing.setdefault("candidate_count_n", candidate_count_n)
@@ -269,6 +287,42 @@ def _standard_state(verdict: str, status: str) -> StandardVerdictState:
     if verdict in POSITIVE_VERDICTS:
         return "EDGE"
     return "NO_EDGE"
+
+
+def _data_adequacy_from_payload(payload: object, state: StandardVerdictState) -> DataAdequacy:
+    raw = _payload_get(payload, "data_adequacy", None)
+    if raw is None:
+        safety = _mapping_or_empty(_payload_get(payload, "safety", {}))
+        raw = safety.get("data_adequacy")
+    if isinstance(raw, str):
+        if raw not in ("adequate", "limited", "blocked"):
+            raise ValueError(f"invalid data_adequacy: {raw!r}")
+        adequacy = raw
+    else:
+        adequacy = "blocked" if state == "INSUFFICIENT" else "limited"
+    if state == "INSUFFICIENT" and adequacy != "blocked":
+        raise ValueError("INSUFFICIENT verdicts must use data_adequacy='blocked'")
+    if state != "INSUFFICIENT" and adequacy == "blocked":
+        raise ValueError("data_adequacy='blocked' is only valid for INSUFFICIENT verdicts")
+    return cast(DataAdequacy, adequacy)
+
+
+def _unlock_condition_from_payload(
+    payload: object, data_adequacy: DataAdequacy, reason: str
+) -> str:
+    raw = _payload_get(payload, "unlock_condition", None)
+    if raw is None:
+        safety = _mapping_or_empty(_payload_get(payload, "safety", {}))
+        raw = safety.get("unlock_condition")
+    if raw is not None:
+        value = str(raw).strip()
+        if value:
+            return value
+    if data_adequacy == "adequate":
+        return "N/A"
+    if data_adequacy == "blocked":
+        return reason or "data gate must pass before this hypothesis can be evaluated"
+    return "runner did not declare an unlock condition"
 
 
 def _payload_get(payload: object, key: str, default: object) -> object:

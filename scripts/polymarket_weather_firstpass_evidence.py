@@ -145,6 +145,10 @@ def run_gate_probe(
         "status": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
+        "data_adequacy": "blocked",
+        "unlock_condition": (
+            "GEFS GRIB2 station interpolation and independent bucket probability model"
+        ),
         "coverage": coverage,
         "gate_evidence": {
             "sample_aligned_events": aligned_events[:10],
@@ -307,6 +311,8 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
         "",
         f"- Verdict: `{payload['verdict']}`",
         f"- Reason: {payload['reason']}",
+        f"- Data adequacy: `{payload.get('data_adequacy')}`",
+        f"- Unlock condition: {payload.get('unlock_condition')}",
         f"- JSON: `{json_path}`",
         "",
         "## Coverage",
