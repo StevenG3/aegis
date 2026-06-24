@@ -14,6 +14,7 @@ def _row(
     expiry_ts: int = 2_000,
     implied_vol: float = 0.80,
     realized_vol: float = 0.60,
+    variance_year_fraction: float = 7.0 / 365.0,
     option_spread_cost: float = 0.01,
     hedge_fee_cost: float = 0.005,
     hedge_slippage_cost: float = 0.005,
@@ -26,6 +27,7 @@ def _row(
         "expiry_ts": expiry_ts,
         "implied_vol": implied_vol,
         "realized_vol": realized_vol,
+        "variance_year_fraction": variance_year_fraction,
         "option_spread_cost": option_spread_cost,
         "hedge_fee_cost": hedge_fee_cost,
         "hedge_slippage_cost": hedge_slippage_cost,
@@ -60,7 +62,13 @@ def test_short_vol_vrp_counts_hedge_funding_cost() -> None:
 
 def test_short_vol_vrp_positive_premium_but_tail_unsafe() -> None:
     rows = [
-        _row(variant="atm_straddle_7d", iv_ts=1_000 + index, expiry_ts=2_000 + index)
+        _row(
+            variant="atm_straddle_7d",
+            iv_ts=1_000 + index,
+            expiry_ts=2_000 + index,
+            implied_vol=5.00,
+            realized_vol=0.20,
+        )
         for index in range(5)
     ]
     rows.append(
@@ -68,9 +76,9 @@ def test_short_vol_vrp_positive_premium_but_tail_unsafe() -> None:
             variant="atm_straddle_7d",
             iv_ts=9_000,
             expiry_ts=10_000,
-            implied_vol=1.20,
+            implied_vol=10.00,
             realized_vol=0.30,
-            tail_loss=2.00,
+            tail_loss=3.00,
         )
     )
     report = run_btc_short_vol_vrp(rows, config=ShortVolVrpConfig(max_drawdown_limit=-0.30))

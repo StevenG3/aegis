@@ -4,6 +4,7 @@ import math
 import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from aegis.backtest_core import benjamini_hochberg, pbo, sign_test_p_value
@@ -32,6 +33,7 @@ class ShortVolObservation:
     expiry_ts: int
     implied_vol: float
     realized_vol: float
+    variance_year_fraction: float
     option_spread_cost: float
     hedge_fee_cost: float
     hedge_slippage_cost: float
@@ -40,7 +42,9 @@ class ShortVolObservation:
 
     @property
     def net_return(self) -> float:
-        variance_premium = self.implied_vol**2 - self.realized_vol**2
+        variance_premium = (
+            (self.implied_vol**2 - self.realized_vol**2) * self.variance_year_fraction
+        )
         costs = (
             self.option_spread_cost
             + self.hedge_fee_cost
@@ -76,7 +80,8 @@ def run_btc_short_vol_vrp(
     pbo_valid = bool(pbo_report.get("valid", False))
     pbo_value = _float(pbo_report.get("pbo"), default=1.0)
     best = max(evaluations, key=lambda evaluation: float(evaluation["mean_net_return"]))
-    best_metrics = _tail_metrics(cast_returns(best["returns"]))
+    best_observations = [row for row in observations if row.variant == best["variant"]]
+    best_metrics = _tail_metrics(best_observations)
     fdr_pass = any(
         flag and evaluation["variant"] == best["variant"]
         for flag, evaluation in zip(fdr_flags, evaluations, strict=True)
@@ -170,6 +175,7 @@ def _observations(
                 expiry_ts=_required_int(row["expiry_ts"]),
                 implied_vol=_required_float(row["implied_vol"]),
                 realized_vol=_required_float(row["realized_vol"]),
+                variance_year_fraction=_required_float(row["variance_year_fraction"]),
                 option_spread_cost=_required_float(row["option_spread_cost"]),
                 hedge_fee_cost=_required_float(row["hedge_fee_cost"]),
                 hedge_slippage_cost=_required_float(row["hedge_slippage_cost"]),
@@ -187,6 +193,7 @@ def _row_exclusion_reason(row: Mapping[str, object]) -> str | None:
         "expiry_ts",
         "implied_vol",
         "realized_vol",
+        "variance_year_fraction",
         "option_spread_cost",
         "hedge_fee_cost",
         "hedge_slippage_cost",
@@ -200,6 +207,7 @@ def _row_exclusion_reason(row: Mapping[str, object]) -> str | None:
     expiry_ts = _optional_int(row["expiry_ts"])
     iv = _optional_float(row["implied_vol"])
     rv = _optional_float(row["realized_vol"])
+    year_fraction = _optional_float(row["variance_year_fraction"])
     costs = (
         _optional_float(row["option_spread_cost"]),
         _optional_float(row["hedge_fee_cost"]),
@@ -212,6 +220,7 @@ def _row_exclusion_reason(row: Mapping[str, object]) -> str | None:
         or expiry_ts is None
         or iv is None
         or rv is None
+        or year_fraction is None
         or any(c is None for c in costs)
     ):
         return "parse_error"
@@ -219,6 +228,8 @@ def _row_exclusion_reason(row: Mapping[str, object]) -> str | None:
         return "iv_timestamp_not_before_expiry"
     if iv < 0.0 or rv < 0.0:
         return "negative_volatility"
+    if year_fraction <= 0.0:
+        return "non_positive_year_fraction"
     if any(c < 0.0 for c in costs if c is not None):
         return "negative_cost"
     return None
@@ -268,7 +279,8 @@ def _pbo_report(
     return {**report, "valid": True}
 
 
-def _tail_metrics(returns: Sequence[float]) -> Mapping[str, float | int | None]:
+def _tail_metrics(observations: Sequence[ShortVolObservation]) -> Mapping[str, float | int | None]:
+    returns = tuple(row.net_return for row in observations)
     if not returns:
         return {
             "trades": 0,
@@ -295,11 +307,21 @@ def _tail_metrics(returns: Sequence[float]) -> Mapping[str, float | int | None]:
         "cvar_95": cvar95,
         "cvar_99": cvar99,
         "worst_trade": min(returns),
-        "worst_month": min(returns),
+        "worst_month": _worst_month(observations),
         "sortino": sortino,
         "calmar": calmar,
         "return_to_cvar_95": total / abs(cvar95) if cvar95 < 0.0 else None,
     }
+
+
+def _worst_month(observations: Sequence[ShortVolObservation]) -> float | None:
+    if not observations:
+        return None
+    by_month: dict[str, float] = {}
+    for row in observations:
+        month = datetime.fromtimestamp(row.iv_ts / 1000, UTC).strftime("%Y-%m")
+        by_month[month] = by_month.get(month, 0.0) + row.net_return
+    return min(by_month.values()) if by_month else None
 
 
 def _max_drawdown(returns: Sequence[float]) -> float:
