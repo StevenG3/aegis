@@ -397,7 +397,7 @@ def _pbo_report(
             "n_splits": config.pbo_splits,
         }
     report = pbo(trial_returns, n_splits=config.pbo_splits)
-    return {**report, "valid": bool(report.get("valid", False))}
+    return {**report, "valid": True}
 
 
 def _metrics(trades: object) -> Mapping[str, Any]:

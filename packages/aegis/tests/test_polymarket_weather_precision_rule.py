@@ -3,9 +3,11 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from aegis.gefs_weather_probability import GefsCycle, StationForecastSample
 from aegis.polymarket_weather_precision_rule import (
     WeatherPrecisionRuleConfig,
     precision_data_blocked_report,
@@ -150,3 +152,91 @@ def test_weather_precision_evidence_gate_blocks_when_archive_unset(
     gate = module._point_in_time_forecast_gate()
     assert gate["available"] is False
     assert gate["local_archive_path"] == str(missing)
+
+
+def test_weather_gefs_precision_evidence_builds_rows_from_gefs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    script_path = Path(__file__).resolve().parents[3] / "scripts" / (
+        "polymarket_weather_gefs_precision_evidence.py"
+    )
+    spec = importlib.util.spec_from_file_location("weather_gefs_precision_evidence", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["weather_gefs_precision_evidence"] = module
+    spec.loader.exec_module(module)
+
+    event = {
+        "slug": "highest-temperature-in-nyc-on-june-22-2026",
+        "closed": True,
+        "endDate": "2026-06-23T03:59:00Z",
+        "resolutionSource": "https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA",
+        "description": (
+            "Temperatures are measured to whole degrees Fahrenheit and finalized after "
+            "the first datapoint for the following date has been published."
+        ),
+        "markets": [
+            {
+                "slug": "highest-temperature-in-nyc-on-june-22-2026-84-85f",
+                "question": "Will the high temperature in NYC be between 84-85°F?",
+                "resolutionSource": (
+                    "https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA"
+                ),
+                "description": "whole degrees Fahrenheit",
+                "clobTokenIds": '["yes-token", "no-token"]',
+                "outcomePrices": '["1", "0"]',
+            }
+        ],
+    }
+
+    monkeypatch.setattr(module, "_fetch_temperature_events", lambda **_kwargs: [event])
+    monkeypatch.setattr(
+        module,
+        "gefs_archive_availability",
+        lambda **_kwargs: SimpleNamespace(
+            required_messages=2,
+            available_messages=2,
+            missing_messages=0,
+            missing_examples=(),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_or_compute_samples",
+        lambda **_kwargs: (
+            [
+                StationForecastSample("gep01", 84.2, 84, (6, 12)),
+                StationForecastSample("gep02", 85.0, 85, (6, 12)),
+            ],
+            GefsCycle(
+                issue_time=module.datetime.fromtimestamp(1_782_160_000, module.UTC),
+                cycle_hour=0,
+            ),
+            (6, 12),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_latest_token_price",
+        lambda token, _ts: 0.10 if token == "yes-token" else 0.88,
+    )
+
+    report = module.run_weather_gefs_precision_evidence(
+        start_date=module.date(2026, 6, 22),
+        end_date=module.date(2026, 6, 22),
+        city_slugs=("nyc",),
+        members=("gep01", "gep02"),
+        cache_dir=tmp_path / "cache",
+        sample_cache_dir=tmp_path / "samples",
+        max_events=0,
+        max_workers=1,
+    )
+    coverage = report["coverage"]
+    assert coverage["events_found"] == 1
+    assert coverage["settlement_aligned_events"] == 1
+    assert coverage["events_processed_with_gefs"] == 1
+    assert coverage["observations"] == 1
+    assert coverage["event_excluded_reasons"] == {}
+    assert report["state"] == "INSUFFICIENT"
+    assert "observations 1 < min_observations" in report["reason"]
