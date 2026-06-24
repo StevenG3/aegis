@@ -107,6 +107,24 @@ STATIONS: Mapping[str, StationSpec] = {
         longitude=-118.4085,
         timezone="America/Los_Angeles",
     ),
+    "KORD": StationSpec("KORD", latitude=41.9742, longitude=-87.9073, timezone="America/Chicago"),
+    "KAUS": StationSpec("KAUS", latitude=30.1975, longitude=-97.6664, timezone="America/Chicago"),
+    "KBKF": StationSpec("KBKF", latitude=39.7017, longitude=-104.7517, timezone="America/Denver"),
+    "KSEA": StationSpec(
+        "KSEA",
+        latitude=47.4502,
+        longitude=-122.3088,
+        timezone="America/Los_Angeles",
+    ),
+    "KDAL": StationSpec("KDAL", latitude=32.8471, longitude=-96.8518, timezone="America/Chicago"),
+    "KHOU": StationSpec("KHOU", latitude=29.6454, longitude=-95.2789, timezone="America/Chicago"),
+    "KATL": StationSpec("KATL", latitude=33.6407, longitude=-84.4277, timezone="America/New_York"),
+    "KSFO": StationSpec(
+        "KSFO",
+        latitude=37.6213,
+        longitude=-122.3790,
+        timezone="America/Los_Angeles",
+    ),
 }
 
 
