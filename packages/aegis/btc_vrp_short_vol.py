@@ -40,9 +40,12 @@ class ShortVolObservation:
     funding_cost: float
     tail_loss: float
     return_floor: float | None = None
+    net_return_override: float | None = None
 
     @property
     def net_return(self) -> float:
+        if self.net_return_override is not None:
+            return self.net_return_override
         variance_premium = (
             (self.implied_vol**2 - self.realized_vol**2) * self.variance_year_fraction
         )
@@ -190,6 +193,7 @@ def _observations(
                 funding_cost=_required_float(row["funding_cost"]),
                 tail_loss=_required_float(row["tail_loss"]),
                 return_floor=_optional_float(row.get("return_floor")),
+                net_return_override=_optional_float(row.get("net_return_override")),
             )
         )
     return observations, excluded
