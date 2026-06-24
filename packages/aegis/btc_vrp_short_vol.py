@@ -39,6 +39,7 @@ class ShortVolObservation:
     hedge_slippage_cost: float
     funding_cost: float
     tail_loss: float
+    return_floor: float | None = None
 
     @property
     def net_return(self) -> float:
@@ -52,18 +53,22 @@ class ShortVolObservation:
             + self.funding_cost
             + self.tail_loss
         )
-        return variance_premium - costs
+        net = variance_premium - costs
+        if self.return_floor is not None:
+            return max(net, -self.return_floor)
+        return net
 
 
 def run_btc_short_vol_vrp(
     rows: Sequence[Mapping[str, object]],
     *,
     config: ShortVolVrpConfig | None = None,
+    all_variants: Sequence[str] | None = None,
 ) -> Mapping[str, Any]:
     if config is None:
         config = ShortVolVrpConfig()
     observations, excluded = _observations(rows)
-    variants = sorted({row.variant for row in observations})
+    variants = sorted(set(all_variants or ()) | {row.variant for row in observations})
     coverage = {
         "input_rows": len(rows),
         "observations": len(observations),
@@ -79,7 +84,10 @@ def run_btc_short_vol_vrp(
     pbo_report = _pbo_report(evaluations, observations, config)
     pbo_valid = bool(pbo_report.get("valid", False))
     pbo_value = _float(pbo_report.get("pbo"), default=1.0)
-    best = max(evaluations, key=lambda evaluation: float(evaluation["mean_net_return"]))
+    traded_evaluations = [
+        evaluation for evaluation in evaluations if int(evaluation["trade_count"]) > 0
+    ]
+    best = max(traded_evaluations, key=lambda evaluation: float(evaluation["mean_net_return"]))
     best_observations = [row for row in observations if row.variant == best["variant"]]
     best_metrics = _tail_metrics(best_observations)
     fdr_pass = any(
@@ -181,6 +189,7 @@ def _observations(
                 hedge_slippage_cost=_required_float(row["hedge_slippage_cost"]),
                 funding_cost=_required_float(row["funding_cost"]),
                 tail_loss=_required_float(row["tail_loss"]),
+                return_floor=_optional_float(row.get("return_floor")),
             )
         )
     return observations, excluded
