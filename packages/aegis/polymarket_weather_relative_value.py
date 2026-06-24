@@ -140,6 +140,7 @@ def run_weather_relative_value_firstpass(
         )
     return {
         "status": "OK",
+        "state": "EDGE" if verdict == "SUGGESTIVE_NEEDS_PAID_CONFIRM" else "NO_EDGE",
         "verdict": verdict,
         "reason": reason,
         "data_adequacy": "limited",
@@ -448,6 +449,7 @@ def _insufficient(
 ) -> Mapping[str, Any]:
     return {
         "status": "INSUFFICIENT",
+        "state": "INSUFFICIENT",
         "verdict": "INSUFFICIENT",
         "reason": reason,
         "data_adequacy": "blocked",

@@ -94,6 +94,7 @@ def test_weather_relative_value_runner_applies_ask_costs_and_gates() -> None:
         ),
     )
     assert report["status"] == "OK"
+    assert report["state"] in {"EDGE", "NO_EDGE"}
     assert report["standard_metrics"]["trades"] == 12
     assert report["standard_metrics"]["wins"] == 8
     assert report["standard_metrics"]["mean_yes_ask"] == 0.60
@@ -154,4 +155,5 @@ def test_weather_relative_value_missing_no_ask_fails_closed() -> None:
         config=WeatherRelativeValueConfig(min_observations=1),
     )
     assert report["verdict"] == "INSUFFICIENT"
+    assert report["state"] == "INSUFFICIENT"
     assert report["coverage"]["excluded_reasons"] == {"missing_no_ask": 1}

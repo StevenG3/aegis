@@ -37,9 +37,21 @@ from aegis.private_paths import private_dir_from_cli
 DEFAULT_TASK = "olympus71"
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 CLOB_BASE_URL = "https://clob.polymarket.com"
-USER_AGENT = "aegis-polymarket-weather-model/0.1 read-only"
-US_CITY_SLUGS = ("nyc", "miami", "los-angeles")
-DEFAULT_START_DATE = date(2026, 5, 1)
+USER_AGENT = "aegis-polymarket-weather-model/0.2 read-only"
+US_CITY_SLUGS = (
+    "nyc",
+    "miami",
+    "los-angeles",
+    "chicago",
+    "austin",
+    "denver",
+    "seattle",
+    "dallas",
+    "houston",
+    "atlanta",
+    "san-francisco",
+)
+DEFAULT_START_DATE = date(2026, 4, 1)
 DEFAULT_END_DATE = date(2026, 6, 22)
 ASK_PROXY_SPREAD_COST = 0.02
 
@@ -203,6 +215,13 @@ def run_weather_model_evidence(
     )
     report = run_weather_relative_value_firstpass(observations, config=config)
     verdict = _str(report.get("verdict")) or "INSUFFICIENT"
+    state = _str(report.get("state")) or (
+        "INSUFFICIENT"
+        if verdict == "INSUFFICIENT"
+        else "EDGE"
+        if verdict.startswith("SUGGESTIVE")
+        else "NO_EDGE"
+    )
     coverage = dict(cast(Mapping[str, Any], report.get("coverage", {})))
     coverage.update(
         {
@@ -218,6 +237,9 @@ def run_weather_model_evidence(
                 "CLOB prices-history latest YES/NO token prices before market end "
                 "+ fixed ask proxy spread"
             ),
+            "ask_source_quality": "proxy_history",
+            "true_ask_markets": 0,
+            "proxy_ask_markets": len({str(row.get("market_slug")) for row in observations}),
             "ask_method": (
                 "YES ask proxy = YES token prices-history + spread; "
                 "NO ask proxy = NO token prices-history + spread; never 1 - yes_ask"
@@ -226,8 +248,9 @@ def run_weather_model_evidence(
         }
     )
     return {
-        "briefing": "CODEX_OLYMPUS_71C_WEATHER_TWOSIDED",
+        "briefing": "CODEX_OLYMPUS_71D_WEATHER_EXPANDED_FORWARD_TWOSIDED",
         "generated_at": datetime.now(UTC).isoformat(),
+        "state": state,
         "verdict": verdict,
         "reason": report.get("reason"),
         "data_adequacy": report.get("data_adequacy"),
@@ -551,12 +574,9 @@ def _temperature_event_slug(city_slug: str, day: date) -> str:
 
 
 def _city_from_slug(slug: str) -> str:
-    if "miami" in slug:
-        return "miami"
-    if "los-angeles" in slug:
-        return "los-angeles"
-    if "nyc" in slug:
-        return "nyc"
+    for city_slug in sorted(US_CITY_SLUGS, key=len, reverse=True):
+        if f"highest-temperature-in-{city_slug}-" in slug:
+            return city_slug
     return "unknown"
 
 
@@ -626,8 +646,9 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
     multiple = cast(Mapping[str, Any], payload.get("multiple_testing", {}))
     metrics = cast(Mapping[str, Any], payload.get("standard_metrics", {}) or {})
     lines = [
-        "# CODEX OLYMPUS 71C Weather Two-Sided Evidence",
+        "# CODEX OLYMPUS 71D Weather Expanded Forward Two-Sided Evidence",
         "",
+        f"- State: `{payload.get('state')}`",
         f"- Verdict: `{payload.get('verdict')}`",
         f"- Reason: {payload.get('reason')}",
         f"- Data adequacy: `{payload.get('data_adequacy')}`",
@@ -641,6 +662,9 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
         f"- Member count: `{coverage.get('member_count')}`",
         f"- Price source: `{coverage.get('price_source')}`",
         f"- Ask method: `{coverage.get('ask_method')}`",
+        f"- Ask source quality: `{coverage.get('ask_source_quality')}`",
+        f"- True ask markets: `{coverage.get('true_ask_markets')}`",
+        f"- Proxy ask markets: `{coverage.get('proxy_ask_markets')}`",
         "",
         "## Metrics",
         f"- Trades: `{metrics.get('trades')}`",
@@ -657,7 +681,7 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run #71C Polymarket weather model evidence.")
+    parser = argparse.ArgumentParser(description="Run #71D Polymarket weather model evidence.")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--start-date", type=date.fromisoformat, default=DEFAULT_START_DATE)
     parser.add_argument("--end-date", type=date.fromisoformat, default=DEFAULT_END_DATE)
