@@ -96,3 +96,33 @@ def test_btc_vrp_blocked_report_sets_unlock_condition() -> None:
     assert report["state"] == "INSUFFICIENT"
     assert report["data_adequacy"] == "blocked"
     assert report["unlock_condition"] == "missing 2020 crash IV"
+
+
+def test_short_vol_return_floor_caps_condor_loss() -> None:
+    report = run_btc_short_vol_vrp(
+        [
+            _row(
+                variant="capped_condor",
+                implied_vol=0.20,
+                realized_vol=5.00,
+                option_spread_cost=0.0,
+                hedge_fee_cost=0.0,
+                hedge_slippage_cost=0.0,
+                funding_cost=0.0,
+                tail_loss=0.0,
+            )
+            | {"return_floor": 0.25}
+        ],
+        config=ShortVolVrpConfig(),
+    )
+    assert report["best_candidate"]["mean_net_return"] == -0.25
+
+
+def test_short_vol_counts_predeclared_zero_trade_variants() -> None:
+    report = run_btc_short_vol_vrp(
+        [_row(variant="traded")],
+        config=ShortVolVrpConfig(),
+        all_variants=("traded", "filtered_out"),
+    )
+    assert report["candidate_count_n"] == 2
+    assert report["best_candidate"]["variant"] == "traded"
