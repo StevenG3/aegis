@@ -12,6 +12,13 @@ TRADING_DAYS_PER_YEAR = 252.0
 
 TimingRule = Literal["iv_edge", "vix_percentile"]
 
+OPTION_SPREAD_COST_PCT = 0.03
+HARD_CAP_INSURANCE_COST_PCT = 0.02
+HEDGE_DELTA_NOTIONAL_FRACTION = 0.15
+HEDGE_FEE_RATE = 0.0002
+HEDGE_SLIPPAGE_RATE = 0.0005
+EXPOSURE_POLICY = "non_overlapping_per_variant"
+
 
 @dataclass(frozen=True)
 class SpxDailyBar:
@@ -78,7 +85,10 @@ def build_spx_vrp_rows(
         "hard_cap_bindings": 0,
         "hard_cap_violations": 0,
         "max_position_scale": 0.0,
+        "exposure_policy": EXPOSURE_POLICY,
+        "overlap_skips": 0,
     }
+    next_eligible_by_variant = {name: 0 for name in spx_vrp_variant_names()}
     for index, current_day in enumerate(ordered_days):
         forecast_rv = forecast_realized_vol(spx=spx, ordered_days=ordered_days, index=index)
         recent_rv = trailing_realized_vol(spx=spx, ordered_days=ordered_days, index=index, days=10)
@@ -101,6 +111,10 @@ def build_spx_vrp_rows(
             continue
         implied_vol = vix[current_day] / 100.0
         for spec in SPX_VRP_SPECS:
+            if index < next_eligible_by_variant[spec.name]:
+                _count_skip(diagnostics, f"overlap_cap_{spec.name}")
+                diagnostics["overlap_skips"] = int(diagnostics["overlap_skips"]) + 1
+                continue
             expiry_index = index + spec.tenor_days
             if expiry_index >= len(ordered_days):
                 _count_skip(diagnostics, "insufficient_future_window")
@@ -127,17 +141,14 @@ def build_spx_vrp_rows(
                 continue
             realized_vol = annualized_vol(future_returns)
             variance_year_fraction = spec.tenor_days / TRADING_DAYS_PER_YEAR
-            insurance_cost = min(0.0030, spec.max_loss_cap * 0.08)
-            option_spread_cost = 0.0025 + insurance_cost
-            hedge_fee_cost = spec.tenor_days * 0.00002 * 0.15
-            hedge_slippage_cost = spec.tenor_days * 0.00005 * 0.15
-            raw_unscaled = (
-                (implied_vol * implied_vol - realized_vol * realized_vol)
-                * variance_year_fraction
-                - option_spread_cost
-                - hedge_fee_cost
-                - hedge_slippage_cost
+            components = vrp_trade_components(
+                implied_vol=implied_vol,
+                realized_vol=realized_vol,
+                variance_year_fraction=variance_year_fraction,
+                future_returns=future_returns,
             )
+            gross_vrp_return = components["gross_vrp_return"]
+            raw_unscaled = gross_vrp_return - components["total_cost"]
             capped_unscaled = max(raw_unscaled, -spec.max_loss_cap)
             if capped_unscaled != raw_unscaled:
                 diagnostics["hard_cap_bindings"] = int(diagnostics["hard_cap_bindings"]) + 1
@@ -157,9 +168,19 @@ def build_spx_vrp_rows(
                     "implied_vol": implied_vol,
                     "realized_vol": realized_vol,
                     "variance_year_fraction": variance_year_fraction,
-                    "option_spread_cost": option_spread_cost * position_scale,
-                    "hedge_fee_cost": hedge_fee_cost * position_scale,
-                    "hedge_slippage_cost": hedge_slippage_cost * position_scale,
+                    "premium_credit": components["premium_credit"] * position_scale,
+                    "realized_variance_cost": components["realized_variance_cost"]
+                    * position_scale,
+                    "gross_vrp_return": gross_vrp_return * position_scale,
+                    "option_spread_cost": components["option_spread_cost"]
+                    * position_scale,
+                    "hard_cap_insurance_cost": components["hard_cap_insurance_cost"]
+                    * position_scale,
+                    "hedge_turnover": components["hedge_turnover"] * position_scale,
+                    "hedge_fee_cost": components["hedge_fee_cost"] * position_scale,
+                    "hedge_slippage_cost": components["hedge_slippage_cost"]
+                    * position_scale,
+                    "total_cost": components["total_cost"] * position_scale,
                     "funding_cost": 0.0,
                     "tail_loss": 0.0,
                     "return_floor": scaled_cap,
@@ -175,6 +196,7 @@ def build_spx_vrp_rows(
                     "capped_unscaled_return": capped_unscaled,
                 }
             )
+            next_eligible_by_variant[spec.name] = expiry_index + 1
             counts = diagnostics["trade_counts_by_variant"]
             if isinstance(counts, dict):
                 counts[spec.name] = int(counts[spec.name]) + 1
@@ -191,8 +213,17 @@ def build_always_short_rows(
 ) -> tuple[list[Mapping[str, object]], Mapping[str, Any]]:
     rows: list[Mapping[str, object]] = []
     ordered_days = sorted(set(vix) & set(spx))
-    diagnostics = {"hard_cap_violations": 0, "hard_cap_bindings": 0}
+    diagnostics: dict[str, Any] = {
+        "hard_cap_violations": 0,
+        "hard_cap_bindings": 0,
+        "exposure_policy": EXPOSURE_POLICY,
+        "overlap_skips": 0,
+    }
+    next_eligible_index = 0
     for index, current_day in enumerate(ordered_days):
+        if index < next_eligible_index:
+            diagnostics["overlap_skips"] = int(diagnostics["overlap_skips"]) + 1
+            continue
         forecast_rv = forecast_realized_vol(spx=spx, ordered_days=ordered_days, index=index)
         if forecast_rv is None:
             continue
@@ -208,11 +239,13 @@ def build_always_short_rows(
         realized_vol = annualized_vol(future_returns)
         implied_vol = vix[current_day] / 100.0
         year_fraction = tenor_days / TRADING_DAYS_PER_YEAR
-        raw_unscaled = (
-            (implied_vol * implied_vol - realized_vol * realized_vol) * year_fraction
-            - 0.0035
-            - tenor_days * 0.00007 * 0.15
+        components = vrp_trade_components(
+            implied_vol=implied_vol,
+            realized_vol=realized_vol,
+            variance_year_fraction=year_fraction,
+            future_returns=future_returns,
         )
+        raw_unscaled = components["gross_vrp_return"] - components["total_cost"]
         capped_unscaled = max(raw_unscaled, -max_loss_cap)
         if capped_unscaled != raw_unscaled:
             diagnostics["hard_cap_bindings"] = int(diagnostics["hard_cap_bindings"]) + 1
@@ -229,16 +262,76 @@ def build_always_short_rows(
                 "implied_vol": implied_vol,
                 "realized_vol": realized_vol,
                 "variance_year_fraction": year_fraction,
-                "option_spread_cost": 0.0035 * position_scale,
-                "hedge_fee_cost": tenor_days * 0.00002 * 0.15 * position_scale,
-                "hedge_slippage_cost": tenor_days * 0.00005 * 0.15 * position_scale,
+                "premium_credit": components["premium_credit"] * position_scale,
+                "realized_variance_cost": components["realized_variance_cost"]
+                * position_scale,
+                "gross_vrp_return": components["gross_vrp_return"] * position_scale,
+                "option_spread_cost": components["option_spread_cost"] * position_scale,
+                "hard_cap_insurance_cost": components["hard_cap_insurance_cost"]
+                * position_scale,
+                "hedge_turnover": components["hedge_turnover"] * position_scale,
+                "hedge_fee_cost": components["hedge_fee_cost"] * position_scale,
+                "hedge_slippage_cost": components["hedge_slippage_cost"] * position_scale,
+                "total_cost": components["total_cost"] * position_scale,
                 "funding_cost": 0.0,
                 "tail_loss": 0.0,
                 "return_floor": scaled_cap,
                 "net_return_override": net_return,
             }
         )
+        next_eligible_index = expiry_index + 1
     return rows, diagnostics
+
+
+def vrp_trade_components(
+    *,
+    implied_vol: float,
+    realized_vol: float,
+    variance_year_fraction: float,
+    future_returns: Sequence[float],
+) -> Mapping[str, float]:
+    premium_credit = implied_vol * implied_vol * variance_year_fraction
+    realized_variance_cost = realized_vol * realized_vol * variance_year_fraction
+    gross_vrp_return = premium_credit - realized_variance_cost
+    option_spread_cost = premium_credit * OPTION_SPREAD_COST_PCT
+    hard_cap_insurance_cost = premium_credit * HARD_CAP_INSURANCE_COST_PCT
+    hedge_turnover = sum(abs(value) for value in future_returns) * HEDGE_DELTA_NOTIONAL_FRACTION
+    hedge_fee_cost = hedge_turnover * HEDGE_FEE_RATE
+    hedge_slippage_cost = hedge_turnover * HEDGE_SLIPPAGE_RATE
+    total_cost = (
+        option_spread_cost
+        + hard_cap_insurance_cost
+        + hedge_fee_cost
+        + hedge_slippage_cost
+    )
+    return {
+        "premium_credit": premium_credit,
+        "realized_variance_cost": realized_variance_cost,
+        "gross_vrp_return": gross_vrp_return,
+        "option_spread_cost": option_spread_cost,
+        "hard_cap_insurance_cost": hard_cap_insurance_cost,
+        "hedge_turnover": hedge_turnover,
+        "hedge_fee_cost": hedge_fee_cost,
+        "hedge_slippage_cost": hedge_slippage_cost,
+        "total_cost": total_cost,
+    }
+
+
+def gross_vrp_self_check(rows: Sequence[Mapping[str, object]]) -> Mapping[str, Any]:
+    values = [
+        value
+        for row in rows
+        if (value := _float(row.get("gross_vrp_return"))) is not None
+    ]
+    if not values:
+        return {"valid": False, "reason": "no gross_vrp_return rows", "count": 0}
+    mean_gross = statistics.fmean(values)
+    return {
+        "valid": mean_gross > 0.0,
+        "count": len(values),
+        "mean_gross_vrp_return": mean_gross,
+        "positive_share": sum(1 for value in values if value > 0.0) / len(values),
+    }
 
 
 def locked_oos_variant_report(

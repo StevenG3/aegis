@@ -8,6 +8,7 @@ from aegis.spx_vrp_harvest import (
     SpxDailyBar,
     build_spx_vrp_rows,
     date_to_ms,
+    gross_vrp_self_check,
     locked_oos_variant_report,
     spx_vrp_variant_names,
 )
@@ -108,6 +109,56 @@ def test_spx_vrp_costs_reduce_net_return() -> None:
     assert expensive["best_candidate"]["mean_net_return"] < cheap["best_candidate"][
         "mean_net_return"
     ]
+
+
+def test_spx_vrp_costs_scale_with_premium_not_absolute_constant() -> None:
+    low_rows, _ = build_spx_vrp_rows(vix=_vix(25.0), spx=_bars(high_vol=False))
+    high_rows, _ = build_spx_vrp_rows(vix=_vix(50.0), spx=_bars(high_vol=False))
+
+    low = low_rows[0]
+    high = high_rows[0]
+
+    assert cast(float, low["premium_credit"]) > 0.0
+    assert cast(float, high["premium_credit"]) > cast(float, low["premium_credit"])
+    assert cast(float, high["option_spread_cost"]) > cast(
+        float, low["option_spread_cost"]
+    )
+    assert cast(float, low["option_spread_cost"]) / cast(
+        float, low["premium_credit"]
+    ) == cast(float, high["option_spread_cost"]) / cast(float, high["premium_credit"])
+
+
+def test_spx_vrp_gross_vrp_self_check_requires_positive_gross_mean() -> None:
+    positive = gross_vrp_self_check(
+        [
+            {"gross_vrp_return": 0.01},
+            {"gross_vrp_return": 0.02},
+            {"gross_vrp_return": -0.005},
+        ]
+    )
+    negative = gross_vrp_self_check(
+        [{"gross_vrp_return": -0.01}, {"gross_vrp_return": -0.02}]
+    )
+
+    assert positive["valid"] is True
+    assert negative["valid"] is False
+
+
+def test_spx_vrp_uses_non_overlapping_exposure_per_variant() -> None:
+    rows, diagnostics = build_spx_vrp_rows(vix=_vix(50.0), spx=_bars(high_vol=False))
+
+    assert diagnostics["exposure_policy"] == "non_overlapping_per_variant"
+    by_variant: dict[str, list[tuple[int, int]]] = {}
+    for row in rows:
+        by_variant.setdefault(str(row["variant"]), []).append(
+            (cast(int, row["iv_ts"]), cast(int, row["expiry_ts"]))
+        )
+    assert by_variant
+    for trades in by_variant.values():
+        previous_expiry = -1
+        for entry, expiry in sorted(trades):
+            assert entry > previous_expiry
+            previous_expiry = expiry
 
 
 def test_locked_oos_variant_report_selects_on_is_then_reports_oos() -> None:
