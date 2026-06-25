@@ -40,6 +40,13 @@ class SpxVrpSpec:
     vix_percentile_threshold: float | None = None
 
 
+@dataclass(frozen=True)
+class SpxVrpRiskSpec:
+    name: str
+    target_vol: float
+    max_exposure: float
+
+
 SPX_VRP_SPECS: tuple[SpxVrpSpec, ...] = (
     SpxVrpSpec("spx_vrp_21d_cap10_tv10_edge03", 21, 0.10, 0.10, "iv_edge", 0.03),
     SpxVrpSpec("spx_vrp_21d_cap10_tv10_pct75", 21, 0.10, 0.10, "vix_percentile", None, 0.75),
@@ -59,6 +66,12 @@ SPX_VRP_SPECS: tuple[SpxVrpSpec, ...] = (
     SpxVrpSpec("spx_vrp_42d_cap15_tv15_pct80", 42, 0.15, 0.15, "vix_percentile", None, 0.80),
 )
 
+SPX_VRP_RISK_SPECS: tuple[SpxVrpRiskSpec, ...] = (
+    SpxVrpRiskSpec("risk08_cap4x", 0.08, 4.0),
+    SpxVrpRiskSpec("risk12_cap6x", 0.12, 6.0),
+    SpxVrpRiskSpec("risk16_cap8x", 0.16, 8.0),
+)
+
 REQUIRED_SPX_CRASH_WINDOWS: Mapping[str, tuple[date, date]] = {
     "dotcom_2000_2002": (date(2000, 3, 1), date(2002, 10, 31)),
     "gfc_2008": (date(2008, 9, 1), date(2009, 3, 31)),
@@ -69,6 +82,12 @@ REQUIRED_SPX_CRASH_WINDOWS: Mapping[str, tuple[date, date]] = {
 
 def spx_vrp_variant_names() -> tuple[str, ...]:
     return tuple(spec.name for spec in SPX_VRP_SPECS)
+
+
+def spx_vrp_deployment_variant_names() -> tuple[str, ...]:
+    return tuple(
+        f"{spec.name}__{risk.name}" for spec in SPX_VRP_SPECS for risk in SPX_VRP_RISK_SPECS
+    )
 
 
 def build_spx_vrp_rows(
@@ -203,6 +222,160 @@ def build_spx_vrp_rows(
     return rows, diagnostics
 
 
+def build_spx_vrp_deployment_rows(
+    *,
+    vix: Mapping[date, float],
+    spx: Mapping[date, SpxDailyBar],
+    risk_specs: Sequence[SpxVrpRiskSpec] = SPX_VRP_RISK_SPECS,
+) -> tuple[list[Mapping[str, object]], Mapping[str, Any]]:
+    base_rows, diagnostics = build_spx_vrp_rows(vix=vix, spx=spx)
+    deployed: list[Mapping[str, object]] = []
+    for row in base_rows:
+        for risk in risk_specs:
+            exposure = risk.max_exposure
+            deployed.append(_scale_spx_vrp_row(row, risk=risk, exposure=exposure))
+    return deployed, {
+        **diagnostics,
+        "risk_specs": [
+            {
+                "name": risk.name,
+                "target_vol": risk.target_vol,
+                "max_exposure": risk.max_exposure,
+            }
+            for risk in risk_specs
+        ],
+        "deployment_rows": len(deployed),
+        "portfolio_exposure_policy": "base non-overlap per variant plus risk-tier max_exposure cap",
+    }
+
+
+def spx_vrp_risk_curve(rows: Sequence[Mapping[str, object]]) -> Mapping[str, Any]:
+    by_risk: dict[str, list[Mapping[str, object]]] = {}
+    for row in rows:
+        risk = str(row.get("risk_spec", "unknown"))
+        by_risk.setdefault(risk, []).append(row)
+    result: dict[str, Any] = {}
+    for risk, items in sorted(by_risk.items()):
+        by_variant: dict[str, list[Mapping[str, object]]] = {}
+        for item in items:
+            by_variant.setdefault(str(item["variant"]), []).append(item)
+        variant_metrics = {
+            variant: _portfolio_metrics(variant_rows)
+            for variant, variant_rows in sorted(by_variant.items())
+        }
+        valid_metrics = [
+            (variant, metrics)
+            for variant, metrics in variant_metrics.items()
+            if bool(metrics.get("valid"))
+        ]
+        if not valid_metrics:
+            result[risk] = {"valid": False, "reason": "no valid variants"}
+            continue
+        best_variant, best_metrics = max(
+            valid_metrics, key=lambda item: float(item[1].get("sharpe", 0.0))
+        )
+        result[risk] = {
+            "valid": True,
+            "best_variant": best_variant,
+            "variant_count": len(variant_metrics),
+            **best_metrics,
+        }
+    return result
+
+
+def _portfolio_metrics(rows: Sequence[Mapping[str, object]]) -> Mapping[str, Any]:
+    ordered = sorted(rows, key=lambda item: _int(item.get("iv_ts")) or 0)
+    returns = [
+        value
+        for item in ordered
+        if (value := _float(item.get("net_return_override"))) is not None
+    ]
+    if not returns:
+        return {"valid": False, "reason": "no returns"}
+    first_ts = _int(ordered[0].get("iv_ts")) or 0
+    last_ts = _int(ordered[-1].get("expiry_ts")) or (_int(ordered[-1].get("iv_ts")) or 0)
+    years = max((last_ts - first_ts) / DAY_MS / 365.25, 1.0 / 365.25)
+    equity = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    for value in returns:
+        equity *= 1.0 + value
+        peak = max(peak, equity)
+        max_dd = min(max_dd, equity / peak - 1.0)
+    total_return = equity - 1.0
+    annualized_return = equity ** (1.0 / years) - 1.0 if equity > 0.0 else -1.0
+    trades_per_year = len(returns) / years
+    mean_return = statistics.fmean(returns)
+    stdev = statistics.pstdev(returns) if len(returns) > 1 else 0.0
+    downside = [value for value in returns if value < 0.0]
+    downside_stdev = statistics.pstdev(downside) if len(downside) > 1 else 0.0
+    sharpe = mean_return / stdev * math.sqrt(trades_per_year) if stdev > 0.0 else 0.0
+    sortino = (
+        mean_return / downside_stdev * math.sqrt(trades_per_year)
+        if downside_stdev > 0.0
+        else 0.0
+    )
+    cvar95 = _cvar_values(returns, 0.95)
+    cvar99 = _cvar_values(returns, 0.99)
+    return {
+        "valid": True,
+        "trades": len(returns),
+        "years": years,
+        "total_return": total_return,
+        "annualized_return": annualized_return,
+        "mean_return": mean_return,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": annualized_return / abs(max_dd) if max_dd < 0.0 else None,
+        "max_drawdown": max_dd,
+        "cvar_95": cvar95,
+        "cvar_99": cvar99,
+        "worst_trade": min(returns),
+        "win_rate": sum(1 for value in returns if value > 0.0) / len(returns),
+        "turnover_proxy": sum(
+            abs(value)
+            for item in ordered
+            if (value := _float(item.get("deployment_exposure"))) is not None
+        ),
+    }
+
+
+def _scale_spx_vrp_row(
+    row: Mapping[str, object],
+    *,
+    risk: SpxVrpRiskSpec,
+    exposure: float,
+) -> Mapping[str, object]:
+    scaled = dict(row)
+    original_variant = str(row["variant"])
+    scaled["base_variant"] = original_variant
+    scaled["variant"] = f"{original_variant}__{risk.name}"
+    scaled["risk_spec"] = risk.name
+    scaled["target_portfolio_vol"] = risk.target_vol
+    scaled["max_exposure"] = risk.max_exposure
+    scaled["deployment_exposure"] = exposure
+    for key in (
+        "premium_credit",
+        "realized_variance_cost",
+        "gross_vrp_return",
+        "option_spread_cost",
+        "hard_cap_insurance_cost",
+        "hedge_turnover",
+        "hedge_fee_cost",
+        "hedge_slippage_cost",
+        "total_cost",
+        "net_return_override",
+        "return_floor",
+        "hard_cap_scaled",
+        "raw_unscaled_return",
+        "capped_unscaled_return",
+    ):
+        value = _float(row.get(key))
+        if value is not None:
+            scaled[key] = value * exposure
+    return scaled
+
+
 def build_always_short_rows(
     *,
     vix: Mapping[date, float],
@@ -332,6 +505,12 @@ def gross_vrp_self_check(rows: Sequence[Mapping[str, object]]) -> Mapping[str, A
         "mean_gross_vrp_return": mean_gross,
         "positive_share": sum(1 for value in values if value > 0.0) / len(values),
     }
+
+
+def _cvar_values(returns: Sequence[float], confidence: float) -> float:
+    sorted_returns = sorted(returns)
+    tail_count = max(1, math.ceil(len(sorted_returns) * (1.0 - confidence)))
+    return statistics.fmean(sorted_returns[:tail_count])
 
 
 def locked_oos_variant_report(

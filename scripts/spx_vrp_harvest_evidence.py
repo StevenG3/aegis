@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import math
+import statistics
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -21,12 +23,14 @@ from aegis.spx_vrp_harvest import (
     REQUIRED_SPX_CRASH_WINDOWS,
     SpxDailyBar,
     build_always_short_rows,
+    build_spx_vrp_deployment_rows,
     build_spx_vrp_rows,
     crash_window_coverage,
     garman_klass_vol,
     gross_vrp_self_check,
     locked_oos_variant_report,
-    spx_vrp_variant_names,
+    spx_vrp_deployment_variant_names,
+    spx_vrp_risk_curve,
 )
 
 DEFAULT_TASK = "olympus85"
@@ -82,8 +86,8 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
         "spx_rows": len(spx),
         "required_crash_windows": list(REQUIRED_SPX_CRASH_WINDOWS),
         "max_drawdown_limit": config.max_drawdown_limit,
-        "predeclared_configs": list(spx_vrp_variant_names()),
-        "predeclared_config_n": len(spx_vrp_variant_names()),
+        "predeclared_configs": list(spx_vrp_deployment_variant_names()),
+        "predeclared_config_n": len(spx_vrp_deployment_variant_names()),
         "costs": {
             "option_spread_proxy": "3% of premium credit, same scale as VRP premium",
             "hard_cap_insurance_proxy": "2% of premium credit for capped-wing proxy",
@@ -110,9 +114,11 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
         diagnostics: Mapping[str, Any] = {}
         always_diagnostics: Mapping[str, Any] = {}
     else:
-        rows, diagnostics = build_spx_vrp_rows(vix=vix, spx=spx)
+        rows, diagnostics = build_spx_vrp_deployment_rows(vix=vix, spx=spx)
+        base_rows, base_diagnostics = build_spx_vrp_rows(vix=vix, spx=spx)
         always_rows, always_diagnostics = build_always_short_rows(vix=vix, spx=spx)
         gross_self_check = gross_vrp_self_check(rows)
+        base_gross_self_check = gross_vrp_self_check(base_rows)
         always_gross_self_check = gross_vrp_self_check(always_rows)
         if not bool(gross_self_check.get("valid")):
             report = {
@@ -130,7 +136,7 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
             report = run_btc_short_vol_vrp(
                 rows,
                 config=config,
-                all_variants=spx_vrp_variant_names(),
+                all_variants=spx_vrp_deployment_variant_names(),
             )
             locked_oos = locked_oos_variant_report(rows)
             always_report = run_btc_short_vol_vrp(
@@ -142,17 +148,20 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
             **coverage,
             **_mapping_or_empty(report.get("coverage")),
             "diagnostics": diagnostics,
+            "base_diagnostics": base_diagnostics,
             "always_short_diagnostics": always_diagnostics,
             "gross_vrp_self_check": gross_self_check,
+            "base_gross_vrp_self_check": base_gross_self_check,
             "always_short_gross_vrp_self_check": always_gross_self_check,
             "rv_estimators": _rv_estimator_summary(spx),
             "locked_oos": locked_oos,
+            "risk_curve": spx_vrp_risk_curve(rows),
         })
     if missing:
         locked_oos = {"valid": False, "reason": "data gate blocked"}
     tail_conclusion = _tail_conclusion(report)
     return {
-        "briefing": "CODEX_OLYMPUS_85B_SPX_VRP_HARVEST_CORRECTED",
+        "briefing": "CODEX_OLYMPUS_85C_SPX_VRP_RISK_DEPLOYMENT",
         "generated_at": datetime.now(  # noqa: UP017 - host evidence uses py3.10.
             timezone.utc  # noqa: UP017 - host evidence uses py3.10.
         ).isoformat(),
@@ -172,9 +181,13 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
             "cash": {"mean_return": 0.0},
             "always_short_vol": always_report.get("standard_metrics"),
             "buy_hold_spx": _buy_hold_spx_metrics(spx),
+            "put_index": _load_benchmark_metrics(cache_dir, "^PUT"),
+            "putw_etf": _load_benchmark_metrics(cache_dir, "PUTW"),
+            "svol_etf": _load_benchmark_metrics(cache_dir, "SVOL"),
             "put_write_etf_comparability": (
-                "VIX/SPX proxy cannot determine whether it beats PUT/SVOL/PFIX-style "
-                "products after management fees, margin, and actual option execution."
+                "Risk-matched comparison is approximate: VIX/SPX proxy is not "
+                "strike-level executable option evidence, while PUT/PUTW/SVOL are "
+                "index/ETF total-return proxies when available."
             ),
         },
         "multiple_testing": report.get("multiple_testing"),
@@ -194,8 +207,7 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
             ),
             "hard_cap": "net_return_override is clipped at scaled max single-trade loss",
             "portfolio_exposure": (
-                "non-overlapping per variant; a new trade opens only after the previous "
-                "same-variant tenor expires"
+                "base non-overlap per variant plus predeclared risk-tier max_exposure cap"
             ),
             "vol_target": "position scale uses forecast RV at t only",
             "gross_vrp_self_check": (
@@ -237,7 +249,7 @@ def load_cboe_vix(path: Path) -> dict[date, float]:
 
 def load_spx_yfinance(path: Path) -> dict[date, SpxDailyBar]:
     if not path.exists():
-        import yfinance as yf  # type: ignore[import-not-found]
+        yf = importlib.import_module("yfinance")
 
         path.parent.mkdir(parents=True, exist_ok=True)
         frame = yf.download(
@@ -338,7 +350,98 @@ def _buy_hold_spx_metrics(spx: Mapping[date, SpxDailyBar]) -> Mapping[str, Any]:
         "total_return": closes[-1] / closes[0] - 1.0,
         "mean_daily_return": sum(returns) / len(returns),
         "max_drawdown": max_drawdown,
+        **_daily_return_metrics(returns),
     }
+
+
+def _load_benchmark_metrics(cache_dir: Path, symbol: str) -> Mapping[str, Any]:
+    try:
+        closes = _load_yfinance_closes(cache_dir / f"{_safe_symbol(symbol)}.csv", symbol)
+    except Exception as exc:  # noqa: BLE001 - benchmark availability is reported, not fatal.
+        return {"valid": False, "symbol": symbol, "reason": str(exc)}
+    if len(closes) < 30:
+        return {"valid": False, "symbol": symbol, "reason": "insufficient rows"}
+    days = sorted(closes)
+    prices = [closes[day] for day in days if closes[day] > 0.0]
+    if len(prices) < 30:
+        return {"valid": False, "symbol": symbol, "reason": "insufficient positive closes"}
+    returns = [prices[index] / prices[index - 1] - 1.0 for index in range(1, len(prices))]
+    peak = prices[0]
+    max_drawdown = 0.0
+    for price in prices:
+        peak = max(peak, price)
+        max_drawdown = min(max_drawdown, price / peak - 1.0)
+    return {
+        "valid": True,
+        "symbol": symbol,
+        "start": days[0].isoformat(),
+        "end": days[-1].isoformat(),
+        "rows": len(prices),
+        "total_return": prices[-1] / prices[0] - 1.0,
+        "max_drawdown": max_drawdown,
+        **_daily_return_metrics(returns),
+    }
+
+
+def _load_yfinance_closes(path: Path, symbol: str) -> dict[date, float]:
+    if not path.exists():
+        yf = importlib.import_module("yfinance")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame = yf.download(
+            symbol,
+            start=DEFAULT_START.isoformat(),
+            end=(date.today()).isoformat(),
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["Date", "Close"])
+            writer.writeheader()
+            for raw_index, row in frame.iterrows():
+                writer.writerow(
+                    {
+                        "Date": str(raw_index)[:10],
+                        "Close": _float_or_default(_row_value(row, "Close"), None),
+                    }
+                )
+    result: dict[date, float] = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            raw_date = row.get("Date")
+            close = _float_or_none(row.get("Close"))
+            if raw_date is None or close is None or close <= 0.0:
+                continue
+            result[date.fromisoformat(raw_date)] = close
+    return result
+
+
+def _daily_return_metrics(returns: list[float]) -> Mapping[str, float]:
+    if not returns:
+        return {
+            "annualized_return": 0.0,
+            "annualized_volatility": 0.0,
+            "sharpe": 0.0,
+            "sortino": 0.0,
+        }
+    total = math.prod(1.0 + value for value in returns) - 1.0
+    years = max(len(returns) / 252.0, 1.0 / 252.0)
+    annualized_return = (1.0 + total) ** (1.0 / years) - 1.0 if total > -1.0 else -1.0
+    stdev = statistics.pstdev(returns) if len(returns) > 1 else 0.0
+    downside = [value for value in returns if value < 0.0]
+    downside_stdev = statistics.pstdev(downside) if len(downside) > 1 else 0.0
+    mean = statistics.fmean(returns)
+    return {
+        "annualized_return": annualized_return,
+        "annualized_volatility": stdev * math.sqrt(252.0),
+        "sharpe": mean / stdev * math.sqrt(252.0) if stdev > 0.0 else 0.0,
+        "sortino": mean / downside_stdev * math.sqrt(252.0) if downside_stdev > 0.0 else 0.0,
+    }
+
+
+def _safe_symbol(symbol: str) -> str:
+    return "".join(char if char.isalnum() else "_" for char in symbol).strip("_").lower()
 
 
 def _tail_conclusion(report: Mapping[str, Any]) -> str:
@@ -363,7 +466,7 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
     coverage = cast(Mapping[str, Any], payload.get("coverage", {}) or {})
     return "\n".join(
         [
-            "# CODEX OLYMPUS 85B SPX VRP Harvest Evidence",
+            "# CODEX OLYMPUS 85C SPX VRP Risk Deployment Evidence",
             "",
             f"- State: `{payload.get('state')}`",
             f"- Verdict: `{payload.get('verdict')}`",
