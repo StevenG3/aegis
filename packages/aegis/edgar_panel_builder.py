@@ -32,6 +32,22 @@ def month_end_dates(start: date, end: date) -> list[date]:
     return result
 
 
+def historical_universe_symbols(
+    constituent_store: HistoricalConstituentStore,
+    dates: Sequence[date],
+) -> set[str]:
+    """Return the union of as-of members across rebalance dates.
+
+    This is deliberately not the current constituent set. It is used by
+    survivor-bias audits that need names which were removed before today.
+    """
+
+    symbols: set[str] = set()
+    for as_of in dates:
+        symbols.update(constituent_store.as_of(as_of))
+    return symbols
+
+
 def build_edgar_ic_panel(
     *,
     fundamentals: Mapping[str, PitFundamentalStore],
