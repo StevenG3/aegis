@@ -24,6 +24,7 @@ from aegis.spx_vrp_harvest import (
     build_spx_vrp_rows,
     crash_window_coverage,
     garman_klass_vol,
+    gross_vrp_self_check,
     locked_oos_variant_report,
     spx_vrp_variant_names,
 )
@@ -84,19 +85,24 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
         "predeclared_configs": list(spx_vrp_variant_names()),
         "predeclared_config_n": len(spx_vrp_variant_names()),
         "costs": {
-            "option_spread_proxy": "25 bps plus capped-wing insurance proxy per trade",
-            "hedge_fee_proxy": "daily hedge notional x 2 bps",
-            "hedge_slippage_proxy": "daily hedge notional x 5 bps",
+            "option_spread_proxy": "3% of premium credit, same scale as VRP premium",
+            "hard_cap_insurance_proxy": "2% of premium credit for capped-wing proxy",
+            "hedge_fee_proxy": "delta-hedge turnover x 2 bps",
+            "hedge_slippage_proxy": "delta-hedge turnover x 5 bps",
             "funding": "N/A for equity index option proxy",
         },
+        "exposure_policy": "non_overlapping_per_variant",
     }
     crash_coverage = crash_window_coverage(vix=vix, spx=spx)
     coverage["crash_window_coverage"] = crash_coverage
     missing = [
         name
         for name, item in crash_coverage.items()
-        if not bool(cast(Mapping[str, Any], item)["covered"])
+        if not bool(item["covered"])
     ]
+    report: Mapping[str, Any]
+    always_report: Mapping[str, Any]
+    locked_oos: Mapping[str, Any]
     if missing:
         reason = f"required SPX/VIX crash windows missing: {', '.join(missing)}"
         report = btc_vrp_data_blocked_report(reason=reason, coverage=coverage, config=config)
@@ -106,30 +112,47 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
     else:
         rows, diagnostics = build_spx_vrp_rows(vix=vix, spx=spx)
         always_rows, always_diagnostics = build_always_short_rows(vix=vix, spx=spx)
-        report = run_btc_short_vol_vrp(
-            rows,
-            config=config,
-            all_variants=spx_vrp_variant_names(),
-        )
-        locked_oos = locked_oos_variant_report(rows)
-        always_report = run_btc_short_vol_vrp(
-            always_rows,
-            config=config,
-            all_variants=("always_short_vrp_21d_cap15_tv10",),
-        )
-        coverage = {
+        gross_self_check = gross_vrp_self_check(rows)
+        always_gross_self_check = gross_vrp_self_check(always_rows)
+        if not bool(gross_self_check.get("valid")):
+            report = {
+                "state": "INSUFFICIENT",
+                "verdict": "MODEL_INVALID_GROSS_VRP",
+                "reason": (
+                    "model failed gross VRP positivity self-check; P&L representation "
+                    "does not capture the known positive average IV-minus-RV premium"
+                ),
+                "candidate_count_n": len(rows),
+            }
+            locked_oos = {"valid": False, "reason": "gross VRP self-check failed"}
+            always_report = report
+        else:
+            report = run_btc_short_vol_vrp(
+                rows,
+                config=config,
+                all_variants=spx_vrp_variant_names(),
+            )
+            locked_oos = locked_oos_variant_report(rows)
+            always_report = run_btc_short_vol_vrp(
+                always_rows,
+                config=config,
+                all_variants=("always_short_vrp_21d_cap15_tv10",),
+            )
+        coverage = dict({
             **coverage,
-            **cast(Mapping[str, Any], report.get("coverage", {})),
+            **_mapping_or_empty(report.get("coverage")),
             "diagnostics": diagnostics,
             "always_short_diagnostics": always_diagnostics,
+            "gross_vrp_self_check": gross_self_check,
+            "always_short_gross_vrp_self_check": always_gross_self_check,
             "rv_estimators": _rv_estimator_summary(spx),
             "locked_oos": locked_oos,
-        }
+        })
     if missing:
         locked_oos = {"valid": False, "reason": "data gate blocked"}
     tail_conclusion = _tail_conclusion(report)
     return {
-        "briefing": "CODEX_OLYMPUS_85_SPX_VRP_HARVEST",
+        "briefing": "CODEX_OLYMPUS_85B_SPX_VRP_HARVEST_CORRECTED",
         "generated_at": datetime.now(  # noqa: UP017 - host evidence uses py3.10.
             timezone.utc  # noqa: UP017 - host evidence uses py3.10.
         ).isoformat(),
@@ -148,6 +171,7 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
         "benchmark_metrics": {
             "cash": {"mean_return": 0.0},
             "always_short_vol": always_report.get("standard_metrics"),
+            "buy_hold_spx": _buy_hold_spx_metrics(spx),
             "put_write_etf_comparability": (
                 "VIX/SPX proxy cannot determine whether it beats PUT/SVOL/PFIX-style "
                 "products after management fees, margin, and actual option execution."
@@ -169,7 +193,14 @@ def run_spx_vrp_harvest_evidence(*, cache_dir: Path) -> Mapping[str, Any]:
                 "realized variance starts after t"
             ),
             "hard_cap": "net_return_override is clipped at scaled max single-trade loss",
+            "portfolio_exposure": (
+                "non-overlapping per variant; a new trade opens only after the previous "
+                "same-variant tenor expires"
+            ),
             "vol_target": "position scale uses forecast RV at t only",
+            "gross_vrp_self_check": (
+                "gross mean must be positive before net-cost strategy verdict is allowed"
+            ),
             "proxy_limit": "VIX index is not executable option-chain bid/ask",
         },
         "safety": {
@@ -206,7 +237,7 @@ def load_cboe_vix(path: Path) -> dict[date, float]:
 
 def load_spx_yfinance(path: Path) -> dict[date, SpxDailyBar]:
     if not path.exists():
-        import yfinance as yf  # type: ignore[import-untyped]
+        import yfinance as yf  # type: ignore[import-not-found]
 
         path.parent.mkdir(parents=True, exist_ok=True)
         frame = yf.download(
@@ -251,14 +282,21 @@ def _bar_from_row(row: Mapping[str, str]) -> SpxDailyBar | None:
     high = _float_or_none(row.get("High"))
     low = _float_or_none(row.get("Low"))
     close = _float_or_none(row.get("Close"))
-    if raw_date is None or min(open_ or 0.0, high or 0.0, low or 0.0, close or 0.0) <= 0.0:
+    if (
+        raw_date is None
+        or open_ is None
+        or high is None
+        or low is None
+        or close is None
+        or min(open_, high, low, close) <= 0.0
+    ):
         return None
     return SpxDailyBar(
         date.fromisoformat(raw_date),
-        float(open_),
-        float(high),
-        float(low),
-        float(close),
+        open_,
+        high,
+        low,
+        close,
     )
 
 
@@ -268,6 +306,38 @@ def _rv_estimator_summary(spx: Mapping[date, SpxDailyBar]) -> Mapping[str, Any]:
         "close_to_close_primary": True,
         "garman_klass_last_252d": garman_klass_vol(bars),
         "parkinson_gk_available": True,
+    }
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    return {}
+
+
+def _buy_hold_spx_metrics(spx: Mapping[date, SpxDailyBar]) -> Mapping[str, Any]:
+    days = sorted(spx)
+    if len(days) < 2:
+        return {"valid": False, "reason": "insufficient SPX rows"}
+    closes = [spx[day].close for day in days if spx[day].close > 0.0]
+    if len(closes) < 2:
+        return {"valid": False, "reason": "insufficient positive SPX closes"}
+    peak = closes[0]
+    max_drawdown = 0.0
+    returns: list[float] = []
+    for index in range(1, len(closes)):
+        previous = closes[index - 1]
+        current = closes[index]
+        returns.append(current / previous - 1.0)
+        peak = max(peak, current)
+        max_drawdown = min(max_drawdown, current / peak - 1.0)
+    return {
+        "valid": True,
+        "start": days[0].isoformat(),
+        "end": days[-1].isoformat(),
+        "total_return": closes[-1] / closes[0] - 1.0,
+        "mean_daily_return": sum(returns) / len(returns),
+        "max_drawdown": max_drawdown,
     }
 
 
@@ -293,7 +363,7 @@ def _markdown(payload: Mapping[str, Any], json_path: Path) -> str:
     coverage = cast(Mapping[str, Any], payload.get("coverage", {}) or {})
     return "\n".join(
         [
-            "# CODEX OLYMPUS 85 SPX VRP Harvest Evidence",
+            "# CODEX OLYMPUS 85B SPX VRP Harvest Evidence",
             "",
             f"- State: `{payload.get('state')}`",
             f"- Verdict: `{payload.get('verdict')}`",
