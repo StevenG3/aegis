@@ -6,10 +6,12 @@ from typing import cast
 from aegis.btc_vrp_short_vol import ShortVolVrpConfig, run_btc_short_vol_vrp
 from aegis.spx_vrp_harvest import (
     SpxDailyBar,
+    build_spx_vrp_deployment_rows,
     build_spx_vrp_rows,
     date_to_ms,
     gross_vrp_self_check,
     locked_oos_variant_report,
+    spx_vrp_risk_curve,
     spx_vrp_variant_names,
 )
 
@@ -159,6 +161,50 @@ def test_spx_vrp_uses_non_overlapping_exposure_per_variant() -> None:
         for entry, expiry in sorted(trades):
             assert entry > previous_expiry
             previous_expiry = expiry
+
+
+def test_spx_vrp_deployment_respects_exposure_cap() -> None:
+    rows, diagnostics = build_spx_vrp_deployment_rows(
+        vix=_vix(50.0), spx=_bars(high_vol=False)
+    )
+
+    assert rows
+    assert diagnostics["portfolio_exposure_policy"]
+    assert all(
+        cast(float, row["deployment_exposure"]) <= cast(float, row["max_exposure"])
+        for row in rows
+    )
+
+
+def test_spx_vrp_deployment_scales_return_and_cost_components() -> None:
+    base_rows, _ = build_spx_vrp_rows(vix=_vix(50.0), spx=_bars(high_vol=False))
+    deployed_rows, _ = build_spx_vrp_deployment_rows(
+        vix=_vix(50.0), spx=_bars(high_vol=False)
+    )
+    base = base_rows[0]
+    deployed = next(
+        row
+        for row in deployed_rows
+        if row["base_variant"] == base["variant"] and row["iv_ts"] == base["iv_ts"]
+    )
+    exposure = cast(float, deployed["deployment_exposure"])
+
+    assert cast(float, deployed["net_return_override"]) == cast(
+        float, base["net_return_override"]
+    ) * exposure
+    assert cast(float, deployed["total_cost"]) == cast(float, base["total_cost"]) * exposure
+
+
+def test_spx_vrp_risk_curve_reports_annualized_metrics_by_risk_tier() -> None:
+    rows, _ = build_spx_vrp_deployment_rows(vix=_vix(50.0), spx=_bars(high_vol=False))
+    curve = spx_vrp_risk_curve(rows)
+
+    assert {"risk08_cap4x", "risk12_cap6x", "risk16_cap8x"} <= set(curve)
+    assert all(cast(dict[str, object], metrics)["valid"] is True for metrics in curve.values())
+    assert all(
+        "annualized_return" in cast(dict[str, object], metrics)
+        for metrics in curve.values()
+    )
 
 
 def test_locked_oos_variant_report_selects_on_is_then_reports_oos() -> None:
