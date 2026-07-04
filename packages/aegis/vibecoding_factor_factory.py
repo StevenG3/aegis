@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from aegis.backtest_core import (
+    MAX_TRIAL_COUNT_DEFAULT,
     CostModel,
     benjamini_hochberg,
     deflated_sharpe_threshold,
@@ -55,6 +56,7 @@ class VibeFactoryConfig:
     stop_loss_pct: float = 0.03
     take_profit_pct: float = 0.06
     survivor_light: bool = True
+    max_trial_count: int | None = MAX_TRIAL_COUNT_DEFAULT
 
 
 DEFAULT_FACTORY_CONFIG = VibeFactoryConfig()
@@ -135,7 +137,11 @@ def run_vibecoding_factor_factory(
 
     factor_rows = _factor_ic_rows(frames, config)
     factor_p_values = [_object_float(row["p_value"]) for row in factor_rows]
-    factor_bh = benjamini_hochberg(factor_p_values, alpha=config.fdr_alpha)
+    factor_bh = benjamini_hochberg(
+        factor_p_values,
+        alpha=config.fdr_alpha,
+        max_trial_count=config.max_trial_count,
+    )
     for row, passed in zip(factor_rows, factor_bh, strict=True):
         row["bh_fdr_pass"] = bool(passed)
     allowed_families = _allowed_families(factor_rows)
@@ -147,7 +153,15 @@ def run_vibecoding_factor_factory(
         cost_model=cost_model,
     )
     all_p_values = factor_p_values + [_object_float(row["p_value"]) for row in strategy_rows]
-    all_bh = benjamini_hochberg(all_p_values, alpha=config.fdr_alpha) if all_p_values else []
+    all_bh = (
+        benjamini_hochberg(
+            all_p_values,
+            alpha=config.fdr_alpha,
+            max_trial_count=config.max_trial_count,
+        )
+        if all_p_values
+        else []
+    )
     factor_fdr_survivors = sum(1 for passed in all_bh[: len(factor_p_values)] if passed)
     strategy_fdr_flags = all_bh[len(factor_p_values) :]
     for row, passed in zip(strategy_rows, strategy_fdr_flags, strict=True):

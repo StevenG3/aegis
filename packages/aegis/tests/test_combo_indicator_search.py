@@ -45,7 +45,7 @@ def _tiny_config() -> ComboSearchConfig:
         atr_periods=(3,),
         bollinger_periods=(),
         realized_vol_periods=(),
-        volume_z_periods=(3,),
+        volume_z_periods=(),
         obv_periods=(),
     )
 
