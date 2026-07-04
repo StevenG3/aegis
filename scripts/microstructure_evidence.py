@@ -214,6 +214,7 @@ def _hypothesis_spec(run: EvidenceRun, observations: Sequence[Mapping[str, Any]]
             "pbo_threshold": 0.20,
             "annualization_periods": _annualization_periods(run.timeframe),
             "fdr_alpha": 0.10,
+            "max_trial_count": max(1, trial_n),
         },
         cost_model={
             "fee_bps": run.taker_fee_bps,

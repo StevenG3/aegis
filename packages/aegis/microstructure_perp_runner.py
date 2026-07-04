@@ -8,6 +8,7 @@ from itertools import product
 from typing import Any
 
 from aegis.backtest_core import (
+    MAX_TRIAL_COUNT_DEFAULT,
     benjamini_hochberg,
     metrics_from_returns,
     pbo,
@@ -127,6 +128,7 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
     fdr_alpha = _float_param(params, "fdr_alpha", 0.10)
     pbo_splits = _int_param(params, "pbo_splits", 4)
     pbo_threshold = _float_param(params, "pbo_threshold", 0.20)
+    max_trial_count = _max_trial_count_param(params)
     liquidity_availability = _liquidity_data_availability(filtered)
     controls = _control_grid(params)
 
@@ -161,7 +163,12 @@ def run_microstructure_perp_from_spec(spec: Any) -> Mapping[str, Any]:
         )
 
     p_values = [result.p_value for result in valid_results]
-    fdr_flags = benjamini_hochberg(p_values, alpha=fdr_alpha, tie_policy="rank")
+    fdr_flags = benjamini_hochberg(
+        p_values,
+        alpha=fdr_alpha,
+        tie_policy="rank",
+        max_trial_count=max_trial_count,
+    )
     pbo_report = _pbo_report(valid_results, pbo_splits=pbo_splits)
     pbo_value = _number_from_mapping(pbo_report, "pbo", 1.0)
     pbo_pass = pbo_value <= pbo_threshold
@@ -1042,6 +1049,17 @@ def _int_param(params: Mapping[str, object], key: str, default: int) -> int:
     if key not in params:
         return default
     return _required_int(params, key)
+
+
+def _max_trial_count_param(params: Mapping[str, object]) -> int | None:
+    if "max_trial_count" not in params:
+        return MAX_TRIAL_COUNT_DEFAULT
+    if params["max_trial_count"] is None:
+        return None
+    value = _required_int(params, "max_trial_count")
+    if value < 1:
+        raise ValueError("max_trial_count must be positive or null")
+    return value
 
 
 def _bool_param(params: Mapping[str, object], key: str, default: bool) -> bool:

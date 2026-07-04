@@ -38,6 +38,7 @@ POSITIVE_VERDICTS = frozenset(
     }
 )
 INSUFFICIENT_VERDICTS = frozenset({"INSUFFICIENT", "INSUFFICIENT_DATA"})
+MAX_TRIAL_COUNT_DEFAULT = 100
 
 
 @dataclass(frozen=True)
@@ -433,7 +434,19 @@ def benjamini_hochberg(
     *,
     alpha: float = 0.10,
     tie_policy: BhTiePolicy = "p_value_cutoff",
+    max_trial_count: int | None = MAX_TRIAL_COUNT_DEFAULT,
 ) -> list[bool]:
+    if max_trial_count is not None and max_trial_count < 1:
+        raise ValueError("max_trial_count must be positive or None")
+    if max_trial_count is not None and len(p_values) > max_trial_count:
+        raise ValueError(
+            "benjamini_hochberg received "
+            f"{len(p_values)} trials, above max_trial_count={max_trial_count}. "
+            "Predeclare a small grid: giant grids mechanically raise the BH-FDR "
+            "bar and can false-negative real signals. Pass a larger "
+            "max_trial_count with a documented rationale, or pass None to disable "
+            "this guard."
+        )
     indexed = sorted(enumerate(p_values), key=lambda item: item[1])
     passed = [False for _ in p_values]
     m = len(indexed)

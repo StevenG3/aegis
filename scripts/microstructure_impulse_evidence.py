@@ -255,6 +255,7 @@ def _hypothesis_spec(
             "pbo_threshold": 0.20,
             "annualization_periods": base_evidence._annualization_periods(run.timeframe),
             "fdr_alpha": 0.10,
+            "max_trial_count": max(1, trial_n),
         },
         cost_model={
             "fee_bps": run.taker_fee_bps,

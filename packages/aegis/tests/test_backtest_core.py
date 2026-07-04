@@ -58,6 +58,35 @@ def test_benjamini_hochberg_supports_legacy_rank_and_cutoff_modes() -> None:
     ]
 
 
+def test_benjamini_hochberg_raises_when_default_trial_guard_is_exceeded() -> None:
+    p_values = [1e-6] + [0.9] * 100
+
+    with pytest.raises(
+        ValueError,
+        match="giant grids mechanically raise the BH-FDR bar",
+    ):
+        benjamini_hochberg(p_values, alpha=0.10)
+
+
+def test_benjamini_hochberg_allows_documented_trial_guard_override() -> None:
+    p_values = [1e-6] + [0.9] * 100
+
+    discoveries = benjamini_hochberg(p_values, alpha=0.10, max_trial_count=101)
+
+    assert discoveries[0] is True
+    assert sum(discoveries) == 1
+
+
+def test_benjamini_hochberg_preserves_olympus73_small_grid_shape() -> None:
+    p_values = [1e-6] + [0.9] * 83
+
+    discoveries = benjamini_hochberg(p_values, alpha=0.10)
+
+    assert len(discoveries) == 84
+    assert discoveries[0] is True
+    assert sum(discoveries) == 1
+
+
 def test_sign_test_supports_one_sided_and_two_sided_modes() -> None:
     excess = [1.0, 1.0, 1.0, -1.0]
 

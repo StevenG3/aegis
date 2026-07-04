@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from aegis.backtest_core import CostModel
+from aegis.backtest_core import MAX_TRIAL_COUNT_DEFAULT, CostModel
 from aegis.vibecoding_factor_factory import (
     StrategyParams,
     VibeBar,
@@ -51,7 +51,9 @@ def _bars(
     return out
 
 
-def _small_config() -> VibeFactoryConfig:
+def _small_config(
+    *, max_trial_count: int | None = MAX_TRIAL_COUNT_DEFAULT
+) -> VibeFactoryConfig:
     return VibeFactoryConfig(
         train_bars_1h=50,
         test_bars_1h=25,
@@ -62,6 +64,7 @@ def _small_config() -> VibeFactoryConfig:
         min_trades=1,
         min_oos_windows=2,
         pbo_splits=4,
+        max_trial_count=max_trial_count,
     )
 
 
@@ -149,7 +152,7 @@ def test_no_significant_ic_skips_strategy_stage_without_positive_verdict() -> No
     flat = _bars(count=120, drift=0.0, wave=0.0)
     result = run_vibecoding_factor_factory(
         {"BTCUSDT:1h": flat},
-        config=_small_config(),
+        config=_small_config(max_trial_count=150),
         cost_model=CostModel(fee_bps=10.0, slippage_bps=5.0),
         generated_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
@@ -168,7 +171,7 @@ def test_factory_reports_trial_count_and_survivor_ceiling() -> None:
             "ETHUSDT:1h": _bars(count=180, drift=0.003, wave=0.006, start_price=80.0),
             "SOLUSDT:1h": _bars(count=180, drift=0.002, wave=0.008, start_price=40.0),
         },
-        config=_small_config(),
+        config=_small_config(max_trial_count=400),
         generated_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
