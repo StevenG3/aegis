@@ -1,10 +1,20 @@
 name: aegis
+
+# 运维护栏：日志封顶 + 每服务内存上限（仅下次 deploy 生效，不动运行中容器）
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   orchestrator:
     build:
       context: ..
       dockerfile: services/orchestrator/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
     environment:
       DATA_DIR: /data
       RISK_ENGINE_URL: http://risk-engine:8081
@@ -84,6 +94,8 @@ services:
       context: ..
       dockerfile: services/risk-engine/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
     environment:
       DATA_DIR: /data
       MARKET_DATA_URL: http://market-data:8083
@@ -111,6 +123,8 @@ services:
       context: ..
       dockerfile: services/execution-service/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
     environment:
       DATA_DIR: /data
       MARKET_DATA_URL: http://market-data:8083
@@ -141,6 +155,8 @@ services:
       context: ..
       dockerfile: services/market-data/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
     environment:
       FIXTURES_ONLY: "false"
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
@@ -159,6 +175,8 @@ services:
       context: ..
       dockerfile: services/analysis-adapter/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
     environment:
       DATA_DIR: /data
       ORCHESTRATOR_URL: http://orchestrator:8080
@@ -192,6 +210,8 @@ services:
       context: ..
       dockerfile: services/ibkr-bridge/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
     environment:
       IBKR_GATEWAY_HOST: ${IBKR_GATEWAY_HOST:-ibkr-host}
       IBKR_GATEWAY_PORT: ${IBKR_GATEWAY_PORT:-4002}
@@ -215,6 +235,8 @@ services:
       context: ..
       dockerfile: services/exchange-bridge/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
     environment:
       EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:-}
       EXCHANGE_API_SECRET: ${EXCHANGE_API_SECRET:-}
@@ -238,6 +260,8 @@ services:
       context: ..
       dockerfile: services/backtest-service/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
     environment:
       BACKTEST_MAX_BARS: ${BACKTEST_MAX_BARS:-5000}
       STRATEGY_PLUGINS_DIR: /plugins
@@ -257,6 +281,8 @@ services:
       context: ..
       dockerfile: services/screener-service/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 384m
     environment:
       SCREENER_CACHE_TTL_SEC: ${SCREENER_CACHE_TTL_SEC:-21600}
       SCREENER_MAX_SYMBOLS: ${SCREENER_MAX_SYMBOLS:-50}
